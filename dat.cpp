@@ -33,7 +33,7 @@ auto no_last_time = std::chrono::steady_clock::time_point::min();
 
 struct Args {
     std::string cache_policy = "lru";
-    std::string prefetch = "none";
+    std::string prefetch_policy = "none";
     std::uint64_t prefetch_amount = 0; // only used for some prefetchers; ignored otherwise
     std::size_t capacity = (1 << 20);
     std::vector<int> r_pipes;
@@ -64,13 +64,14 @@ struct ResumeContext {
     ~ResumeContext() = default;
 
     bool operator<(const ResumeContext& other) const {
+        // reverse-ordering
         if (ready == other.ready) {
             // prefetched pages come first on tie because
             // 1. prefetched pages should show up by the time they are accessed without triggering another remote disk access
             // 2. because we will evict prefetched pages first, so we make prefetched pages older
-            return app == nullptr && other.app != nullptr;
+            return app != nullptr && other.app == nullptr;
         }
-        return ready < other.ready;
+        return ready > other.ready;
     }
 };
 
@@ -104,8 +105,8 @@ Args parse_args(int argc, char** argv) {
             a.r_pipes = split_csv(require_value(i, argc, argv));
         } else if (key == "--out-pipes") {
             a.w_pipes = split_csv(require_value(i, argc, argv));
-        } else if (key == "--prefetch") {
-            a.prefetch = require_value(i, argc, argv);
+        } else if (key == "--prefetch-policy") {
+            a.prefetch_policy = require_value(i, argc, argv);
         } else if (key == "--miss-delay") {
             a.miss_delay_ns = std::stoull(require_value(i, argc, argv));
         } else if (key == "--hit-delay") {
@@ -192,19 +193,20 @@ struct WorkerThread {
         }
 
         // True critical section -- we update priority queue and cache
-        for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
-            pq.push(ResumeContext{
-                sim_time + cache.get_page_ns(prefetch_req.pages[i]),
-                prefetch_req.pages[i],
-                nullptr,
-            });
-        }
         std::uint64_t sim_elapsed_ns = cache.get_page_ns(page);
         pq.push(ResumeContext{
             sim_time + sim_elapsed_ns,
             page,
             rw_pipe,
         });
+        for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
+            std::uint64_t sim_elapsed_ns = cache.get_page_ns(prefetch_req.pages[i]);
+            pq.push(ResumeContext{
+                sim_time + sim_elapsed_ns,
+                prefetch_req.pages[i],
+                nullptr,
+            });
+        }
 
         // Pop all fetched pages that arrive by the next timestamp
         
@@ -231,7 +233,7 @@ struct WorkerThread {
             cache, evict_policy, prefetch_policy,
             stats, mu, pq, res,
             warmup
-        });
+        }).detach();
 
         // log metrics
         if (global_idx > warmup) {
@@ -264,16 +266,17 @@ int main(int argc, char** argv) {
         //     throw std::runtime_error("Unsupported --cache-policy: " + args.cache_policy);
         // }
 
-        if (args.prefetch == "readahead") {
+        if (args.prefetch_policy == "readahead") {
             prefetch_policy = new policy::ReadaheadPolicy(cache);
-        } else if (args.prefetch != "none") {
-            throw std::runtime_error("Unsupported --prefetch: " + args.prefetch);
+        } else if (args.prefetch_policy != "none") {
+            throw std::runtime_error("Unsupported --prefetch-policy: " + args.prefetch_policy);
         }
 
         Stats stats;
         stats.first_time.store(no_first_time);  // cmp-xchg to set on first request
         stats.last_time.store(no_last_time);    // swap to update on each request
 
+        std::vector<std::promise<int>> promises(args.w_pipes.size());
         std::vector<std::future<int>> responses(args.w_pipes.size());
         std::vector<PipePair> pipes(args.w_pipes.size());
         std::priority_queue<ResumeContext> pq;
@@ -284,21 +287,20 @@ int main(int argc, char** argv) {
             int r_fd = args.r_pipes[worker_id];
             int w_fd = args.w_pipes[worker_id];
             std::uint64_t warmup = args.warmup_period;
-            std::promise<int> promise{};
-            responses[worker_id] = promise.get_future();
+            responses[worker_id] = promises[worker_id].get_future();
             pipes[worker_id] = {w_fd, r_fd};
 
             std::thread(WorkerThread{
                 &pipes[worker_id],
                 cache, evict_policy, prefetch_policy,
-                stats, mu, pq, promise,
+                stats, mu, pq, promises[worker_id],
                 warmup
-            });
+            }).detach();
         }
 
         for (std::size_t i = 0; i < responses.size(); ++i) {
             int code = responses[i].get();
-            std::cout << "Thread " << i << " exited with code " << code << std::endl;
+            std::cerr << "Thread " << i << " exited with code " << code << std::endl;
             pipes[i].close();
         }
 

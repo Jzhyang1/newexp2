@@ -27,7 +27,7 @@ struct Args {
     int n = 4;
     std::uint64_t seed = 1;
     std::string cache_policy = "lru";
-    std::string prefetch = "none";
+    std::string prefetch_policy = "none";
     std::size_t capacity = 4096;
     std::uint64_t miss_delay_ns = 300000;
     std::uint64_t hit_delay_ns = 30000;
@@ -69,8 +69,8 @@ Args parse_args(int argc, char** argv) {
             a.seed = std::stoull(require_value(i, argc, argv));
         } else if (key == "--cache-policy") {
             a.cache_policy = require_value(i, argc, argv);
-        } else if (key == "--prefetch") {
-            a.prefetch = require_value(i, argc, argv);
+        } else if (key == "--prefetch-policy") {
+            a.prefetch_policy = require_value(i, argc, argv);
         } else if (key == "--capacity") {
             a.capacity = static_cast<std::size_t>(std::stoull(require_value(i, argc, argv)));
         } else if (key == "--miss-delay") {
@@ -296,7 +296,7 @@ void append_log(const Args& args, const ParsedStats& s) {
     }
 
     if (need_header) {
-        out << "timestamp,machine,commit_hash,n,seed,cache_policy,prefetch,capacity,miss_delay_ns,hit_delay_ns,file_data,"
+        out << "timestamp,machine,commit_hash,n,seed,cache_policy,prefetch_policy,capacity,miss_delay_ns,hit_delay_ns,file_data,"
                "frac_scan,warmup_period,requests,page_span,hits,misses,"
                "hit_ratio,evictions,bytes_read,bytes_written,avg_latency_ns,runtime_seconds\n";
     }
@@ -310,7 +310,7 @@ void append_log(const Args& args, const ParsedStats& s) {
         << args.n << ','
         << args.seed << ','
         << args.cache_policy << ','
-        << args.prefetch << ','
+        << args.prefetch_policy << ','
         << args.capacity << ','
         << args.miss_delay_ns << ','
         << args.hit_delay_ns << ','
@@ -362,7 +362,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> dat_cmd = {
             "./bin/dat",
             "--cache-policy", args.cache_policy,
-            "--prefetch", args.prefetch,
+            "--prefetch-policy", args.prefetch_policy,
             "--capacity", std::to_string(args.capacity),
             "--in-pipes", join_csv(dat_r_pipes),
             "--out-pipes", join_csv(dat_w_pipes),

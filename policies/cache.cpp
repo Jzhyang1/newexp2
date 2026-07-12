@@ -1,6 +1,8 @@
 #include "policy_api.h"
 #include <chrono>
 #include <thread>
+#include <cstdio>
+#include <iostream>
 
 namespace policy {
 

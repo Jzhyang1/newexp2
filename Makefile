@@ -22,11 +22,11 @@ RUNNER_BIN := $(BIN_DIR)/runner
 # Default experiment parameters for `make run`
 N ?= 1
 SEED ?= 1
-CAPACITY ?= 8192
+CAPACITY ?= 1048576
 CACHE_POLICY ?= lru
 PREFETCH_POLICY ?= none
 MISS_DELAY_NS ?= 300000
-HIT_DELAY_NS ?= 1
+HIT_DELAY_NS ?=  100000
 FILE_DATA ?= ./data.bin
 FRAC_SCAN ?= 0.5
 WARMUP ?= 0
@@ -41,16 +41,22 @@ dirs:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR) ./logs
 
 # Build the app workload executable.
-app: $(APP_SRC)
-	$(CXX) $(CXXFLAGS) $< -o $(APP_BIN) $(LDFLAGS)
+app: $(APP_BIN)
+
+$(APP_BIN): $(APP_SRC) | dirs
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 # Build the cache daemon with policy implementations linked in.
-dat: $(DAT_SRC) $(POLICY_SRCS)
-	$(CXX) $(CXXFLAGS) $^ -o $(DAT_BIN) $(LDFLAGS)
+dat: $(DAT_BIN)
+
+$(DAT_BIN): $(DAT_SRC) $(POLICY_SRCS) | dirs
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Build the experiment orchestrator.
-runner: $(RUNNER_SRC)
-	$(CXX) $(CXXFLAGS) $< -o $(RUNNER_BIN) $(LDFLAGS)
+runner: $(RUNNER_BIN)
+
+$(RUNNER_BIN): $(RUNNER_SRC) | dirs
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 print-config:
 	@echo "N=$(N)"
@@ -70,7 +76,7 @@ run: all print-config
 		-n $(N) \
 		--seed $(SEED) \
 		--cache-policy $(CACHE_POLICY) \
-		--prefetch $(PREFETCH_POLICY) \
+		--prefetch-policy $(PREFETCH_POLICY) \
 		--capacity $(CAPACITY) \
 		--miss-delay $(MISS_DELAY_NS) \
 		--hit-delay $(HIT_DELAY_NS) \

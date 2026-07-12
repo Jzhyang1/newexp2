@@ -85,7 +85,7 @@ Experiment orchestrator.
 - `-n`: number of app processes
 - `--seed`: base seed (`seed + i` for app `i`)
 - `--cache-policy`: `lru` or `lru-cxt-aware`
-- `--prefetch`: `readahead`
+- `--prefetch-policy`: `readahead`
 - `--prefetch-amount`: number of pages to prefetch
 - `--capacity`: cache size in pages
 - `--miss-delay`: miss latency floor in ns
@@ -115,6 +115,7 @@ make run \
   N=8 \
   SEED=7 \
   CACHE_POLICY=lru-cxt-aware \
+  PREFETCH_POLICY=readahead \
   CAPACITY=8192 \
   MISS_DELAY_NS=500000 \
   HIT_DELAY_NS=30000 \
