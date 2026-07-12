@@ -20,15 +20,16 @@ DAT_BIN := $(BIN_DIR)/dat
 RUNNER_BIN := $(BIN_DIR)/runner
 
 # Default experiment parameters for `make run`
-N ?= 4
+N ?= 1
 SEED ?= 1
+CAPACITY ?= 8192
 CACHE_POLICY ?= lru
-CAPACITY ?= 4096
+PREFETCH_POLICY ?= none
 MISS_DELAY_NS ?= 300000
-HIT_DELAY_NS ?= 30000
+HIT_DELAY_NS ?= 1
 FILE_DATA ?= ./data.bin
 FRAC_SCAN ?= 0.5
-WARMUP ?= 5000
+WARMUP ?= 0
 LOG ?= ./logs/results.csv
 
 # Ensure these targets always run when requested.
@@ -69,6 +70,7 @@ run: all print-config
 		-n $(N) \
 		--seed $(SEED) \
 		--cache-policy $(CACHE_POLICY) \
+		--prefetch $(PREFETCH_POLICY) \
 		--capacity $(CAPACITY) \
 		--miss-delay $(MISS_DELAY_NS) \
 		--hit-delay $(HIT_DELAY_NS) \

@@ -56,10 +56,14 @@ public:
     Cache(std::size_t capacity, std::uint64_t hit_latency_ns = 0, std::uint64_t miss_latency_ns = 0);
 
     // We track if a page is in the cache
-    bool present(std::uint64_t page);
+    bool present(std::uint64_t page) const;
     bool evict(std::uint64_t page);
     // returns false if we are out of capacity or if there was an eviction
     bool insert(std::uint64_t page, std::uint64_t victim_page); // victim is evicted only if no space
+
+    inline std::uint64_t get_page_ns(std::uint64_t page) {
+        return present(page) ? hit_latency_ns : miss_latency_ns;
+    }
 
     // some data tracking
     const std::size_t capacity;
@@ -69,6 +73,17 @@ public:
 private:
     // This is a concurrent cache, so we need to protect the set with a mutex
     std::unordered_set<std::uint64_t> pages_{};
+};
+
+// ================================
+// concrete policy implementations
+// ================================
+
+class ReadaheadPolicy : public CachePolicy {
+public:
+    ReadaheadPolicy(Cache& cache);
+    void on_access(std::uint64_t context, std::uint64_t page);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
 };
 
 }  // namespace policy

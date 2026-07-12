@@ -49,9 +49,6 @@ struct ParsedStats {
     double hit_ratio = 0.0;
     double avg_latency_ns = 0.0;
     double runtime_seconds = 0.0;
-    std::uint64_t p50_latency_ns = 0;
-    std::uint64_t p95_latency_ns = 0;
-    std::uint64_t p99_latency_ns = 0;
 };
 
 std::string require_value(int& i, int argc, char** argv) {
@@ -228,9 +225,6 @@ ParsedStats parse_stats_line(const std::string& all_output) {
         s.hit_ratio = std::stod(extract_value(line, "hit_ratio"));
         s.avg_latency_ns = std::stod(extract_value(line, "avg_latency_ns"));
         s.runtime_seconds = std::stod(extract_value(line, "runtime_seconds"));
-        s.p50_latency_ns = std::stoull(extract_value(line, "p50_latency_ns"));
-        s.p95_latency_ns = std::stoull(extract_value(line, "p95_latency_ns"));
-        s.p99_latency_ns = std::stoull(extract_value(line, "p99_latency_ns"));
         break;
     }
     return s;
@@ -304,7 +298,7 @@ void append_log(const Args& args, const ParsedStats& s) {
     if (need_header) {
         out << "timestamp,machine,commit_hash,n,seed,cache_policy,prefetch,capacity,miss_delay_ns,hit_delay_ns,file_data,"
                "frac_scan,warmup_period,requests,page_span,hits,misses,"
-               "hit_ratio,evictions,bytes_read,bytes_written,avg_latency_ns,runtime_seconds,p50_latency_ns,p95_latency_ns,p99_latency_ns\n";
+               "hit_ratio,evictions,bytes_read,bytes_written,avg_latency_ns,runtime_seconds\n";
     }
 
     auto now = std::chrono::system_clock::now();
@@ -332,10 +326,7 @@ void append_log(const Args& args, const ParsedStats& s) {
         << s.bytes_read << ','
         << s.bytes_written << ','
         << s.avg_latency_ns << ','
-        << s.runtime_seconds << ','
-        << s.p50_latency_ns << ','
-        << s.p95_latency_ns << ','
-        << s.p99_latency_ns
+        << s.runtime_seconds
         << '\n';
 }
 
@@ -440,7 +431,6 @@ int main(int argc, char** argv) {
                   << " misses=" << stats.misses
                   << " hit_ratio=" << stats.hit_ratio
                   << " duration=" << stats.runtime_seconds
-                  << " p99_ns=" << stats.p99_latency_ns
                   << " log=" << args.log_file
                   << std::endl;
 

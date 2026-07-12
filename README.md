@@ -144,9 +144,6 @@ Each run appends a row that includes:
 - bytes read
 - bytes written
 - average latency
-- p50 latency
-- p95 latency
-- p99 latency
 
 ## Commenting and Code Style Guidance
 
