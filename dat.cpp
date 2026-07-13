@@ -62,10 +62,17 @@ struct App {
     std::size_t id;
 };
 
+struct BlockedApp : public App {
+    std::uint64_t block_time;
+    
+    BlockedApp(PipePair* rw_pipe, std::promise<int>* res, std::size_t id, std::uint64_t block_time):
+        App(rw_pipe, res, id), block_time(block_time) {}
+};
+
 struct ResumeContext {
     std::uint64_t page = 0;
     std::uint64_t ready = 0;    // when the data will be ready
-    std::vector<App>* apps = nullptr;
+    std::vector<BlockedApp>* apps = nullptr;
 
     ~ResumeContext() = default;
 
@@ -156,7 +163,7 @@ struct WorkerThread {
     Stats& stats;
     std::shared_mutex& mu;
     std::priority_queue<ResumeContext>& pq;
-    std::unordered_map<std::uint64_t, std::vector<App>*>& rmap;    // in-flight map
+    std::unordered_map<std::uint64_t, std::vector<BlockedApp>*>& rmap;    // in-flight map
     const std::uint64_t warmup;
 
     void operator()() {
@@ -199,12 +206,10 @@ struct WorkerThread {
 
         // manage cache
         bool hit;
-        std::uint64_t sim_elapsed_ns;
         ResumeContext resume;
         {
             std::lock_guard _{mu};
             hit = cache.present(page);
-            sim_elapsed_ns = cache.get_page_ns(page);
 
             // True critical section -- we update priority queue and cache
 
@@ -225,6 +230,7 @@ struct WorkerThread {
         std::ostringstream resp;
         resp << "RESP " << kPageBytes << "\n";
 
+        std::uint64_t total_blocked_time = 0;
         if (resume.apps) {
             // respond and yield to blocked apps
             for (auto app : *resume.apps) {
@@ -239,6 +245,7 @@ struct WorkerThread {
                     stats, mu, pq, rmap,
                     warmup
                 }).detach();
+                total_blocked_time += resume.ready - app.block_time;
             }
             delete resume.apps;
         }
@@ -248,25 +255,24 @@ struct WorkerThread {
             stats.hits.fetch_add(hit);
             stats.misses.fetch_add(1 - hit);
             // stats.evictions = 0;    // TODO evictions
-            stats.total_latencies.fetch_add(sim_elapsed_ns);
+            stats.total_latencies.fetch_add(total_blocked_time);
         }
     }
 
     void add_to_queue(std::uint64_t page, bool is_prefetch) {
         // non-thread safe
         // adds the page to in-flight queue
+        // returns the time elapsed before the page will be available again
 
         // crashes when (page=0, is_prefetch=false)
 
         // Check if rmap already has the entry
         auto in_flight = rmap.find(page);
+        std::vector<BlockedApp>* resume_apps;
+        std::uint64_t sim_time = stats.sim_time_elapsed.load();
         if (in_flight == rmap.end()) {
-            std::uint64_t sim_time = stats.sim_time_elapsed.load();
             std::uint64_t sim_elapsed_ns = cache.get_page_ns(page);
-            std::vector<App>* resume_apps = new std::vector<App>{};
-
-            if (!is_prefetch)
-                resume_apps->push_back(self);
+            resume_apps = new std::vector<BlockedApp>{};
 
             pq.emplace(
                 page,
@@ -275,9 +281,16 @@ struct WorkerThread {
             );
             rmap[page] = resume_apps;
         } else {
-            if (!is_prefetch)
-                in_flight->second->push_back(self);
+            resume_apps = in_flight->second;
         }
+
+        if (!is_prefetch)
+            resume_apps->emplace_back(
+                self.rw_pipe,
+                self.res,
+                self.id,
+                sim_time
+            );
     }
 
     ResumeContext pop_from_queue() {
@@ -337,7 +350,7 @@ int main(int argc, char** argv) {
         std::vector<std::future<int>> responses(n);
         std::vector<PipePair> pipes(n);
         std::priority_queue<ResumeContext> pq;
-        std::unordered_map<std::uint64_t, std::vector<App>*> rmap;
+        std::unordered_map<std::uint64_t, std::vector<BlockedApp>*> rmap;
         std::shared_mutex mu;   // Protects critical sections
 
         for (std::size_t worker_id = 0; worker_id < args.w_pipes.size(); ++worker_id) {
