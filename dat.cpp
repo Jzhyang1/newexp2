@@ -56,21 +56,21 @@ struct Stats {
     std::atomic<std::uint64_t> total_latencies{0};
 };
 
+struct App {
+    PipePair* rw_pipe;
+    std::promise<int>* res;
+    std::size_t id;
+};
+
 struct ResumeContext {
-    std::uint64_t ready;
-    std::uint64_t page;
-    PipePair* app;
+    std::uint64_t page = 0;
+    std::uint64_t ready = 0;    // when the data will be ready
+    std::vector<App>* apps = nullptr;
 
     ~ResumeContext() = default;
 
     bool operator<(const ResumeContext& other) const {
         // reverse-ordering
-        if (ready == other.ready) {
-            // prefetched pages come first on tie because
-            // 1. prefetched pages should show up by the time they are accessed without triggering another remote disk access
-            // 2. because we will evict prefetched pages first, so we make prefetched pages older
-            return app != nullptr && other.app == nullptr;
-        }
         return ready > other.ready;
     }
 };
@@ -133,27 +133,42 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
+
+/*
+ Invariants:
+ - Every app will have a corresponding PipePair* throughout
+   the lifetime of dat
+ - There is a unique pointer to PipePair* that is either in
+   a ResumeContext within pq or in-flight with a WorkerThread
+   at all times
+ - Every request of each app has a corresponding WorkerThread
+ - Access to values in rmap are unique either by accessing 
+   or popping the value during the critical section
+ - Termination occurs exactly once per app if there are no errors
+   by the thread that receives the DONE marker
+ */
+
 struct WorkerThread {
-    PipePair* rw_pipe;
+    App self; // the app that spawned the worker - all fields are non-null
     policy::Cache& cache;
     policy::CachePolicy* evict_policy;
     policy::CachePolicy* prefetch_policy;
     Stats& stats;
     std::shared_mutex& mu;
     std::priority_queue<ResumeContext>& pq;
-    std::promise<int>& res;
+    std::unordered_map<std::uint64_t, std::vector<App>*>& rmap;    // in-flight map
     const std::uint64_t warmup;
 
     void operator()() {
         std::string line;
         do {
             // look for a request
-            if (rw_pipe->read_line(line)) {
-                res.set_value(1);   // crash without terminate
+            if (self.rw_pipe->read_line(line)) {
+                self.res->set_value(1);   // crash without terminate
                 return;
             }
             if (line.rfind("DONE ", 0) == 0) {
-                res.set_value(0);   // terminate
+                self.res->set_value(0);   // terminate
                 return;
             }
         } while (line.rfind("REQ ", 0) != 0);
@@ -165,75 +180,68 @@ struct WorkerThread {
         std::uint64_t page = 0;
         if (!(in >> op >> client_id >> seq >> page)) {
             std::cerr << "Bad request: " << line << std::endl;
-            res.set_value(2);   // crash without terminate
+            self.res->set_value(2);   // crash without terminate
             return;
         }
 
         // manage real-world timings of simulation
         auto real_time = std::chrono::steady_clock::now();
+        auto expected_first_time = no_first_time;
         stats.last_time.store(real_time);
-        stats.first_time.compare_exchange_strong(no_first_time, real_time);
+        stats.first_time.compare_exchange_strong(expected_first_time, real_time);
 
         // manage simulation timings
         std::uint64_t global_idx = stats.request_count.fetch_add(1) + 1;
-        std::uint64_t sim_time = stats.sim_time_elapsed.load();
 
         // decide on who to prefetch
         policy::PrefetchRequest prefetch_req;
-        if (prefetch_policy) prefetch_policy->on_prefetch_request(rw_pipe->r_fd, page, prefetch_req);
+        if (prefetch_policy) prefetch_policy->on_prefetch_request(self.id, page, prefetch_req);
 
         // manage cache
-        mu.lock_shared();
-        bool hit = cache.present(page);
-
-        if (!mu.try_lock()) {
-            // try to acquire write permissions to cache
-            mu.unlock_shared();
-            mu.lock();
-        }
-
-        // True critical section -- we update priority queue and cache
-        std::uint64_t sim_elapsed_ns = cache.get_page_ns(page);
-        pq.push(ResumeContext{
-            sim_time + sim_elapsed_ns,
-            page,
-            rw_pipe,
-        });
-        for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
-            std::uint64_t sim_elapsed_ns = cache.get_page_ns(prefetch_req.pages[i]);
-            pq.push(ResumeContext{
-                sim_time + sim_elapsed_ns,
-                prefetch_req.pages[i],
-                nullptr,
-            });
-        }
-
-        // Pop all fetched pages that arrive by the next timestamp
-        
+        bool hit;
+        std::uint64_t sim_elapsed_ns;
         ResumeContext resume;
-        do {
-            resume = pq.top(); pq.pop();
-            cache.insert(resume.page, 0);   // we presently assume infinite cache size
-            stats.sim_time_elapsed.store(resume.ready);
-        } while(resume.app == nullptr);     // get the next app to yield to
+        {
+            std::lock_guard _{mu};
+            hit = cache.present(page);
+            sim_elapsed_ns = cache.get_page_ns(page);
 
-        mu.unlock();
-        // Critical section end
+            // True critical section -- we update priority queue and cache
+
+            add_to_queue(page, false);
+            for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
+                add_to_queue(prefetch_req.pages[i], true);
+            }
+
+            // Pop all fetched pages that arrive by the next timestamp
+            resume = pop_from_queue();
+
+            if (resume.apps) {
+                // this cleanup is unsafe outside of critical section
+                rmap.erase(resume.page);
+            }
+        } // Critical section end
 
         std::ostringstream resp;
         resp << "RESP " << kPageBytes << "\n";
-        if (rw_pipe->write_all(resp.str())) {
-            res.set_value(3);   // crash due to pipe failure
-            return;
-        }
 
-        // go to next app
-        std::thread(WorkerThread{
-            resume.app,
-            cache, evict_policy, prefetch_policy,
-            stats, mu, pq, res,
-            warmup
-        }).detach();
+        if (resume.apps) {
+            // respond and yield to blocked apps
+            for (auto app : *resume.apps) {
+                if (app.rw_pipe->write_all(resp.str())) {
+                    app.res->set_value(3);   // crash due to pipe failure
+                    return;
+                }
+                
+                std::thread(WorkerThread{
+                    app,
+                    cache, evict_policy, prefetch_policy,
+                    stats, mu, pq, rmap,
+                    warmup
+                }).detach();
+            }
+            delete resume.apps;
+        }
 
         // log metrics
         if (global_idx > warmup) {
@@ -242,6 +250,54 @@ struct WorkerThread {
             // stats.evictions = 0;    // TODO evictions
             stats.total_latencies.fetch_add(sim_elapsed_ns);
         }
+    }
+
+    void add_to_queue(std::uint64_t page, bool is_prefetch) {
+        // non-thread safe
+        // adds the page to in-flight queue
+
+        // crashes when (page=0, is_prefetch=false)
+
+        // Check if rmap already has the entry
+        auto in_flight = rmap.find(page);
+        if (in_flight == rmap.end()) {
+            std::uint64_t sim_time = stats.sim_time_elapsed.load();
+            std::uint64_t sim_elapsed_ns = cache.get_page_ns(page);
+            std::vector<App>* resume_apps = new std::vector<App>{};
+
+            if (!is_prefetch)
+                resume_apps->push_back(self);
+
+            pq.emplace(
+                page,
+                sim_time + sim_elapsed_ns,
+                resume_apps
+            );
+            rmap[page] = resume_apps;
+        } else {
+            if (!is_prefetch)
+                in_flight->second->push_back(self);
+        }
+    }
+
+    ResumeContext pop_from_queue() {
+        // not thread safe
+        // pops until we have threads to yield to; prefetch requests will also be handled
+
+        if (pq.empty()) return ResumeContext{};
+        ResumeContext resume = pq.top(); pq.pop();
+        while(resume.apps->empty()) {
+            cache.insert(resume.page, 0);   // we presently assume infinite cache size
+            stats.sim_time_elapsed.store(resume.ready);
+            // clean up for metadata discarded
+            rmap.erase(resume.page);
+            delete resume.apps;
+            if (pq.empty()) return ResumeContext{};
+            resume = pq.top(); pq.pop();
+        }
+        cache.insert(resume.page, 0);   // we presently assume infinite cache size
+        stats.sim_time_elapsed.store(resume.ready);
+        return resume;
     }
 };
 
@@ -276,10 +332,12 @@ int main(int argc, char** argv) {
         stats.first_time.store(no_first_time);  // cmp-xchg to set on first request
         stats.last_time.store(no_last_time);    // swap to update on each request
 
-        std::vector<std::promise<int>> promises(args.w_pipes.size());
-        std::vector<std::future<int>> responses(args.w_pipes.size());
-        std::vector<PipePair> pipes(args.w_pipes.size());
+        std::size_t n = args.w_pipes.size();
+        std::vector<std::promise<int>> promises(n);
+        std::vector<std::future<int>> responses(n);
+        std::vector<PipePair> pipes(n);
         std::priority_queue<ResumeContext> pq;
+        std::unordered_map<std::uint64_t, std::vector<App>*> rmap;
         std::shared_mutex mu;   // Protects critical sections
 
         for (std::size_t worker_id = 0; worker_id < args.w_pipes.size(); ++worker_id) {
@@ -291,9 +349,9 @@ int main(int argc, char** argv) {
             pipes[worker_id] = {w_fd, r_fd};
 
             std::thread(WorkerThread{
-                &pipes[worker_id],
+                {&pipes[worker_id], &promises[worker_id], worker_id},
                 cache, evict_policy, prefetch_policy,
-                stats, mu, pq, promises[worker_id],
+                stats, mu, pq, rmap,
                 warmup
             }).detach();
         }
