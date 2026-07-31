@@ -10,7 +10,8 @@ BUILD_DIR := build
 BIN_DIR := bin
 
 # Source layout
-POLICY_SRCS := policies/cache.cpp policies/policy_lru.cpp policies/policy_lru_cxt_aware.cpp policies/policy_readahead.cpp
+POLICY_SRCS := $(wildcard policies/*.cpp)
+WORKLOAD_SRCS := $(wildcard workloads/*.cpp)
 APP_SRC := app.cpp
 DAT_SRC := dat.cpp
 RUNNER_SRC := runner.cpp
@@ -20,17 +21,18 @@ DAT_BIN := $(BIN_DIR)/dat
 RUNNER_BIN := $(BIN_DIR)/runner
 
 # Default experiment parameters for `make run`
-N ?= 1
 SEED ?= 1
-CAPACITY ?= 1048576
-CACHE_POLICY ?= lru
+CAPACITY ?= 4096
+EVICT_POLICY ?= lru
 PREFETCH_POLICY ?= none
 MISS_DELAY_NS ?= 300000
 HIT_DELAY_NS ?=  100000
 FILE_DATA ?= ./data.bin
-FRAC_SCAN ?= 0.5
+CONFIG ?= configs/zipfian.txt
 WARMUP ?= 0
 LOG ?= ./logs/results.csv
+PAGE_SPAN ?= 10485760
+REQUESTS ?= 200000
 
 # Ensure these targets always run when requested.
 .PHONY: all dirs app dat runner run clean print-config
@@ -43,8 +45,8 @@ dirs:
 # Build the app workload executable.
 app: $(APP_BIN)
 
-$(APP_BIN): $(APP_SRC) | dirs
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+$(APP_BIN): $(APP_SRC) $(WORKLOAD_SRCS) | dirs
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Build the cache daemon with policy implementations linked in.
 dat: $(DAT_BIN)
@@ -61,7 +63,7 @@ $(RUNNER_BIN): $(RUNNER_SRC) | dirs
 print-config:
 	@echo "N=$(N)"
 	@echo "SEED=$(SEED)"
-	@echo "CACHE_POLICY=$(CACHE_POLICY)"
+	@echo "EVICT_POLICY=$(EVICT_POLICY)"
 	@echo "CAPACITY=$(CAPACITY)"
 	@echo "MISS_DELAY_NS=$(MISS_DELAY_NS)"
 	@echo "HIT_DELAY_NS=$(HIT_DELAY_NS)"
@@ -73,17 +75,17 @@ print-config:
 # Run one full experiment via runner. Override vars at invocation time.
 run: all print-config
 	$(RUNNER_BIN) \
-		-n $(N) \
 		--seed $(SEED) \
-		--cache-policy $(CACHE_POLICY) \
+		--evict-policy $(EVICT_POLICY) \
 		--prefetch-policy $(PREFETCH_POLICY) \
 		--capacity $(CAPACITY) \
 		--miss-delay $(MISS_DELAY_NS) \
 		--hit-delay $(HIT_DELAY_NS) \
 		--file-data $(FILE_DATA) \
-		--frac-scan $(FRAC_SCAN) \
 		--warmup-period $(WARMUP) \
-		--log $(LOG)
+		--log $(LOG) \
+		--requests $(REQUESTS) \
+		--config $(CONFIG)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)

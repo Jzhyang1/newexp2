@@ -32,7 +32,7 @@ auto no_first_time = std::chrono::steady_clock::time_point::max();
 auto no_last_time = std::chrono::steady_clock::time_point::min();
 
 struct Args {
-    std::string cache_policy = "lru";
+    std::string evict_policy = "lru";
     std::string prefetch_policy = "none";
     std::uint64_t prefetch_amount = 0; // only used for some prefetchers; ignored otherwise
     std::size_t capacity = (1 << 20);
@@ -72,7 +72,12 @@ struct BlockedApp : public App {
 struct ResumeContext {
     std::uint64_t page = 0;
     std::uint64_t ready = 0;    // when the data will be ready
-    std::vector<BlockedApp>* apps = nullptr;
+    std::vector<BlockedApp>* blocked_apps = nullptr;
+    std::uint64_t trigger_app = 0;  // the app that triggered the fetch
+        // we assume that a single trigger app is sufficient
+        // because we assume that it is infrequent that 2 different
+        // processes request the same page.
+        // this is used for eviction.
 
     ~ResumeContext() = default;
 
@@ -104,8 +109,8 @@ Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
-        if (key == "--cache-policy") {
-            a.cache_policy = require_value(i, argc, argv);
+        if (key == "--evict-policy") {
+            a.evict_policy = require_value(i, argc, argv);
         } else if (key == "--capacity") {
             a.capacity = static_cast<std::size_t>(std::stoull(require_value(i, argc, argv)));
         } else if (key == "--in-pipes") {
@@ -221,7 +226,7 @@ struct WorkerThread {
             // Pop all fetched pages that arrive by the next timestamp
             resume = pop_from_queue();
 
-            if (resume.apps) {
+            if (resume.blocked_apps) {
                 // this cleanup is unsafe outside of critical section
                 rmap.erase(resume.page);
             }
@@ -231,9 +236,9 @@ struct WorkerThread {
         resp << "RESP " << kPageBytes << "\n";
 
         std::uint64_t total_blocked_time = 0;
-        if (resume.apps) {
+        if (resume.blocked_apps) {
             // respond and yield to blocked apps
-            for (auto app : *resume.apps) {
+            for (auto app : *resume.blocked_apps) {
                 if (app.rw_pipe->write_all(resp.str())) {
                     app.res->set_value(3);   // crash due to pipe failure
                     return;
@@ -247,7 +252,7 @@ struct WorkerThread {
                 }).detach();
                 total_blocked_time += resume.ready - app.block_time;
             }
-            delete resume.apps;
+            delete resume.blocked_apps;
         }
 
         // log metrics
@@ -277,7 +282,8 @@ struct WorkerThread {
             pq.emplace(
                 page,
                 sim_time + sim_elapsed_ns,
-                resume_apps
+                resume_apps,
+                self.id
             );
             rmap[page] = resume_apps;
         } else {
@@ -298,19 +304,60 @@ struct WorkerThread {
         // pops until we have threads to yield to; prefetch requests will also be handled
 
         if (pq.empty()) return ResumeContext{};
+
         ResumeContext resume = pq.top(); pq.pop();
-        while(resume.apps->empty()) {
-            cache.insert(resume.page, 0);   // we presently assume infinite cache size
+        while(resume.blocked_apps->empty()) {
+            add_to_cache(resume);
             stats.sim_time_elapsed.store(resume.ready);
             // clean up for metadata discarded
             rmap.erase(resume.page);
-            delete resume.apps;
+            delete resume.blocked_apps;
             if (pq.empty()) return ResumeContext{};
             resume = pq.top(); pq.pop();
         }
-        cache.insert(resume.page, 0);   // we presently assume infinite cache size
+        add_to_cache(resume);   // this is the actual page that things are blocked on
         stats.sim_time_elapsed.store(resume.ready);
         return resume;
+    }
+
+    void add_to_cache(ResumeContext& ctx) {
+        if (cache.present(ctx.page)) return;    // TODO consider what happens if we
+            // instead of noop-ing eviction when ctx is present,
+            // we still allow eviction, just don't add ctx.page into cache.
+            // this is helpful if we ever allow batch flushing to remote volume
+            // (we get to evict faster later) but for simulation, it will not matter.
+
+        policy::EvictRequest evictions;
+        if(evict_policy) evict_policy->on_evict_request(ctx.trigger_app, ctx.page, evictions);
+
+        // we will accept all suggested evictions for now
+        for (std::uint64_t i = 0; i < evictions.n_pages; ++i) {
+            auto evict_page = evictions.pages[i];
+            cache.evict(evict_page);
+            evict_page_for_all(evict_page, *ctx.blocked_apps);
+        }
+
+        // admit
+        auto force_evicted = cache.insert(ctx.page);
+        if (!force_evicted.first) {
+            std::cerr << "random eviction: " << force_evicted.second << std::endl;
+            // if the eviction request doesn't free up space, then
+            // we need to evict another page
+            evict_page_for_all(force_evicted.second, *ctx.blocked_apps);
+        }
+        admit_page_for_all(ctx.page, *ctx.blocked_apps);
+    }
+
+    inline void evict_page_for_all(std::uint64_t page, std::vector<BlockedApp>& apps) {
+        if (evict_policy == nullptr) return;
+        for (auto &app : apps)
+            evict_policy->on_evict(app.id, page);
+    }
+
+    inline void admit_page_for_all(std::uint64_t page, std::vector<BlockedApp>& apps) {
+        if (evict_policy == nullptr) return;
+        for (auto &app : apps)
+            evict_policy->on_admit(app.id, page);
     }
 };
 
@@ -327,13 +374,15 @@ int main(int argc, char** argv) {
         policy::Cache cache(args.capacity, args.hit_delay_ns, args.miss_delay_ns);
         policy::CachePolicy* evict_policy = nullptr;
         policy::CachePolicy* prefetch_policy = nullptr;
-        // if (args.cache_policy == "lru") {
-        //     policy::create_lru(cache);
-        // } else if (args.cache_policy == "lru-cxt-aware") {
-        //     policy::create_lru_cxt_aware(cache);
-        // } else {
-        //     throw std::runtime_error("Unsupported --cache-policy: " + args.cache_policy);
-        // }
+        if (args.evict_policy == "fifo") {
+            evict_policy = new policy::FIFOPolicy(cache);
+        } else if (args.evict_policy == "lifo") {
+            evict_policy = new policy::LIFOPolicy(cache);
+        } else if (args.evict_policy == "lru") {
+            evict_policy = new policy::LRUPolicy(cache);
+        } else if (args.evict_policy != "none") {
+            throw std::runtime_error("Unsupported --evict-policy: " + args.evict_policy);
+        }
 
         if (args.prefetch_policy == "readahead") {
             prefetch_policy = new policy::ReadaheadPolicy(cache);

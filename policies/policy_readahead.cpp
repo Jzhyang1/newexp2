@@ -9,7 +9,7 @@ namespace policy {
 
 ReadaheadPolicy::ReadaheadPolicy(Cache& cache) : CachePolicy(cache) {}
 
-void ReadaheadPolicy::on_access(std::uint64_t context, std::uint64_t page) {
+void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page) {
     (void)cache;
     (void)context;
     (void)page;

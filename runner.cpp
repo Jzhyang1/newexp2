@@ -24,15 +24,14 @@
 namespace {
 
 struct Args {
-    int n = 4;
     std::uint64_t seed = 1;
-    std::string cache_policy = "lru";
+    std::string evict_policy = "lru";
     std::string prefetch_policy = "none";
     std::size_t capacity = 4096;
     std::uint64_t miss_delay_ns = 300000;
     std::uint64_t hit_delay_ns = 30000;
     std::string file_data;
-    double frac_scan = 0.5;
+    std::string config_file;
     std::uint64_t warmup_period = 0;
     std::string log_file = "./logs/results.csv";
     std::uint64_t requests = 20000;
@@ -63,12 +62,10 @@ Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
-        if (key == "-n") {
-            a.n = std::stoi(require_value(i, argc, argv));
-        } else if (key == "--seed") {
+        if (key == "--seed") {
             a.seed = std::stoull(require_value(i, argc, argv));
-        } else if (key == "--cache-policy") {
-            a.cache_policy = require_value(i, argc, argv);
+        } else if (key == "--evict-policy") {
+            a.evict_policy = require_value(i, argc, argv);
         } else if (key == "--prefetch-policy") {
             a.prefetch_policy = require_value(i, argc, argv);
         } else if (key == "--capacity") {
@@ -79,8 +76,8 @@ Args parse_args(int argc, char** argv) {
             a.hit_delay_ns = std::stoull(require_value(i, argc, argv));
         } else if (key == "--file-data") {
             a.file_data = require_value(i, argc, argv);
-        } else if (key == "--frac-scan") {
-            a.frac_scan = std::stod(require_value(i, argc, argv));
+        } else if (key == "--config") {
+            a.config_file = require_value(i, argc, argv);
         } else if (key == "--warmup-period") {
             a.warmup_period = std::stoull(require_value(i, argc, argv));
         } else if (key == "--log") {
@@ -94,20 +91,45 @@ Args parse_args(int argc, char** argv) {
         }
     }
 
-    if (a.n <= 0) {
-        throw std::runtime_error("-n must be > 0");
-    }
     if (a.file_data.empty()) {
         throw std::runtime_error("--file-data is required");
     }
-    if (a.frac_scan < 0.0 || a.frac_scan > 1.0) {
-        throw std::runtime_error("--frac-scan must be in [0, 1]");
+    if (a.config_file.empty()) {
+        throw std::runtime_error("--config is required");
     }
     if (a.page_span == 0) {
         throw std::runtime_error("--page-span must be > 0");
     }
 
     return a;
+}
+
+std::vector<std::string> load_app_behaviors(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Failed to open config file: " + path);
+    }
+    std::vector<std::string> behaviors;
+    std::string line;
+    while (std::getline(in, line)) {
+        // Trim simple whitespace from edges if present
+        std::size_t start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) continue; // Skip empty lines
+        if (line[start] == '#') continue;         // Allow comments
+
+        std::size_t end = line.find_last_not_of(" \t\r\n");
+        std::string b = line.substr(start, end - start + 1);
+
+        if (b != "scan" && b != "random-read" && b != "zipfian") {
+            throw std::runtime_error("Invalid behavior in config file: " + b);
+        }
+        behaviors.push_back(b);
+    }
+
+    if (behaviors.empty()) {
+        throw std::runtime_error("Config file contained no valid app behaviors");
+    }
+    return behaviors;
 }
 
 std::string join_csv(const std::vector<int>& v) {
@@ -163,7 +185,6 @@ pid_t spawn_dat_with_stdout_pipe(const std::vector<std::string>& args, int* read
     if (pid == 0) {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
-        // dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         execv(argv[0], argv.data());
         std::perror("execv dat");
@@ -281,7 +302,7 @@ void ensure_parent_dir(const std::string& path) {
     }
 }
 
-void append_log(const Args& args, const ParsedStats& s) {
+void append_log(const Args& args, std::size_t app_count, const ParsedStats& s) {
     ensure_parent_dir(args.log_file);
 
     bool need_header = true;
@@ -296,8 +317,8 @@ void append_log(const Args& args, const ParsedStats& s) {
     }
 
     if (need_header) {
-        out << "timestamp,machine,commit_hash,n,seed,cache_policy,prefetch_policy,capacity,miss_delay_ns,hit_delay_ns,file_data,"
-               "frac_scan,warmup_period,requests,page_span,hits,misses,"
+        out << "timestamp,machine,commit_hash,n,seed,evict_policy,prefetch_policy,capacity,miss_delay_ns,hit_delay_ns,file_data,"
+               "config_file,warmup_period,requests,page_span,hits,misses,"
                "hit_ratio,evictions,bytes_read,bytes_written,avg_latency_ns,runtime_seconds\n";
     }
 
@@ -307,15 +328,15 @@ void append_log(const Args& args, const ParsedStats& s) {
     out << ts << ','
         << get_hostname() << ','
         << get_git_commit() << ','
-        << args.n << ','
+        << app_count << ','
         << args.seed << ','
-        << args.cache_policy << ','
+        << args.evict_policy << ','
         << args.prefetch_policy << ','
         << args.capacity << ','
         << args.miss_delay_ns << ','
         << args.hit_delay_ns << ','
         << args.file_data << ','
-        << args.frac_scan << ','
+        << args.config_file << ','
         << args.warmup_period << ','
         << args.requests << ','
         << args.page_span << ','
@@ -333,15 +354,15 @@ void append_log(const Args& args, const ParsedStats& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<std::string> fifo_paths;
     try {
         Args args = parse_args(argc, argv);
+        std::vector<std::string> app_behaviors = load_app_behaviors(args.config_file);
+        std::size_t n = app_behaviors.size();
 
         std::filesystem::path run_dir = std::filesystem::path("./build") /
                                         ("run_" + std::to_string(::getpid()) + "_" + std::to_string(args.seed));
         std::filesystem::create_directories(run_dir);
 
-        std::size_t n = args.n;
         std::vector<PipePair> r_pipes(n);
         std::vector<PipePair> w_pipes(n);
         std::vector<int> dat_r_pipes(n);
@@ -349,7 +370,7 @@ int main(int argc, char** argv) {
         std::vector<int> app_r_pipes(n);
         std::vector<int> app_w_pipes(n);
 
-        for (int i = 0; i < args.n; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             if (r_pipes[i].open() || w_pipes[i].open()) {
                 throw std::runtime_error("mkfifo failed");
             }
@@ -361,7 +382,7 @@ int main(int argc, char** argv) {
 
         std::vector<std::string> dat_cmd = {
             "./bin/dat",
-            "--cache-policy", args.cache_policy,
+            "--evict-policy", args.evict_policy,
             "--prefetch-policy", args.prefetch_policy,
             "--capacity", std::to_string(args.capacity),
             "--in-pipes", join_csv(dat_r_pipes),
@@ -377,18 +398,16 @@ int main(int argc, char** argv) {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-        std::size_t scan_apps = static_cast<std::size_t>(args.frac_scan * static_cast<double>(args.n));
         std::vector<pid_t> app_pids;
-        app_pids.reserve(static_cast<std::size_t>(args.n));
+        app_pids.reserve(n);
 
-        for (int i = 0; i < args.n; ++i) {
-            const bool is_scan = static_cast<std::size_t>(i) < scan_apps;
+        for (std::size_t i = 0; i < n; ++i) {
             std::vector<std::string> app_cmd = {
                 "./bin/app",
-                "--behavior", is_scan ? "scan" : "random-read",
+                "--behavior", app_behaviors[i],
                 "--seed", std::to_string(args.seed + static_cast<std::uint64_t>(i)),
-                "--in-pipe", std::to_string(app_r_pipes[static_cast<std::size_t>(i)]),
-                "--out-pipe", std::to_string(app_w_pipes[static_cast<std::size_t>(i)]),
+                "--in-pipe", std::to_string(app_r_pipes[i]),
+                "--out-pipe", std::to_string(app_w_pipes[i]),
                 "--client-id", std::to_string(i),
                 "--requests", std::to_string(args.requests),
                 "--page-span", std::to_string(args.page_span),
@@ -418,7 +437,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        append_log(args, stats);
+        append_log(args, n, stats);
 
         if (app_failures) {
             std::cout << "runner: apps_failed=" << app_failures << std::endl;

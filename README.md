@@ -60,7 +60,7 @@ Each app runs independently in parallel, and multiple app instances can run on t
 
 Represents the software-managed cache process.
 
-- `--cache-policy`: `lru` or `lru-cxt-aware`
+- `--evict-policy`: `lru` or `lru-cxt-aware`
 - `--capacity`: cache size in pages
 - `--in-pipes`: list of app inbound pipes (`dat` writes responses)
 - `--out-pipes`: list of app outbound pipes (`dat` reads requests)
@@ -84,7 +84,7 @@ Experiment orchestrator.
 
 - `-n`: number of app processes
 - `--seed`: base seed (`seed + i` for app `i`)
-- `--cache-policy`: `lru` or `lru-cxt-aware`
+- `--evict-policy`: `lru` or `lru-cxt-aware`
 - `--prefetch-policy`: `readahead`
 - `--prefetch-amount`: number of pages to prefetch
 - `--capacity`: cache size in pages

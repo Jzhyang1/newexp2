@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -10,7 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include "pipe_pair.hpp"
+#include "workloads/workload.h"
 
 namespace {
 
@@ -57,8 +60,8 @@ Args parse_args(int argc, char** argv) {
             throw std::runtime_error("Unknown argument: " + key);
         }
     }
-    if (a.behavior != "scan" && a.behavior != "random-read") {
-        throw std::runtime_error("--behavior must be scan or random-read");
+    if (a.behavior != "scan" && a.behavior != "random-read" && a.behavior != "zipfian") {
+        throw std::runtime_error("--behavior must be scan, random-read, or zipfian");
     }
     if (a.page_span == 0) {
         throw std::runtime_error("--page-span must be > 0");
@@ -80,14 +83,23 @@ int main(int argc, char** argv) {
         std::uniform_int_distribution<uint64_t> random_page(0, args.page_span - 1);
         uint64_t scan_cursor = 0;
 
+        Workload* workload;
+        if (args.behavior == "scan") {
+            workload = new ScanWorkload(args.requests, 0l, 0l, args.seed);
+        } else if (args.behavior == "zipfian") {
+            workload = new ZipfianWorkload(
+                0l, 0l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, 0.99, args.seed
+            );
+        } else {
+            workload = new UniformWorkload(
+                0l, 1l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.seed
+            );
+        }
+
         for (uint64_t seq = 0; seq < args.requests; ++seq) {
-            uint64_t page = 0;
-            if (args.behavior == "scan") {
-                page = scan_cursor;
-                scan_cursor = (scan_cursor + 1) % args.page_span;
-            } else {
-                page = random_page(rng);
-            }
+            Operation op;
+            workload->next_op(&op);
+            uint64_t page = op.key;
 
             std::ostringstream request;
             request << "REQ " << args.client_id << " " << seq << " " << page << "\n";

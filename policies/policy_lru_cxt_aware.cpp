@@ -23,7 +23,7 @@ class ContextAwareLRUPolicy : CachePolicy {
 // 	}
 
 // public:
-// 	void on_access(Cache&, std::uint64_t context, std::uint64_t page) {
+// 	void on_admit(Cache&, std::uint64_t context, std::uint64_t page) {
 // 		auto& state = state_for(context);
 // 		auto it = state.page_to_iterator.find(page);
 // 		if (it != state.page_to_iterator.end()) {
@@ -33,7 +33,7 @@ class ContextAwareLRUPolicy : CachePolicy {
 // 		state.page_to_iterator[page] = state.recency_list.begin();
 // 	}
 
-// 	void on_eviction_request(Cache& cache, std::uint64_t context, std::uint64_t, EvictionRequest& request) {
+// 	void on_evict_request(Cache& cache, std::uint64_t context, std::uint64_t, EvictRequest& request) {
 // 		request.n_pages = 0;
 
 // 		auto state_it = context_state_.find(context);
