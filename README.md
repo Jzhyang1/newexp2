@@ -49,10 +49,12 @@ flowchart LR
 
 Represents one server workload process.
 
-- `--behavior`: `scan` or `random-read`
+- `--behavior`: `scan`, `random-read`, `zipfian`, or `trace`
 - `--seed`: per-process deterministic seed
 - `--in-pipe`: read data replies from `dat`
 - `--out-pipe`: send IO requests to `dat`
+- `--zipfian-alpha`: Zipfian skew constant, used only when `--behavior zipfian` (default `0.99`)
+- `--trace-file`: path to a trace, used only when `--behavior trace`; a newline-separated list of `uint64` page numbers replayed in order
 
 Each app runs independently in parallel, and multiple app instances can run on the same machine.
 
@@ -94,6 +96,19 @@ Experiment orchestrator.
 - `--frac-scan`: fraction of apps using `scan`
 - `--warmup-period`: requests to exclude from reporting
 - `--log`: output log path (append mode)
+- `--config`: path to a config file; one app per line (see below)
+
+The config file has one line per app process, each `<behavior> [arg]`:
+
+```
+scan
+random-read
+zipfian
+zipfian 1.2       # optional Zipfian alpha override (default 0.99)
+trace traces/db_trace.txt   # replays the given trace file (see app.cpp above)
+```
+
+Blank lines and lines starting with `#` are ignored.
 
 Notes:
 

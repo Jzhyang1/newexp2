@@ -38,8 +38,9 @@ void LRUPolicy::on_evict_request(std::uint64_t context, std::uint64_t page, Evic
     if (cache.size() < cache.capacity) return;
     
     // Suggest pages from the back of the recency list (least recently used)
+    // we suggest 1 page for now
     auto it = recency_list.rbegin();
-    while (it != recency_list.rend() && request.n_pages < MAX_EVICT_PAGES) {
+    while (it != recency_list.rend() && request.n_pages < 1) {
         std::uint64_t victim_page = *it;
         request.pages[request.n_pages++] = victim_page;
         ++it;

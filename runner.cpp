@@ -104,12 +104,17 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
-std::vector<std::string> load_app_behaviors(const std::string& path) {
+struct AppSpec {
+    std::string behavior;
+    std::vector<std::string> args;  // behavior-specific: trace path, or zipfian alpha
+};
+
+std::vector<AppSpec> load_app_behaviors(const std::string& path) {
     std::ifstream in(path);
     if (!in) {
         throw std::runtime_error("Failed to open config file: " + path);
     }
-    std::vector<std::string> behaviors;
+    std::vector<AppSpec> behaviors;
     std::string line;
     while (std::getline(in, line)) {
         // Trim simple whitespace from edges if present
@@ -118,12 +123,42 @@ std::vector<std::string> load_app_behaviors(const std::string& path) {
         if (line[start] == '#') continue;         // Allow comments
 
         std::size_t end = line.find_last_not_of(" \t\r\n");
-        std::string b = line.substr(start, end - start + 1);
+        std::string trimmed = line.substr(start, end - start + 1);
 
-        if (b != "scan" && b != "random-read" && b != "zipfian") {
-            throw std::runtime_error("Invalid behavior in config file: " + b);
+        std::istringstream tokens(trimmed);
+        AppSpec spec;
+        tokens >> spec.behavior;
+        std::string arg;
+        while (tokens >> arg) {
+            spec.args.push_back(arg);
         }
-        behaviors.push_back(b);
+
+        if (spec.behavior != "scan" && spec.behavior != "random-read" &&
+            spec.behavior != "zipfian" && spec.behavior != "trace") {
+            throw std::runtime_error("Invalid behavior in config file: " + spec.behavior);
+        }
+        if (spec.behavior == "trace" && spec.args.size() != 1) {
+            throw std::runtime_error("trace behavior requires exactly one arg (trace file path): " + trimmed);
+        }
+        if (spec.behavior == "zipfian" && spec.args.size() > 1) {
+            throw std::runtime_error("zipfian behavior accepts at most one arg (alpha): " + trimmed);
+        }
+        if ((spec.behavior == "scan" || spec.behavior == "random-read") && !spec.args.empty()) {
+            throw std::runtime_error(spec.behavior + " behavior does not accept args: " + trimmed);
+        }
+        if (spec.behavior == "zipfian" && spec.args.size() == 1) {
+            try {
+                std::size_t consumed = 0;
+                std::stod(spec.args[0], &consumed);
+                if (consumed != spec.args[0].size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+            } catch (const std::exception&) {
+                throw std::runtime_error("zipfian alpha is not a valid number: " + spec.args[0]);
+            }
+        }
+
+        behaviors.push_back(std::move(spec));
     }
 
     if (behaviors.empty()) {
@@ -356,7 +391,7 @@ void append_log(const Args& args, std::size_t app_count, const ParsedStats& s) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
-        std::vector<std::string> app_behaviors = load_app_behaviors(args.config_file);
+        std::vector<AppSpec> app_behaviors = load_app_behaviors(args.config_file);
         std::size_t n = app_behaviors.size();
 
         std::filesystem::path run_dir = std::filesystem::path("./build") /
@@ -402,9 +437,10 @@ int main(int argc, char** argv) {
         app_pids.reserve(n);
 
         for (std::size_t i = 0; i < n; ++i) {
+            const AppSpec& spec = app_behaviors[i];
             std::vector<std::string> app_cmd = {
                 "./bin/app",
-                "--behavior", app_behaviors[i],
+                "--behavior", spec.behavior,
                 "--seed", std::to_string(args.seed + static_cast<std::uint64_t>(i)),
                 "--in-pipe", std::to_string(app_r_pipes[i]),
                 "--out-pipe", std::to_string(app_w_pipes[i]),
@@ -412,6 +448,13 @@ int main(int argc, char** argv) {
                 "--requests", std::to_string(args.requests),
                 "--page-span", std::to_string(args.page_span),
             };
+            if (spec.behavior == "trace") {
+                app_cmd.push_back("--trace-file");
+                app_cmd.push_back(spec.args[0]);
+            } else if (spec.behavior == "zipfian" && !spec.args.empty()) {
+                app_cmd.push_back("--zipfian-alpha");
+                app_cmd.push_back(spec.args[0]);
+            }
             app_pids.push_back(spawn_child(app_cmd));
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }

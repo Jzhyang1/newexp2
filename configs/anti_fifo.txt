@@ -1,0 +1,5 @@
+# with cache size 2
+# lifo will have 0 hits
+# fifo will have 1 hits
+# LRU will have 2 hits
+trace traces/revisit.txt

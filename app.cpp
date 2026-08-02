@@ -5,6 +5,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -20,6 +21,8 @@ namespace {
 constexpr uint64_t kDefaultRequests = 20000;
 constexpr uint64_t kDefaultPageSpan = 1u << 16;
 
+constexpr double kDefaultZipfianAlpha = 0.99;
+
 struct Args {
     std::string behavior = "random-read";
     uint64_t seed = 1;
@@ -28,6 +31,8 @@ struct Args {
     uint32_t client_id = 0;
     uint64_t requests = kDefaultRequests;
     uint64_t page_span = kDefaultPageSpan;
+    double zipfian_alpha = kDefaultZipfianAlpha;
+    std::string trace_file;
 };
 
 std::string require_value(int& i, int argc, char** argv) {
@@ -56,15 +61,29 @@ Args parse_args(int argc, char** argv) {
             a.requests = std::stoull(require_value(i, argc, argv));
         } else if (key == "--page-span") {
             a.page_span = std::stoull(require_value(i, argc, argv));
+        } else if (key == "--zipfian-alpha") {
+            a.zipfian_alpha = std::stod(require_value(i, argc, argv));
+        } else if (key == "--trace-file") {
+            a.trace_file = require_value(i, argc, argv);
         } else {
             throw std::runtime_error("Unknown argument: " + key);
         }
     }
-    if (a.behavior != "scan" && a.behavior != "random-read" && a.behavior != "zipfian") {
-        throw std::runtime_error("--behavior must be scan, random-read, or zipfian");
+    if (a.behavior != "scan" && a.behavior != "random-read" && a.behavior != "zipfian" && a.behavior != "trace") {
+        throw std::runtime_error("--behavior must be scan, random-read, zipfian, or trace");
     }
     if (a.page_span == 0) {
         throw std::runtime_error("--page-span must be > 0");
+    }
+    if (a.behavior == "trace") {
+        if (a.trace_file.empty()) {
+            throw std::runtime_error("--trace-file is required when --behavior is trace");
+        }
+        // Fail before the pipe to `dat` is set up: once it's open, an app that
+        // exits early leaves `dat` blocked reading from a peer that never writes.
+        if (!std::ifstream(a.trace_file).is_open()) {
+            throw std::runtime_error("failed to open trace file: " + a.trace_file);
+        }
     }
     return a;
 }
@@ -88,15 +107,17 @@ int main(int argc, char** argv) {
             workload = new ScanWorkload(args.requests, 0l, 0l, args.seed);
         } else if (args.behavior == "zipfian") {
             workload = new ZipfianWorkload(
-                0l, 0l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, 0.99, args.seed
+                0l, 0l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.zipfian_alpha, args.seed
             );
+        } else if (args.behavior == "trace") {
+            workload = new ReaderTraceWorkload(args.trace_file, 0l);
         } else {
             workload = new UniformWorkload(
                 0l, 1l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.seed
             );
         }
 
-        for (uint64_t seq = 0; seq < args.requests; ++seq) {
+        for (uint64_t seq = 0; workload->has_next_op(); ++seq) {
             Operation op;
             workload->next_op(&op);
             uint64_t page = op.key;

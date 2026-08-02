@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <numeric>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <sstream>
 #include <list>
@@ -63,13 +64,9 @@ struct UniformWorkload : public Workload {
 	long scan_length;
 	struct OpProportion op_prop;
 
-	/* constants */
-	static constexpr int key_format_len = 64;
-
 	/* states */
 	unsigned int seed;
 	long cur_nr_op;
-	char key_format[key_format_len];
 
 	UniformWorkload(long value_size, long scan_length, long nr_entry, long nr_op, struct OpProportion op_prop, unsigned int seed);
 	void next_op(Operation *op) override;
@@ -86,16 +83,10 @@ struct ZipfianWorkload : public Workload {
 	long scan_length;
 	struct OpProportion op_prop;
 	double zipfian_constant;
-	//int scan_worker_count;
-	//bool do_only_scans = false;
-
-	/* constants */
-	static constexpr int key_format_len = 64;
 
 	/* states */
 	unsigned int seed;
 	long cur_nr_op;
-	char key_format[key_format_len];
 
 	double zetan;
 	double theta;
@@ -120,13 +111,10 @@ struct ScanWorkload : public Workload {
 	long start_key;
 
 	/* constants */
-	static constexpr int key_format_len = 64;
 
 	/* states */
 	unsigned int seed;
 	long cur_nr_entry;
-	char key_format[key_format_len];
-	std::vector<unsigned long> key_shuffle;
 	std::mutex lock;
 
 
@@ -138,6 +126,24 @@ private:
 	void generate_value_string(char *value_buffer);
 };
 
+struct ReaderTraceWorkload : public Workload {
+	/* states */
+	std::ifstream source;
+	long cur_nr_entry;
+	std::mutex lock;
+
+
+	ReaderTraceWorkload(std::string path, long value_size);
+	void next_op(Operation *op) override;
+	bool has_next_op() override;
+
+private:
+    std::uint64_t _next_op;	// pre-read
+	bool _has_next_op;
+	bool has_next_op_unsafe();
+    bool next_op_unsafe();	// returns true if we are at the last op
+};
+
 struct LatestWorkload : public Workload {
 	/* configuration */
 	long nr_entry;
@@ -145,14 +151,10 @@ struct LatestWorkload : public Workload {
 	double read_ratio;
 	double zipfian_constant;
 
-	/* constants */
-	static constexpr int key_format_len = 64;
-
 	/* states */
 	unsigned int seed;
 	long cur_nr_op;
 	unsigned long cur_ack_key;
-	char key_format[key_format_len];
 
 	double zetan;
 	double theta;
