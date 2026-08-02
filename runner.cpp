@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -106,9 +107,42 @@ Args parse_args(int argc, char** argv) {
 
 struct AppSpec {
     std::string behavior;
-    std::vector<std::string> args;  // behavior-specific: trace path, zipfian alpha, or latest read ratio
+    std::string trace_file;                 // trace: file=<path>
+    std::optional<double> alpha;            // zipfian: alpha=<double>
+    std::optional<double> read_ratio;       // latest: read-ratio=<double in [0,1]>
+    std::optional<double> scan_ratio;       // zipfian/random-read: scan-ratio=<double in [0,1]>
+    std::optional<uint64_t> scan_length;    // zipfian/random-read: scan-length=<uint > 0>
 };
 
+double parse_double_arg(const std::string& key, const std::string& value) {
+    try {
+        std::size_t consumed = 0;
+        double parsed = std::stod(value, &consumed);
+        if (consumed != value.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error(key + " is not a valid number: " + value);
+    }
+}
+
+uint64_t parse_uint_arg(const std::string& key, const std::string& value) {
+    try {
+        std::size_t consumed = 0;
+        unsigned long long parsed = std::stoull(value, &consumed);
+        if (consumed != value.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error(key + " is not a valid non-negative integer: " + value);
+    }
+}
+
+// Config file format: one app per line, `<behavior> [key=value ...]`.
+// Supported keys are behavior-specific (see README.md); unknown keys or keys
+// not applicable to a behavior are rejected so typos fail loudly.
 std::vector<AppSpec> load_app_behaviors(const std::string& path) {
     std::ifstream in(path);
     if (!in) {
@@ -128,48 +162,47 @@ std::vector<AppSpec> load_app_behaviors(const std::string& path) {
         std::istringstream tokens(trimmed);
         AppSpec spec;
         tokens >> spec.behavior;
-        std::string arg;
-        while (tokens >> arg) {
-            spec.args.push_back(arg);
-        }
 
         if (spec.behavior != "scan" && spec.behavior != "random-read" &&
             spec.behavior != "zipfian" && spec.behavior != "trace" && spec.behavior != "latest") {
             throw std::runtime_error("Invalid behavior in config file: " + spec.behavior);
         }
-        if (spec.behavior == "trace" && spec.args.size() != 1) {
-            throw std::runtime_error("trace behavior requires exactly one arg (trace file path): " + trimmed);
-        }
-        if (spec.behavior == "zipfian" && spec.args.size() > 1) {
-            throw std::runtime_error("zipfian behavior accepts at most one arg (alpha): " + trimmed);
-        }
-        if (spec.behavior == "latest" && spec.args.size() > 1) {
-            throw std::runtime_error("latest behavior accepts at most one arg (read ratio): " + trimmed);
-        }
-        if ((spec.behavior == "scan" || spec.behavior == "random-read") && !spec.args.empty()) {
-            throw std::runtime_error(spec.behavior + " behavior does not accept args: " + trimmed);
-        }
-        if (spec.behavior == "zipfian" && spec.args.size() == 1) {
-            try {
-                std::size_t consumed = 0;
-                std::stod(spec.args[0], &consumed);
-                if (consumed != spec.args[0].size()) {
-                    throw std::invalid_argument("trailing characters");
-                }
-            } catch (const std::exception&) {
-                throw std::runtime_error("zipfian alpha is not a valid number: " + spec.args[0]);
+
+        std::string token;
+        while (tokens >> token) {
+            std::size_t eq = token.find('=');
+            if (eq == std::string::npos) {
+                throw std::runtime_error("Expected key=value in config line, got '" + token + "': " + trimmed);
+            }
+            std::string key = token.substr(0, eq);
+            std::string value = token.substr(eq + 1);
+
+            if (key == "file" && spec.behavior == "trace") {
+                spec.trace_file = value;
+            } else if (key == "alpha" && spec.behavior == "zipfian") {
+                spec.alpha = parse_double_arg("alpha", value);
+            } else if (key == "read-ratio" && spec.behavior == "latest") {
+                spec.read_ratio = parse_double_arg("read-ratio", value);
+            } else if (key == "scan-ratio" && (spec.behavior == "zipfian" || spec.behavior == "random-read")) {
+                spec.scan_ratio = parse_double_arg("scan-ratio", value);
+            } else if (key == "scan-length" && (spec.behavior == "zipfian" || spec.behavior == "random-read")) {
+                spec.scan_length = parse_uint_arg("scan-length", value);
+            } else {
+                throw std::runtime_error("Unsupported key '" + key + "' for behavior '" + spec.behavior + "': " + trimmed);
             }
         }
-        if (spec.behavior == "latest" && spec.args.size() == 1) {
-            try {
-                std::size_t consumed = 0;
-                double ratio = std::stod(spec.args[0], &consumed);
-                if (consumed != spec.args[0].size() || ratio < 0.0 || ratio > 1.0) {
-                    throw std::invalid_argument("out of range");
-                }
-            } catch (const std::exception&) {
-                throw std::runtime_error("latest read ratio is not a valid number in [0, 1]: " + spec.args[0]);
-            }
+
+        if (spec.behavior == "trace" && spec.trace_file.empty()) {
+            throw std::runtime_error("trace behavior requires file=<path>: " + trimmed);
+        }
+        if (spec.read_ratio && (*spec.read_ratio < 0.0 || *spec.read_ratio > 1.0)) {
+            throw std::runtime_error("read-ratio must be between 0 and 1: " + trimmed);
+        }
+        if (spec.scan_ratio && (*spec.scan_ratio < 0.0 || *spec.scan_ratio > 1.0)) {
+            throw std::runtime_error("scan-ratio must be between 0 and 1: " + trimmed);
+        }
+        if (spec.scan_length && *spec.scan_length == 0) {
+            throw std::runtime_error("scan-length must be > 0: " + trimmed);
         }
 
         behaviors.push_back(std::move(spec));
@@ -464,13 +497,23 @@ int main(int argc, char** argv) {
             };
             if (spec.behavior == "trace") {
                 app_cmd.push_back("--trace-file");
-                app_cmd.push_back(spec.args[0]);
-            } else if (spec.behavior == "zipfian" && !spec.args.empty()) {
+                app_cmd.push_back(spec.trace_file);
+            }
+            if (spec.alpha) {
                 app_cmd.push_back("--zipfian-alpha");
-                app_cmd.push_back(spec.args[0]);
-            } else if (spec.behavior == "latest" && !spec.args.empty()) {
+                app_cmd.push_back(std::to_string(*spec.alpha));
+            }
+            if (spec.read_ratio) {
                 app_cmd.push_back("--read-ratio");
-                app_cmd.push_back(spec.args[0]);
+                app_cmd.push_back(std::to_string(*spec.read_ratio));
+            }
+            if (spec.scan_ratio) {
+                app_cmd.push_back("--scan-ratio");
+                app_cmd.push_back(std::to_string(*spec.scan_ratio));
+            }
+            if (spec.scan_length) {
+                app_cmd.push_back("--scan-length");
+                app_cmd.push_back(std::to_string(*spec.scan_length));
             }
             app_pids.push_back(spawn_child(app_cmd));
             std::this_thread::sleep_for(std::chrono::milliseconds(150));

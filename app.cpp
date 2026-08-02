@@ -24,6 +24,17 @@ constexpr uint64_t kDefaultPageSpan = 1u << 16;
 constexpr double kDefaultZipfianAlpha = 0.99;
 constexpr double kDefaultReadRatio = 0.5;
 
+// Matches YCSB's default maxscanlength (see My-YCSB's *.yaml `scan_length: 100`).
+constexpr uint64_t kDefaultScanLength = 100;
+constexpr double kDefaultScanRatio = 0.0;
+
+// `dat` only ever sees a page number, never op.value_buffer -- but My-YCSB's
+// generate_value_string() writes into it for UPDATE/INSERT/READ_MODIFY_WRITE ops
+// (LatestWorkload's INSERT/UPDATE branch is intrinsic to its algorithm and can't be
+// disabled via OpProportion). Give every workload a real backing buffer so that path
+// can't write through a null/undersized pointer.
+constexpr long kScratchValueSize = 16;
+
 struct Args {
     std::string behavior = "random-read";
     uint64_t seed = 1;
@@ -34,6 +45,8 @@ struct Args {
     uint64_t page_span = kDefaultPageSpan;
     double zipfian_alpha = kDefaultZipfianAlpha;
     double read_ratio = kDefaultReadRatio;
+    uint64_t scan_length = kDefaultScanLength;
+    double scan_ratio = kDefaultScanRatio;
     std::string trace_file;
 };
 
@@ -67,6 +80,10 @@ Args parse_args(int argc, char** argv) {
             a.zipfian_alpha = std::stod(require_value(i, argc, argv));
         } else if (key == "--read-ratio") {
             a.read_ratio = std::stod(require_value(i, argc, argv));
+        } else if (key == "--scan-length") {
+            a.scan_length = std::stoull(require_value(i, argc, argv));
+        } else if (key == "--scan-ratio") {
+            a.scan_ratio = std::stod(require_value(i, argc, argv));
         } else if (key == "--trace-file") {
             a.trace_file = require_value(i, argc, argv);
         } else {
@@ -78,6 +95,12 @@ Args parse_args(int argc, char** argv) {
     }
     if (a.read_ratio < 0.0 || a.read_ratio > 1.0) {
         throw std::runtime_error("--read-ratio must be between 0 and 1");
+    }
+    if (a.scan_length == 0) {
+        throw std::runtime_error("--scan-length must be > 0");
+    }
+    if (a.scan_ratio < 0.0 || a.scan_ratio > 1.0) {
+        throw std::runtime_error("--scan-ratio must be between 0 and 1");
     }
     if (a.behavior == "trace") {
         if (a.trace_file.empty()) {
@@ -106,48 +129,70 @@ int main(int argc, char** argv) {
         std::uniform_int_distribution<uint64_t> random_page(0, args.page_span - 1);
         uint64_t scan_cursor = 0;
 
+        // Non-SCAN op types (UPDATE/INSERT/READ_MODIFY_WRITE) are never requested here:
+        // `dat` has no op-type-aware backend (every request is just a page fetch), and
+        // My-YCSB's own key generation is identical across UPDATE/INSERT/READ/RMW (only
+        // SCAN differs, by walking scan-length consecutive keys). We also never allocate
+        // op.value_buffer, and My-YCSB's generate_value_string() would write out of bounds
+        // for value_size=0, so those branches must stay unreachable. Reproducing a target
+        // op mix therefore only requires a READ/SCAN split, via --scan-ratio.
+        OpProportion op_prop{0, 0, static_cast<float>(1.0 - args.scan_ratio), static_cast<float>(args.scan_ratio), 0};
+
         Workload* workload;
         if (args.behavior == "scan") {
-            workload = new ScanWorkload(args.requests, 0l, 0l, args.seed);
+            workload = new ScanWorkload(args.requests, 0l, kScratchValueSize, args.seed);
         } else if (args.behavior == "zipfian") {
             workload = new ZipfianWorkload(
-                0l, 0l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.zipfian_alpha, args.seed
+                kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, args.requests, op_prop, args.zipfian_alpha, args.seed
             );
         } else if (args.behavior == "trace") {
-            workload = new ReaderTraceWorkload(args.trace_file, 0l);
+            workload = new ReaderTraceWorkload(args.trace_file, kScratchValueSize);
         } else if (args.behavior == "latest") {
             workload = new LatestWorkload(
-                0l, args.page_span, args.requests, args.read_ratio, args.zipfian_alpha, args.seed
+                kScratchValueSize, args.page_span, args.requests, args.read_ratio, args.zipfian_alpha, args.seed
             );
         } else {
             workload = new UniformWorkload(
-                0l, 1l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.seed
+                kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, args.requests, op_prop, args.seed
             );
         }
 
-        for (uint64_t seq = 0; workload->has_next_op(); ++seq) {
-            Operation op;
+        char value_scratch[kScratchValueSize];
+        for (uint64_t seq = 0; workload->has_next_op(); ) {
+            Operation op{};
+            op.value_buffer = value_scratch;
             workload->next_op(&op);
-            uint64_t page = op.key;
 
-            std::ostringstream request;
-            request << "REQ " << args.client_id << " " << seq << " " << page << "\n";
-            if (rw_pipe.write_all(request.str())) {
-                std::cerr << "app: write request failed \n";
-                rw_pipe.close();
-                return 1;
-            }
+            // A SCAN op walks `scan_length` consecutive pages from the chosen start key
+            // (mirrors My-YCSB's do_scan(), which reads scan_length consecutive keys from
+            // an iterator seeded at op.key). Non-scan ops (and ScanWorkload's own linear
+            // walk, which never sets scan_length) are a single-page request.
+            uint64_t span = (op.type == SCAN && op.scan_length > 0) ? static_cast<uint64_t>(op.scan_length) : 1;
+            for (uint64_t j = 0; j < span; ++j, ++seq) {
+                // Only wrap when actually walking a multi-page scan chain; single-page
+                // ops (scan/trace/latest/random-read, or zipfian with scan-ratio=0) pass
+                // the workload's key through unchanged, preserving prior behavior.
+                uint64_t page = (span > 1) ? (op.key + j) % args.page_span : op.key;
 
-            std::string response;
-            if (rw_pipe.read_line(response)) {
-                std::cerr << "app: read response failed\n";
-                rw_pipe.close();
-                return 1;
-            }
-            if (response.rfind("RESP ", 0) != 0) {
-                std::cerr << "app: malformed response: " << response << "\n";
-                rw_pipe.close();
-                return 1;
+                std::ostringstream request;
+                request << "REQ " << args.client_id << " " << seq << " " << page << "\n";
+                if (rw_pipe.write_all(request.str())) {
+                    std::cerr << "app: write request failed \n";
+                    rw_pipe.close();
+                    return 1;
+                }
+
+                std::string response;
+                if (rw_pipe.read_line(response)) {
+                    std::cerr << "app: read response failed\n";
+                    rw_pipe.close();
+                    return 1;
+                }
+                if (response.rfind("RESP ", 0) != 0) {
+                    std::cerr << "app: malformed response: " << response << "\n";
+                    rw_pipe.close();
+                    return 1;
+                }
             }
         }
 
