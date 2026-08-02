@@ -20,7 +20,7 @@ void FIFOPolicy::on_admit(uint64_t context, uint64_t page) {
 // Callback for eviction - suggests least recently added pages
 void FIFOPolicy::on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request) {
     (void)context;
-    (void)page;
+    if (cache.present(page)) return; // hit - page already cached, no eviction needed
     if (cache.size() < cache.capacity) return;  // no eviction
 
     // Suggest pages from the back of the recency list (least recently added)

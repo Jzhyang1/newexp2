@@ -34,7 +34,7 @@ void LRUPolicy::on_admit(uint64_t context, uint64_t page) {
     // Callback for eviction - suggests least recently used pages
 void LRUPolicy::on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request) {
     (void)context;
-    (void)page;
+    if (cache.present(page)) return; // hit - page already cached, no eviction needed
     if (cache.size() < cache.capacity) return;
     
     // Suggest pages from the back of the recency list (least recently used)

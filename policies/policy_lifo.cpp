@@ -20,7 +20,7 @@ void LIFOPolicy::on_admit(uint64_t context, uint64_t page) {
 // Callback for eviction - suggests most recently added pages
 void LIFOPolicy::on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request) {
     (void)context;
-    (void)page;
+    if (cache.present(page)) return; // hit - page already cached, no eviction needed
     if (cache.size() < cache.capacity) return;  // no eviction
 
     // Suggest pages from the front of the recency list (most recently added)

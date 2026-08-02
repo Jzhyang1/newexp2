@@ -106,7 +106,7 @@ Args parse_args(int argc, char** argv) {
 
 struct AppSpec {
     std::string behavior;
-    std::vector<std::string> args;  // behavior-specific: trace path, or zipfian alpha
+    std::vector<std::string> args;  // behavior-specific: trace path, zipfian alpha, or latest read ratio
 };
 
 std::vector<AppSpec> load_app_behaviors(const std::string& path) {
@@ -134,7 +134,7 @@ std::vector<AppSpec> load_app_behaviors(const std::string& path) {
         }
 
         if (spec.behavior != "scan" && spec.behavior != "random-read" &&
-            spec.behavior != "zipfian" && spec.behavior != "trace") {
+            spec.behavior != "zipfian" && spec.behavior != "trace" && spec.behavior != "latest") {
             throw std::runtime_error("Invalid behavior in config file: " + spec.behavior);
         }
         if (spec.behavior == "trace" && spec.args.size() != 1) {
@@ -142,6 +142,9 @@ std::vector<AppSpec> load_app_behaviors(const std::string& path) {
         }
         if (spec.behavior == "zipfian" && spec.args.size() > 1) {
             throw std::runtime_error("zipfian behavior accepts at most one arg (alpha): " + trimmed);
+        }
+        if (spec.behavior == "latest" && spec.args.size() > 1) {
+            throw std::runtime_error("latest behavior accepts at most one arg (read ratio): " + trimmed);
         }
         if ((spec.behavior == "scan" || spec.behavior == "random-read") && !spec.args.empty()) {
             throw std::runtime_error(spec.behavior + " behavior does not accept args: " + trimmed);
@@ -155,6 +158,17 @@ std::vector<AppSpec> load_app_behaviors(const std::string& path) {
                 }
             } catch (const std::exception&) {
                 throw std::runtime_error("zipfian alpha is not a valid number: " + spec.args[0]);
+            }
+        }
+        if (spec.behavior == "latest" && spec.args.size() == 1) {
+            try {
+                std::size_t consumed = 0;
+                double ratio = std::stod(spec.args[0], &consumed);
+                if (consumed != spec.args[0].size() || ratio < 0.0 || ratio > 1.0) {
+                    throw std::invalid_argument("out of range");
+                }
+            } catch (const std::exception&) {
+                throw std::runtime_error("latest read ratio is not a valid number in [0, 1]: " + spec.args[0]);
             }
         }
 
@@ -453,6 +467,9 @@ int main(int argc, char** argv) {
                 app_cmd.push_back(spec.args[0]);
             } else if (spec.behavior == "zipfian" && !spec.args.empty()) {
                 app_cmd.push_back("--zipfian-alpha");
+                app_cmd.push_back(spec.args[0]);
+            } else if (spec.behavior == "latest" && !spec.args.empty()) {
+                app_cmd.push_back("--read-ratio");
                 app_cmd.push_back(spec.args[0]);
             }
             app_pids.push_back(spawn_child(app_cmd));

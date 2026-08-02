@@ -225,6 +225,8 @@ struct WorkerThread {
 
             // Pop all fetched pages that arrive by the next timestamp
             resume = pop_from_queue();
+            if (evict_policy) evict_policy->on_access(resume.trigger_app, resume.page);
+            if (prefetch_policy) prefetch_policy->on_access(resume.trigger_app, resume.page);
 
             if (resume.blocked_apps) {
                 // this cleanup is unsafe outside of critical section

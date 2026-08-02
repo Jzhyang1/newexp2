@@ -22,6 +22,7 @@ constexpr uint64_t kDefaultRequests = 20000;
 constexpr uint64_t kDefaultPageSpan = 1u << 16;
 
 constexpr double kDefaultZipfianAlpha = 0.99;
+constexpr double kDefaultReadRatio = 0.5;
 
 struct Args {
     std::string behavior = "random-read";
@@ -32,6 +33,7 @@ struct Args {
     uint64_t requests = kDefaultRequests;
     uint64_t page_span = kDefaultPageSpan;
     double zipfian_alpha = kDefaultZipfianAlpha;
+    double read_ratio = kDefaultReadRatio;
     std::string trace_file;
 };
 
@@ -63,17 +65,19 @@ Args parse_args(int argc, char** argv) {
             a.page_span = std::stoull(require_value(i, argc, argv));
         } else if (key == "--zipfian-alpha") {
             a.zipfian_alpha = std::stod(require_value(i, argc, argv));
+        } else if (key == "--read-ratio") {
+            a.read_ratio = std::stod(require_value(i, argc, argv));
         } else if (key == "--trace-file") {
             a.trace_file = require_value(i, argc, argv);
         } else {
             throw std::runtime_error("Unknown argument: " + key);
         }
     }
-    if (a.behavior != "scan" && a.behavior != "random-read" && a.behavior != "zipfian" && a.behavior != "trace") {
-        throw std::runtime_error("--behavior must be scan, random-read, zipfian, or trace");
-    }
     if (a.page_span == 0) {
         throw std::runtime_error("--page-span must be > 0");
+    }
+    if (a.read_ratio < 0.0 || a.read_ratio > 1.0) {
+        throw std::runtime_error("--read-ratio must be between 0 and 1");
     }
     if (a.behavior == "trace") {
         if (a.trace_file.empty()) {
@@ -111,6 +115,10 @@ int main(int argc, char** argv) {
             );
         } else if (args.behavior == "trace") {
             workload = new ReaderTraceWorkload(args.trace_file, 0l);
+        } else if (args.behavior == "latest") {
+            workload = new LatestWorkload(
+                0l, args.page_span, args.requests, args.read_ratio, args.zipfian_alpha, args.seed
+            );
         } else {
             workload = new UniformWorkload(
                 0l, 1l, args.page_span, args.requests, OpProportion{0,0,1,0,0}, args.seed
