@@ -35,6 +35,8 @@ constexpr double kDefaultScanRatio = 0.0;
 // can't write through a null/undersized pointer.
 constexpr long kScratchValueSize = 16;
 
+constexpr double kDefaultMarkovRelativeWeight = 0.99;
+
 struct Args {
     std::string behavior = "random-read";
     uint64_t seed = 1;
@@ -48,6 +50,9 @@ struct Args {
     uint64_t scan_length = kDefaultScanLength;
     double scan_ratio = kDefaultScanRatio;
     std::string trace_file;
+    std::string markov_base;
+    uint64_t markov_samples = 0;
+    double markov_relative_weight = kDefaultMarkovRelativeWeight;
 };
 
 std::string require_value(int& i, int argc, char** argv) {
@@ -86,6 +91,12 @@ Args parse_args(int argc, char** argv) {
             a.scan_ratio = std::stod(require_value(i, argc, argv));
         } else if (key == "--trace-file") {
             a.trace_file = require_value(i, argc, argv);
+        } else if (key == "--markov-base") {
+            a.markov_base = require_value(i, argc, argv);
+        } else if (key == "--markov-samples") {
+            a.markov_samples = std::stoull(require_value(i, argc, argv));
+        } else if (key == "--markov-relative-weight") {
+            a.markov_relative_weight = std::stod(require_value(i, argc, argv));
         } else {
             throw std::runtime_error("Unknown argument: " + key);
         }
@@ -112,7 +123,52 @@ Args parse_args(int argc, char** argv) {
             throw std::runtime_error("failed to open trace file: " + a.trace_file);
         }
     }
+    if (a.behavior == "markov") {
+        if (a.markov_base.empty() || a.markov_base == "markov") {
+            throw std::runtime_error("--markov-base is required (and must not be 'markov') when --behavior is markov");
+        }
+        if (a.markov_samples < 3) {
+            throw std::runtime_error("--markov-samples must be >= 3");
+        }
+        if (a.markov_relative_weight < 0.0 || a.markov_relative_weight > 1.0) {
+            throw std::runtime_error("--markov-relative-weight must be between 0 and 1");
+        }
+    }
     return a;
+}
+
+// Builds the Workload for a given behavior name, emitting exactly `nr_op`
+// ops. Factored out of main() so MarkovWorkload can build its training
+// source with a different op count (`--markov-samples`) than the top-level
+// `--requests`, while reusing every other already-parsed flag.
+Workload* build_workload(const std::string& behavior, const Args& args, uint64_t nr_op) {
+    // See the comment on kScratchValueSize above for why op_prop only ever
+    // splits READ/SCAN.
+    OpProportion op_prop{0, 0, static_cast<float>(1.0 - args.scan_ratio), static_cast<float>(args.scan_ratio), 0};
+
+    if (behavior == "scan") {
+        return new ScanWorkload(static_cast<long>(nr_op), 0l, kScratchValueSize, args.seed);
+    } else if (behavior == "zipfian") {
+        return new ZipfianWorkload(
+            kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, static_cast<long>(nr_op), op_prop, args.zipfian_alpha, args.seed
+        );
+    } else if (behavior == "trace") {
+        return new ReaderTraceWorkload(args.trace_file, kScratchValueSize);
+    } else if (behavior == "latest") {
+        return new LatestWorkload(
+            kScratchValueSize, args.page_span, static_cast<long>(nr_op), args.read_ratio, args.zipfian_alpha, args.seed
+        );
+    } else if (behavior == "markov") {
+        Workload* source = build_workload(args.markov_base, args, args.markov_samples);
+        return new MarkovWorkload(
+            kScratchValueSize, source, static_cast<long>(args.markov_samples), static_cast<long>(nr_op),
+            args.page_span, args.markov_relative_weight, args.seed
+        );
+    } else {
+        return new UniformWorkload(
+            kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, static_cast<long>(nr_op), op_prop, args.seed
+        );
+    }
 }
 
 }  // namespace
@@ -127,7 +183,6 @@ int main(int argc, char** argv) {
 
         std::mt19937_64 rng(args.seed);
         std::uniform_int_distribution<uint64_t> random_page(0, args.page_span - 1);
-        uint64_t scan_cursor = 0;
 
         // Non-SCAN op types (UPDATE/INSERT/READ_MODIFY_WRITE) are never requested here:
         // `dat` has no op-type-aware backend (every request is just a page fetch), and
@@ -136,26 +191,7 @@ int main(int argc, char** argv) {
         // op.value_buffer, and My-YCSB's generate_value_string() would write out of bounds
         // for value_size=0, so those branches must stay unreachable. Reproducing a target
         // op mix therefore only requires a READ/SCAN split, via --scan-ratio.
-        OpProportion op_prop{0, 0, static_cast<float>(1.0 - args.scan_ratio), static_cast<float>(args.scan_ratio), 0};
-
-        Workload* workload;
-        if (args.behavior == "scan") {
-            workload = new ScanWorkload(args.requests, 0l, kScratchValueSize, args.seed);
-        } else if (args.behavior == "zipfian") {
-            workload = new ZipfianWorkload(
-                kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, args.requests, op_prop, args.zipfian_alpha, args.seed
-            );
-        } else if (args.behavior == "trace") {
-            workload = new ReaderTraceWorkload(args.trace_file, kScratchValueSize);
-        } else if (args.behavior == "latest") {
-            workload = new LatestWorkload(
-                kScratchValueSize, args.page_span, args.requests, args.read_ratio, args.zipfian_alpha, args.seed
-            );
-        } else {
-            workload = new UniformWorkload(
-                kScratchValueSize, static_cast<long>(args.scan_length), args.page_span, args.requests, op_prop, args.seed
-            );
-        }
+        Workload* workload = build_workload(args.behavior, args, args.requests);
 
         char value_scratch[kScratchValueSize];
         for (uint64_t seq = 0; workload->has_next_op(); ) {

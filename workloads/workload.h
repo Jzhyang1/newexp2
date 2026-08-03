@@ -17,6 +17,8 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <cstdint>
+#include <unordered_map>
 
 enum OperationType {
 	UPDATE = 0,
@@ -49,6 +51,7 @@ struct Workload {
 	std::vector<unsigned long> recorded_keys;
 
 	Workload(long value_size);
+	virtual ~Workload() = default;
 	virtual void next_op(Operation *op) = 0;
 	virtual bool has_next_op() = 0;
 
@@ -171,4 +174,51 @@ private:
 	static unsigned long fnv1_64_hash(unsigned long value);
 	unsigned long generate_zipfian_random_ulong(bool hash);
 	void generate_value_string(char *value_buffer);
+};
+
+// Non-parametric, read-only workload: fits a lightweight Markov model from
+// the first `train_samples` pages of another workload's own output, then
+// generates new page requests from that fitted model instead of replaying
+// the source. Gives prefetchers that mine page-follows-page associations
+// (see policies/assoc_miner.h) genuine sequential structure to learn, unlike
+// the i.i.d. Zipfian/Latest draws the source workloads normally produce.
+//
+// Three count tables are fit from consecutive pages (page[i-1] -> page[i])
+// and their deltas (delta[i] = page[i] - page[i-1]):
+//   - direct[P]      -> {Q: count}   how often Q follows P directly
+//   - rel_to_page[D]  -> {Q: count}   how often Q follows a jump of size D
+//   - rel_to_rel[D]   -> {D': count}  how often jump D' follows jump D
+// Generation draws two independent Bernoulli(relative_weight) coins: the
+// first picks "relative" vs "direct" (table 1); the second, only when
+// "relative", picks rel_to_rel vs rel_to_page. That makes
+// P(rel_to_rel) = relative_weight^2, P(rel_to_page) = relative_weight *
+// (1 - relative_weight), P(direct) = 1 - relative_weight.
+struct MarkovWorkload : public Workload {
+	/* configuration */
+	long nr_op;
+	uint64_t page_span;
+	double relative_weight;
+
+	/* states */
+	unsigned int seed;
+	long cur_nr_op;
+	uint64_t cur_page;
+	int64_t cur_delta;
+
+	// Takes ownership of `source`: pulls exactly `train_samples` ops from it
+	// to fit the model, then deletes it -- `source` is never touched again.
+	MarkovWorkload(long value_size, Workload* source, long train_samples, long nr_op,
+	               uint64_t page_span, double relative_weight, unsigned int seed);
+	void next_op(Operation *op) override;
+	bool has_next_op() override;
+
+private:
+	std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> direct_;
+	std::unordered_map<int64_t, std::unordered_map<uint64_t, uint64_t>> rel_to_page_;
+	std::unordered_map<int64_t, std::unordered_map<int64_t, uint64_t>> rel_to_rel_;
+
+	bool try_direct(uint64_t &next_page);
+	bool try_rel_to_page(uint64_t &next_page);
+	bool try_rel_to_rel(uint64_t &next_page);
+	uint64_t wrap_page(int64_t page) const;
 };

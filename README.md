@@ -49,7 +49,7 @@ flowchart LR
 
 Represents one server workload process.
 
-- `--behavior`: `scan`, `random-read`, `zipfian`, `latest`, or `trace`
+- `--behavior`: `scan`, `random-read`, `zipfian`, `latest`, `trace`, or `markov`
 - `--seed`: per-process deterministic seed
 - `--in-pipe`: read data replies from `dat`
 - `--out-pipe`: send IO requests to `dat`
@@ -60,8 +60,39 @@ Represents one server workload process.
 - `--scan-length`: pages walked per scan op, used by `--behavior zipfian`/`random-read` when `--scan-ratio > 0` (default `100`, matching YCSB's default `maxscanlength`)
 - `--scan-ratio`: fraction of ops that are scans (vs. single-page reads), used by `--behavior zipfian`/`random-read` (default `0`)
 - `--trace-file`: path to a trace, used only when `--behavior trace`; a newline-separated list of `uint64` page numbers replayed in order
+- `--markov-base`: the behavior to sample training data from, used only when `--behavior markov` (any other behavior name)
+- `--markov-samples`: number of pages sampled from `--markov-base` to fit the model, used only when `--behavior markov` (must be `>= 3`)
+- `--markov-relative-weight`: see "Markov workload" below, used only when `--behavior markov` (default `0.99`)
 
 Each app runs independently in parallel, and multiple app instances can run on the same machine.
+
+#### Markov workload
+
+`--behavior markov` exists because Zipfian/Latest draw each page i.i.d. from a
+distribution — there's no real "page X is followed by page Y" structure, so
+prefetchers that mine page-follows-page associations (`cminer`/`quickmine`/`mithril`,
+see [`policies/assoc_miner.h`](policies/assoc_miner.h)) have nothing genuine to learn
+from them. `markov` fits a lightweight, non-parametric Markov model from the first
+`--markov-samples` pages of another workload's own output (`--markov-base`), then
+generates its actual request stream from that fitted model, giving those prefetchers
+real (if synthetic) sequential structure to exploit.
+
+The model learns three count tables from consecutive training pages
+`page[i-1] -> page[i]` and their deltas `delta[i] = page[i] - page[i-1]`:
+
+- `direct[P] -> {Q: count}` — how often `Q` follows `P` directly.
+- `rel_to_page[D] -> {Q: count}` — how often `Q` follows a jump of size `D`.
+- `rel_to_rel[D] -> {D': count}` — how often jump `D'` follows jump `D` (applied as
+  `next = current_page + D'`).
+
+Generation draws two independent `Bernoulli(--markov-relative-weight)` coins per
+step: the first picks "relative" vs. "direct" (`direct`); the second, only when
+"relative", picks `rel_to_rel` vs. `rel_to_page`. So with the default `0.99`:
+`P(rel_to_rel) = 0.99^2 = 0.9801`, `P(rel_to_page) = 0.99 * 0.01 = 0.0099`,
+`P(direct) = 0.01`. If the chosen table has no entry for the current state, it falls
+back through the other tables, then to a uniform random page. The `--markov-samples`
+pages used for training are never themselves emitted as requests — `--requests`
+counts only the generated stream.
 
 #### Op-type modeling and scan semantics
 
@@ -138,11 +169,15 @@ zipfian alpha=1.2                          # Zipfian skew (default 0.99)
 zipfian alpha=0.99 scan-ratio=0.95 scan-length=100
 latest read-ratio=0.95                     # fraction reads vs. inserts (default 0.5)
 trace file=traces/db_trace.txt             # replays the given trace file (see app.cpp above)
+markov base=zipfian samples=5000 alpha=0.99 relative-weight=0.99  # see "Markov workload" above
 ```
 
 Supported keys per behavior: `trace` requires `file=`; `zipfian` and `random-read`
 accept `scan-ratio=` and `scan-length=` (`zipfian` also accepts `alpha=`); `latest`
-accepts `read-ratio=`; `scan` and `random-read` (beyond the scan keys) accept none.
+accepts `read-ratio=`; `scan` and `random-read` (beyond the scan keys) accept none;
+`markov` requires `base=` (any other behavior name) and `samples=` (`>= 3`), accepts
+`relative-weight=` (default `0.99`), and otherwise accepts whatever keys its `base=`
+behavior would (e.g. `base=zipfian` also accepts `alpha=`, `scan-ratio=`, etc.).
 Using a key with the wrong behavior, or omitting a required one, is a config error.
 
 Blank lines and lines starting with `#` are ignored.

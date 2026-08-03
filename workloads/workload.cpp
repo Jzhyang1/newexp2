@@ -341,3 +341,159 @@ void LatestWorkload::generate_value_string(char *value_buffer) {
 	}
 	value_buffer[this->value_size - 1] = '\0';
 }
+
+namespace {
+
+// Draws from `candidates` proportional to count, using the pre-drawn uniform
+// `r` in [0,1]. Returns false if `candidates` is empty. Duplicated for
+// uint64_t/int64_t keys rather than templated, matching this file's style.
+bool pick_weighted(const std::unordered_map<uint64_t, uint64_t> &candidates, double r, uint64_t *out) {
+	if (candidates.empty()) return false;
+	uint64_t total = 0;
+	for (const auto &kv : candidates) total += kv.second;
+	uint64_t target = (uint64_t)(r * (double)total);
+	if (target >= total) target = total - 1;
+	uint64_t cum = 0;
+	for (const auto &kv : candidates) {
+		cum += kv.second;
+		if (target < cum) {
+			*out = kv.first;
+			return true;
+		}
+	}
+	*out = candidates.begin()->first;  // unreachable
+	return true;
+}
+
+bool pick_weighted(const std::unordered_map<int64_t, uint64_t> &candidates, double r, int64_t *out) {
+	if (candidates.empty()) return false;
+	uint64_t total = 0;
+	for (const auto &kv : candidates) total += kv.second;
+	uint64_t target = (uint64_t)(r * (double)total);
+	if (target >= total) target = total - 1;
+	uint64_t cum = 0;
+	for (const auto &kv : candidates) {
+		cum += kv.second;
+		if (target < cum) {
+			*out = kv.first;
+			return true;
+		}
+	}
+	*out = candidates.begin()->first;  // unreachable
+	return true;
+}
+
+}  // namespace
+
+MarkovWorkload::MarkovWorkload(long value_size, Workload *source, long train_samples, long nr_op,
+                                uint64_t page_span, double relative_weight, unsigned int seed)
+: Workload(value_size), nr_op(nr_op), page_span(page_span), relative_weight(relative_weight),
+  seed(seed), cur_nr_op(0) {
+	if (train_samples < 3) {
+		delete source;
+		throw std::invalid_argument("MarkovWorkload requires at least 3 training samples");
+	}
+
+	// `source` may write into op.value_buffer for non-read op types (e.g.
+	// LatestWorkload's INSERT/UPDATE branch); size the scratch buffer to
+	// match, same reasoning as app.cpp's kScratchValueSize.
+	std::vector<char> value_scratch(source->value_size > 0 ? (std::size_t)source->value_size : 1);
+	Operation scratch{};
+	scratch.value_buffer = value_scratch.data();
+
+	std::vector<uint64_t> pages;
+	pages.reserve((std::size_t)train_samples);
+	for (long i = 0; i < train_samples; ++i) {
+		if (!source->has_next_op()) {
+			delete source;
+			throw std::runtime_error("MarkovWorkload: source workload ran out of ops before "
+			                          "producing the requested training samples");
+		}
+		source->next_op(&scratch);
+		pages.push_back(scratch.key);
+	}
+	delete source;
+
+	for (std::size_t i = 1; i < pages.size(); ++i) {
+		this->direct_[pages[i - 1]][pages[i]]++;
+		if (i >= 2) {
+			int64_t prev_delta = (int64_t)pages[i - 1] - (int64_t)pages[i - 2];
+			int64_t next_delta = (int64_t)pages[i] - (int64_t)pages[i - 1];
+			this->rel_to_page_[prev_delta][pages[i]]++;
+			this->rel_to_rel_[prev_delta][next_delta]++;
+		}
+	}
+
+	this->cur_page = pages.back();
+	this->cur_delta = (int64_t)pages[pages.size() - 1] - (int64_t)pages[pages.size() - 2];
+}
+
+bool MarkovWorkload::has_next_op() {
+	return this->cur_nr_op < this->nr_op;
+}
+
+uint64_t MarkovWorkload::wrap_page(int64_t page) const {
+	int64_t span = (int64_t)this->page_span;
+	int64_t wrapped = page % span;
+	if (wrapped < 0) wrapped += span;
+	return (uint64_t)wrapped;
+}
+
+bool MarkovWorkload::try_direct(uint64_t &next_page) {
+	auto it = this->direct_.find(this->cur_page);
+	if (it == this->direct_.end()) return false;
+	double r = this->generate_random_double(&this->seed);
+	return pick_weighted(it->second, r, &next_page);
+}
+
+bool MarkovWorkload::try_rel_to_page(uint64_t &next_page) {
+	auto it = this->rel_to_page_.find(this->cur_delta);
+	if (it == this->rel_to_page_.end()) return false;
+	double r = this->generate_random_double(&this->seed);
+	return pick_weighted(it->second, r, &next_page);
+}
+
+bool MarkovWorkload::try_rel_to_rel(uint64_t &next_page) {
+	auto it = this->rel_to_rel_.find(this->cur_delta);
+	if (it == this->rel_to_rel_.end()) return false;
+	double r = this->generate_random_double(&this->seed);
+	int64_t delta;
+	if (!pick_weighted(it->second, r, &delta)) return false;
+	next_page = this->wrap_page((int64_t)this->cur_page + delta);
+	return true;
+}
+
+void MarkovWorkload::next_op(Operation *op) {
+	if (!this->has_next_op())
+		throw std::invalid_argument("does not have next op");
+
+	uint64_t next_page = this->cur_page;
+	bool found;
+	double r1 = this->generate_random_double(&this->seed);
+	if (r1 < this->relative_weight) {
+		double r2 = this->generate_random_double(&this->seed);
+		if (r2 < this->relative_weight) {
+			found = this->try_rel_to_rel(next_page) || this->try_rel_to_page(next_page) ||
+			        this->try_direct(next_page);
+		} else {
+			found = this->try_rel_to_page(next_page) || this->try_rel_to_rel(next_page) ||
+			        this->try_direct(next_page);
+		}
+	} else {
+		found = this->try_direct(next_page) || this->try_rel_to_page(next_page) ||
+		        this->try_rel_to_rel(next_page);
+	}
+	if (!found) {
+		double r = this->generate_random_double(&this->seed);
+		next_page = (uint64_t)(r * (double)this->page_span);
+		if (next_page >= this->page_span) next_page = this->page_span - 1;
+	}
+
+	op->type = READ;
+	op->key = next_page;
+	op->scan_length = 0;
+	this->cur_delta = (int64_t)next_page - (int64_t)this->cur_page;
+	this->cur_page = next_page;
+	++this->cur_nr_op;
+	op->is_last_op = !this->has_next_op();
+}

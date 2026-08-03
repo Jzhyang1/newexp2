@@ -107,11 +107,14 @@ Args parse_args(int argc, char** argv) {
 
 struct AppSpec {
     std::string behavior;
-    std::string trace_file;                 // trace: file=<path>
-    std::optional<double> alpha;            // zipfian: alpha=<double>
-    std::optional<double> read_ratio;       // latest: read-ratio=<double in [0,1]>
-    std::optional<double> scan_ratio;       // zipfian/random-read: scan-ratio=<double in [0,1]>
-    std::optional<uint64_t> scan_length;    // zipfian/random-read: scan-length=<uint > 0>
+    std::string trace_file;                 // trace (or markov base=trace): file=<path>
+    std::optional<double> alpha;            // zipfian (or markov base=zipfian): alpha=<double>
+    std::optional<double> read_ratio;       // latest (or markov base=latest): read-ratio=<double in [0,1]>
+    std::optional<double> scan_ratio;       // zipfian/random-read (or markov base=<one of those>): scan-ratio=<double in [0,1]>
+    std::optional<uint64_t> scan_length;    // zipfian/random-read (or markov base=<one of those>): scan-length=<uint > 0>
+    std::string base_behavior;              // markov: base=<behavior>
+    std::optional<uint64_t> markov_samples; // markov: samples=<uint >= 3>
+    std::optional<double> markov_relative_weight; // markov: relative-weight=<double in [0,1]>
 };
 
 double parse_double_arg(const std::string& key, const std::string& value) {
@@ -164,36 +167,76 @@ std::vector<AppSpec> load_app_behaviors(const std::string& path) {
         tokens >> spec.behavior;
 
         if (spec.behavior != "scan" && spec.behavior != "random-read" &&
-            spec.behavior != "zipfian" && spec.behavior != "trace" && spec.behavior != "latest") {
+            spec.behavior != "zipfian" && spec.behavior != "trace" && spec.behavior != "latest" &&
+            spec.behavior != "markov") {
             throw std::runtime_error("Invalid behavior in config file: " + spec.behavior);
         }
 
+        // Collect raw key=value pairs first: `markov`'s `base=` can appear in
+        // any position on the line, but it determines which *other* keys
+        // (alpha=, read-ratio=, ...) are valid, so it must be resolved before
+        // those are validated below.
+        std::vector<std::pair<std::string, std::string>> kvs;
         std::string token;
         while (tokens >> token) {
             std::size_t eq = token.find('=');
             if (eq == std::string::npos) {
                 throw std::runtime_error("Expected key=value in config line, got '" + token + "': " + trimmed);
             }
-            std::string key = token.substr(0, eq);
-            std::string value = token.substr(eq + 1);
+            kvs.emplace_back(token.substr(0, eq), token.substr(eq + 1));
+        }
 
-            if (key == "file" && spec.behavior == "trace") {
+        if (spec.behavior == "markov") {
+            for (const auto& [key, value] : kvs) {
+                if (key == "base") spec.base_behavior = value;
+            }
+            if (spec.base_behavior.empty()) {
+                throw std::runtime_error("markov behavior requires base=<behavior>: " + trimmed);
+            }
+            if (spec.base_behavior != "scan" && spec.base_behavior != "random-read" &&
+                spec.base_behavior != "zipfian" && spec.base_behavior != "trace" &&
+                spec.base_behavior != "latest") {
+                throw std::runtime_error("Invalid markov base= behavior: " + spec.base_behavior);
+            }
+        }
+        // Which behavior governs the base-workload-specific keys below:
+        // markov's own base, or the behavior itself for everyone else.
+        const std::string& effective = spec.behavior == "markov" ? spec.base_behavior : spec.behavior;
+
+        for (const auto& [key, value] : kvs) {
+            if (key == "base" && spec.behavior == "markov") {
+                continue;  // already resolved above
+            } else if (key == "samples" && spec.behavior == "markov") {
+                spec.markov_samples = parse_uint_arg("samples", value);
+            } else if (key == "relative-weight" && spec.behavior == "markov") {
+                spec.markov_relative_weight = parse_double_arg("relative-weight", value);
+            } else if (key == "file" && effective == "trace") {
                 spec.trace_file = value;
-            } else if (key == "alpha" && spec.behavior == "zipfian") {
+            } else if (key == "alpha" && effective == "zipfian") {
                 spec.alpha = parse_double_arg("alpha", value);
-            } else if (key == "read-ratio" && spec.behavior == "latest") {
+            } else if (key == "read-ratio" && effective == "latest") {
                 spec.read_ratio = parse_double_arg("read-ratio", value);
-            } else if (key == "scan-ratio" && (spec.behavior == "zipfian" || spec.behavior == "random-read")) {
+            } else if (key == "scan-ratio" && (effective == "zipfian" || effective == "random-read")) {
                 spec.scan_ratio = parse_double_arg("scan-ratio", value);
-            } else if (key == "scan-length" && (spec.behavior == "zipfian" || spec.behavior == "random-read")) {
+            } else if (key == "scan-length" && (effective == "zipfian" || effective == "random-read")) {
                 spec.scan_length = parse_uint_arg("scan-length", value);
             } else {
                 throw std::runtime_error("Unsupported key '" + key + "' for behavior '" + spec.behavior + "': " + trimmed);
             }
         }
 
-        if (spec.behavior == "trace" && spec.trace_file.empty()) {
+        if (effective == "trace" && spec.trace_file.empty()) {
             throw std::runtime_error("trace behavior requires file=<path>: " + trimmed);
+        }
+        if (spec.behavior == "markov" && !spec.markov_samples) {
+            throw std::runtime_error("markov behavior requires samples=<uint >= 3>: " + trimmed);
+        }
+        if (spec.markov_samples && *spec.markov_samples < 3) {
+            throw std::runtime_error("samples must be >= 3: " + trimmed);
+        }
+        if (spec.markov_relative_weight &&
+            (*spec.markov_relative_weight < 0.0 || *spec.markov_relative_weight > 1.0)) {
+            throw std::runtime_error("relative-weight must be between 0 and 1: " + trimmed);
         }
         if (spec.read_ratio && (*spec.read_ratio < 0.0 || *spec.read_ratio > 1.0)) {
             throw std::runtime_error("read-ratio must be between 0 and 1: " + trimmed);
@@ -495,7 +538,18 @@ int main(int argc, char** argv) {
                 "--requests", std::to_string(args.requests),
                 "--page-span", std::to_string(args.page_span),
             };
-            if (spec.behavior == "trace") {
+            const std::string& effective = spec.behavior == "markov" ? spec.base_behavior : spec.behavior;
+            if (spec.behavior == "markov") {
+                app_cmd.push_back("--markov-base");
+                app_cmd.push_back(spec.base_behavior);
+                app_cmd.push_back("--markov-samples");
+                app_cmd.push_back(std::to_string(*spec.markov_samples));
+                if (spec.markov_relative_weight) {
+                    app_cmd.push_back("--markov-relative-weight");
+                    app_cmd.push_back(std::to_string(*spec.markov_relative_weight));
+                }
+            }
+            if (effective == "trace") {
                 app_cmd.push_back("--trace-file");
                 app_cmd.push_back(spec.trace_file);
             }
