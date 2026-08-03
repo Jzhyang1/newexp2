@@ -205,11 +205,8 @@ struct WorkerThread {
         // manage simulation timings
         std::uint64_t global_idx = stats.request_count.fetch_add(1) + 1;
 
-        // decide on who to prefetch
-        policy::PrefetchRequest prefetch_req;
-        if (prefetch_policy) prefetch_policy->on_prefetch_request(self.id, page, prefetch_req);
-
         // manage cache
+        policy::PrefetchRequest prefetch_req;
         bool hit;
         ResumeContext resume;
         {
@@ -218,13 +215,20 @@ struct WorkerThread {
 
             // True critical section -- we update priority queue and cache
 
+            // decide on who to prefetch
+            // (must run under `mu`: any prefetch policy that keeps its own
+            // mining/recency state -- e.g. an association table -- is shared
+            // across concurrently-running WorkerThreads, so calling this
+            // outside the lock is a data race even though it looks read-only)
+            if (prefetch_policy) prefetch_policy->on_prefetch_request(self.id, page, prefetch_req);
+
             add_to_queue(page, false);
             for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
                 add_to_queue(prefetch_req.pages[i], true);
             }
 
             // Pop all fetched pages that arrive by the next timestamp
-            resume = pop_from_queue();
+            resume = pop_from_queue(global_idx > warmup);
             if (evict_policy) evict_policy->on_access(resume.trigger_app, resume.page);
             if (prefetch_policy) prefetch_policy->on_access(resume.trigger_app, resume.page);
 
@@ -261,7 +265,6 @@ struct WorkerThread {
         if (global_idx > warmup) {
             stats.hits.fetch_add(hit);
             stats.misses.fetch_add(1 - hit);
-            // stats.evictions = 0;    // TODO evictions
             stats.total_latencies.fetch_add(total_blocked_time);
         }
     }
@@ -301,7 +304,7 @@ struct WorkerThread {
             );
     }
 
-    ResumeContext pop_from_queue() {
+    ResumeContext pop_from_queue(bool count_stats) {
         // not thread safe
         // pops until we have threads to yield to; prefetch requests will also be handled
 
@@ -309,7 +312,7 @@ struct WorkerThread {
 
         ResumeContext resume = pq.top(); pq.pop();
         while(resume.blocked_apps->empty()) {
-            add_to_cache(resume);
+            add_to_cache(resume, count_stats);
             stats.sim_time_elapsed.store(resume.ready);
             // clean up for metadata discarded
             rmap.erase(resume.page);
@@ -317,12 +320,12 @@ struct WorkerThread {
             if (pq.empty()) return ResumeContext{};
             resume = pq.top(); pq.pop();
         }
-        add_to_cache(resume);   // this is the actual page that things are blocked on
+        add_to_cache(resume, count_stats);   // this is the actual page that things are blocked on
         stats.sim_time_elapsed.store(resume.ready);
         return resume;
     }
 
-    void add_to_cache(ResumeContext& ctx) {
+    void add_to_cache(ResumeContext& ctx, bool count_stats) {
         if (cache.present(ctx.page)) return;    // TODO consider what happens if we
             // instead of noop-ing eviction when ctx is present,
             // we still allow eviction, just don't add ctx.page into cache.
@@ -336,7 +339,7 @@ struct WorkerThread {
         for (std::uint64_t i = 0; i < evictions.n_pages; ++i) {
             auto evict_page = evictions.pages[i];
             cache.evict(evict_page);
-            evict_page_for_all(evict_page, *ctx.blocked_apps);
+            notify_evict(ctx.trigger_app, evict_page, count_stats);
         }
 
         // admit
@@ -345,21 +348,23 @@ struct WorkerThread {
             std::cerr << "random eviction: " << force_evicted.second << std::endl;
             // if the eviction request doesn't free up space, then
             // we need to evict another page
-            evict_page_for_all(force_evicted.second, *ctx.blocked_apps);
+            notify_evict(ctx.trigger_app, force_evicted.second, count_stats);
         }
-        admit_page_for_all(ctx.page, *ctx.blocked_apps);
+        notify_admit(ctx.trigger_app, ctx.page);
     }
 
-    inline void evict_page_for_all(std::uint64_t page, std::vector<BlockedApp>& apps) {
-        if (evict_policy == nullptr) return;
-        for (auto &app : apps)
-            evict_policy->on_evict(app.id, page);
+    // Notify the eviction policy of a page transition exactly once, regardless
+    // of whether any app is currently blocked waiting on it. A page that
+    // finishes prefetching before any real request arrives for it still needs
+    // to be tracked here -- otherwise it stays resident in `cache` but becomes
+    // invisible to the policy's own eviction-candidate bookkeeping.
+    inline void notify_evict(std::uint64_t context, std::uint64_t page, bool count_stats) {
+        if (evict_policy) evict_policy->on_evict(context, page);
+        if (count_stats) stats.evictions.fetch_add(1);
     }
 
-    inline void admit_page_for_all(std::uint64_t page, std::vector<BlockedApp>& apps) {
-        if (evict_policy == nullptr) return;
-        for (auto &app : apps)
-            evict_policy->on_admit(app.id, page);
+    inline void notify_admit(std::uint64_t context, std::uint64_t page) {
+        if (evict_policy) evict_policy->on_admit(context, page);
     }
 };
 
@@ -388,6 +393,12 @@ int main(int argc, char** argv) {
 
         if (args.prefetch_policy == "readahead") {
             prefetch_policy = new policy::ReadaheadPolicy(cache);
+        } else if (args.prefetch_policy == "cminer") {
+            prefetch_policy = new policy::CMinerPolicy(cache);
+        } else if (args.prefetch_policy == "quickmine") {
+            prefetch_policy = new policy::QuickMinePolicy(cache);
+        } else if (args.prefetch_policy == "mithril") {
+            prefetch_policy = new policy::MithrilPolicy(cache);
         } else if (args.prefetch_policy != "none") {
             throw std::runtime_error("Unsupported --prefetch-policy: " + args.prefetch_policy);
         }

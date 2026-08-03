@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <iostream>
 
+#include "assoc_miner.h"
+
 #define MAX_PREFETCH_PAGES 32
 #define MAX_EVICT_PAGES 128
 
@@ -125,6 +127,46 @@ class ReadaheadPolicy : public CachePolicy {
 public:
     ReadaheadPolicy(Cache& cache);
     void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+};
+
+// Baseline: mines page-follows-page associations from a single trailing
+// window shared by every client, i.e. context is ignored entirely. See
+// assoc_miner.h for how this relates to QuickMinePolicy and MithrilPolicy.
+class CMinerPolicy : public CachePolicy {
+    detail::WindowedAssociationTable assoc_;
+    std::uint64_t top_k_;
+public:
+    explicit CMinerPolicy(Cache& cache, std::size_t window_size = 8,
+                           std::uint32_t min_support = 2, std::uint64_t top_k = 4);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+};
+
+// Same windowed-association mining as CMinerPolicy, but partitioned per
+// app-supplied context (here, the requesting client's id) so that unrelated
+// clients' interleaved accesses never pollute each other's associations.
+class QuickMinePolicy : public CachePolicy {
+    detail::WindowedAssociationTable assoc_;
+    std::uint64_t top_k_;
+public:
+    explicit QuickMinePolicy(Cache& cache, std::size_t window_size = 8,
+                              std::uint32_t min_support = 2, std::uint64_t top_k = 4);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+};
+
+// Same global (context-free) windowed-association mining as CMinerPolicy,
+// but skips pages that have already gone "hot" -- both as prefetch triggers
+// and as window occupants -- since LRU already keeps those resident. Mining
+// budget is reserved for sporadically-recurring ("sporadic") pages instead.
+class MithrilPolicy : public CachePolicy {
+    detail::WindowedAssociationTable assoc_;
+    std::unordered_map<std::uint64_t, std::uint32_t> freq_;
+    std::uint64_t top_k_;
+    std::uint32_t hot_threshold_;
+public:
+    explicit MithrilPolicy(Cache& cache, std::size_t window_size = 8,
+                            std::uint32_t min_support = 2, std::uint64_t top_k = 4,
+                            std::uint32_t hot_threshold = 20);
     void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
 };
 
