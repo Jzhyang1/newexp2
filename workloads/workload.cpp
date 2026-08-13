@@ -383,6 +383,20 @@ bool pick_weighted(const std::unordered_map<int64_t, uint64_t> &candidates, doub
 	return true;
 }
 
+// Total count across a table -- the normalizer for both sampling and for
+// evaluating a specific entry's proposal probability.
+uint64_t total_count(const std::unordered_map<uint64_t, uint64_t> &table) {
+	uint64_t total = 0;
+	for (const auto &kv : table) total += kv.second;
+	return total;
+}
+
+uint64_t total_count(const std::unordered_map<int64_t, uint64_t> &table) {
+	uint64_t total = 0;
+	for (const auto &kv : table) total += kv.second;
+	return total;
+}
+
 }  // namespace
 
 MarkovWorkload::MarkovWorkload(long value_size, Workload *source, long train_samples, long nr_op,
@@ -414,18 +428,23 @@ MarkovWorkload::MarkovWorkload(long value_size, Workload *source, long train_sam
 	}
 	delete source;
 
-	for (std::size_t i = 1; i < pages.size(); ++i) {
-		this->direct_[pages[i - 1]][pages[i]]++;
-		if (i >= 2) {
-			int64_t prev_delta = (int64_t)pages[i - 1] - (int64_t)pages[i - 2];
-			int64_t next_delta = (int64_t)pages[i] - (int64_t)pages[i - 1];
-			this->rel_to_page_[prev_delta][pages[i]]++;
-			this->rel_to_rel_[prev_delta][next_delta]++;
+	for (std::size_t i = 0; i < pages.size(); ++i) {
+		this->visits_[pages[i]]++;
+		if (i >= 1) {
+			uint64_t a = pages[i - 1], b = pages[i];
+			// Symmetrize the edge itself (direct_[a][b] == direct_[b][a]
+			// always), not just hope the reverse pair also got observed --
+			// see the class comment on why an empirical-only reverse lookup
+			// is too sparse to be usable at realistic training sizes.
+			this->direct_[a][b]++;
+			if (a != b) this->direct_[b][a]++;
+			int64_t d = (int64_t)b - (int64_t)a;
+			this->delta_freq_[d]++;
+			this->delta_freq_[-d]++;  // symmetrize: makes delta_freq_[D] == delta_freq_[-D]
 		}
 	}
 
 	this->cur_page = pages.back();
-	this->cur_delta = (int64_t)pages[pages.size() - 1] - (int64_t)pages[pages.size() - 2];
 }
 
 bool MarkovWorkload::has_next_op() {
@@ -439,27 +458,56 @@ uint64_t MarkovWorkload::wrap_page(int64_t page) const {
 	return (uint64_t)wrapped;
 }
 
-bool MarkovWorkload::try_direct(uint64_t &next_page) {
+uint64_t MarkovWorkload::sample_from_visits() {
+	double r = this->generate_random_double(&this->seed);
+	uint64_t out;
+	pick_weighted(this->visits_, r, &out);  // visits_ is never empty past construction
+	return out;
+}
+
+// direct[cur_page] -> {Q: count} proposes Q with q_fwd = count/total(direct[
+// cur_page]). direct_ is symmetrized at construction time (direct_[A][B] ==
+// direct_[B][A] always -- see the constructor), so the reverse edge weight
+// is exactly the same count `w` used for q_fwd; only the *far* side's total
+// (Q's own out-degree, generally different from cur_page's) can differ. This
+// is what makes q_rev always well-defined instead of depending on the data
+// happening to independently confirm the reverse pair, which at realistic
+// training sizes it almost never does (most edges are singleton
+// observations) -- exactly the failure mode that made an earlier,
+// non-symmetrized version of this table collapse to near-zero acceptance.
+bool MarkovWorkload::propose_direct(uint64_t &candidate, double &q_fwd, double &q_rev) {
 	auto it = this->direct_.find(this->cur_page);
-	if (it == this->direct_.end()) return false;
+	if (it == this->direct_.end() || it->second.empty()) return false;
+
 	double r = this->generate_random_double(&this->seed);
-	return pick_weighted(it->second, r, &next_page);
+	uint64_t q;
+	pick_weighted(it->second, r, &q);
+	uint64_t w = it->second.at(q);
+	q_fwd = (double)w / (double)total_count(it->second);
+
+	candidate = q;
+
+	auto rev_it = this->direct_.find(q);
+	uint64_t total_cand = (rev_it == this->direct_.end()) ? 0 : total_count(rev_it->second);
+	q_rev = (total_cand > 0) ? (double)w / (double)total_cand : 0.0;
+	return true;
 }
 
-bool MarkovWorkload::try_rel_to_page(uint64_t &next_page) {
-	auto it = this->rel_to_page_.find(this->cur_delta);
-	if (it == this->rel_to_page_.end()) return false;
-	double r = this->generate_random_double(&this->seed);
-	return pick_weighted(it->second, r, &next_page);
-}
+// delta_freq -> {D: count} proposes candidate = cur_page + D with q_fwd =
+// count(D)/total. Since delta_freq is symmetrized at construction time
+// (delta_freq[D] == delta_freq[-D] always), q_rev == q_fwd identically --
+// no reverse lookup needed, and none of the "exact negation must also have
+// been observed" fragility the earlier per-incoming-delta version had.
+bool MarkovWorkload::propose_relative(uint64_t &candidate, double &q_fwd, double &q_rev) {
+	if (this->delta_freq_.empty()) return false;
 
-bool MarkovWorkload::try_rel_to_rel(uint64_t &next_page) {
-	auto it = this->rel_to_rel_.find(this->cur_delta);
-	if (it == this->rel_to_rel_.end()) return false;
 	double r = this->generate_random_double(&this->seed);
 	int64_t delta;
-	if (!pick_weighted(it->second, r, &delta)) return false;
-	next_page = this->wrap_page((int64_t)this->cur_page + delta);
+	pick_weighted(this->delta_freq_, r, &delta);
+	q_fwd = (double)this->delta_freq_.at(delta) / (double)total_count(this->delta_freq_);
+	q_rev = q_fwd;
+
+	candidate = this->wrap_page((int64_t)this->cur_page + delta);
 	return true;
 }
 
@@ -467,32 +515,38 @@ void MarkovWorkload::next_op(Operation *op) {
 	if (!this->has_next_op())
 		throw std::invalid_argument("does not have next op");
 
-	uint64_t next_page = this->cur_page;
-	bool found;
-	double r1 = this->generate_random_double(&this->seed);
-	if (r1 < this->relative_weight) {
-		double r2 = this->generate_random_double(&this->seed);
-		if (r2 < this->relative_weight) {
-			found = this->try_rel_to_rel(next_page) || this->try_rel_to_page(next_page) ||
-			        this->try_direct(next_page);
-		} else {
-			found = this->try_rel_to_page(next_page) || this->try_rel_to_rel(next_page) ||
-			        this->try_direct(next_page);
-		}
+	double coin = this->generate_random_double(&this->seed);
+	bool use_relative = coin < this->relative_weight;
+
+	uint64_t candidate;
+	double q_fwd = 0.0, q_rev = 0.0;
+	bool proposed = use_relative ? this->propose_relative(candidate, q_fwd, q_rev)
+	                              : this->propose_direct(candidate, q_fwd, q_rev);
+
+	uint64_t next_page;
+	if (!proposed) {
+		// Neither kernel has an entry for the current state (e.g. right after
+		// seeding, before any training pair was ever seen at direct[cur_page]).
+		// Propose directly from the target distribution pi=visits_: an
+		// independence proposal that's always accepted, since q(x|y)=pi(x)
+		// for every x, y makes the MH ratio exactly 1.
+		next_page = this->sample_from_visits();
 	} else {
-		found = this->try_direct(next_page) || this->try_rel_to_page(next_page) ||
-		        this->try_rel_to_rel(next_page);
-	}
-	if (!found) {
+		double pi_cur = (double)this->visits_.at(this->cur_page);
+		auto cand_it = this->visits_.find(candidate);
+		double pi_cand = (cand_it == this->visits_.end()) ? 0.0 : (double)cand_it->second;
+
+		double accept = (pi_cand > 0.0) ? std::min(1.0, (pi_cand * q_rev) / (pi_cur * q_fwd)) : 0.0;
 		double r = this->generate_random_double(&this->seed);
-		next_page = (uint64_t)(r * (double)this->page_span);
-		if (next_page >= this->page_span) next_page = this->page_span - 1;
+		// Rejected proposals self-loop (repeat cur_page) -- a perfectly
+		// normal MH outcome, not an error; it's what keeps the walk's
+		// long-run visitation frequency converging to pi.
+		next_page = (r < accept) ? candidate : this->cur_page;
 	}
 
 	op->type = READ;
 	op->key = next_page;
 	op->scan_length = 0;
-	this->cur_delta = (int64_t)next_page - (int64_t)this->cur_page;
 	this->cur_page = next_page;
 	++this->cur_nr_op;
 	op->is_last_op = !this->has_next_op();

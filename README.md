@@ -62,7 +62,7 @@ Represents one server workload process.
 - `--trace-file`: path to a trace, used only when `--behavior trace`; a newline-separated list of `uint64` page numbers replayed in order
 - `--markov-base`: the behavior to sample training data from, used only when `--behavior markov` (any other behavior name)
 - `--markov-samples`: number of pages sampled from `--markov-base` to fit the model, used only when `--behavior markov` (must be `>= 3`)
-- `--markov-relative-weight`: see "Markov workload" below, used only when `--behavior markov` (default `0.99`)
+- `--markov-relative-weight`: see "Markov workload" below, used only when `--behavior markov` (default `0.5`)
 
 Each app runs independently in parallel, and multiple app instances can run on the same machine.
 
@@ -72,27 +72,57 @@ Each app runs independently in parallel, and multiple app instances can run on t
 distribution — there's no real "page X is followed by page Y" structure, so
 prefetchers that mine page-follows-page associations (`cminer`/`quickmine`/`mithril`,
 see [`policies/assoc_miner.h`](policies/assoc_miner.h)) have nothing genuine to learn
-from them. `markov` fits a lightweight, non-parametric Markov model from the first
-`--markov-samples` pages of another workload's own output (`--markov-base`), then
-generates its actual request stream from that fitted model, giving those prefetchers
-real (if synthetic) sequential structure to exploit.
+from them. `markov` fits a model from the first `--markov-samples` pages of another
+workload's own output (`--markov-base`), then generates its actual request stream via
+a Metropolis-Hastings (MH) random walk over that fit, instead of replaying the source.
 
-The model learns three count tables from consecutive training pages
-`page[i-1] -> page[i]` and their deltas `delta[i] = page[i] - page[i-1]`:
+MH matters here, not just a stylistic choice: an earlier version generated pages by
+composing observed jumps directly (`next = current_page + jump`), with no guarantee
+about where that composition ends up. Empirically it didn't stay anywhere near the
+source's own popularity concentration — 20k generated pages from a `Zipfian(0.99)`
+source visited 99.45% distinct pages spanning the *entire* page span, vs. 58% distinct
+for the source itself. Since a source's popularity concentration (e.g. Zipfian's hot
+set) is exactly what drives cache hit ratio, that made `markov` a much harder,
+unrealistic workload rather than a like-for-like comparison. MH fixes this: it's an
+accept/reject scheme with a mathematical guarantee that the walk's long-run page-visit
+frequency converges to a specified target distribution — here, the source's own
+empirical histogram — no matter what "local" proposal moves drive it.
 
-- `direct[P] -> {Q: count}` — how often `Q` follows `P` directly.
-- `rel_to_page[D] -> {Q: count}` — how often `Q` follows a jump of size `D`.
-- `rel_to_rel[D] -> {D': count}` — how often jump `D'` follows jump `D` (applied as
-  `next = current_page + D'`).
+The model fits two tables from consecutive training pages `page[i-1] -> page[i]`,
+plus the marginal visit count per page (the MH target distribution):
 
-Generation draws two independent `Bernoulli(--markov-relative-weight)` coins per
-step: the first picks "relative" vs. "direct" (`direct`); the second, only when
-"relative", picks `rel_to_rel` vs. `rel_to_page`. So with the default `0.99`:
-`P(rel_to_rel) = 0.99^2 = 0.9801`, `P(rel_to_page) = 0.99 * 0.01 = 0.0099`,
-`P(direct) = 0.01`. If the chosen table has no entry for the current state, it falls
-back through the other tables, then to a uniform random page. The `--markov-samples`
-pages used for training are never themselves emitted as requests — `--requests`
-counts only the generated stream.
+- `direct[P] -> {Q: count}` — how often `Q` was adjacent to `P` in training.
+  Built as a **symmetric** table (`direct[P][Q] == direct[Q][P]`, both directions
+  incremented for every observed pair) so that every proposed edge has a
+  well-defined, always-computable reverse probability. An earlier, directed-only
+  version relied on the reverse pair also having been independently observed in
+  training, which at realistic sample sizes it almost never was — most edges are
+  singleton observations — collapsing MH's acceptance rate to ~0 and leaving the
+  walk stuck self-looping on its seed page.
+- `delta_freq[D] -> count` — how often a (signed) jump of size `D` was observed
+  between consecutive training pages, **symmetrized** (`delta_freq[D] ==
+  delta_freq[-D]` by construction: every observed `d` adds a count to `-d` too).
+
+Each generation step draws `Bernoulli(--markov-relative-weight)` to pick a proposal
+kernel — "relative" (propose `current_page + D` via `delta_freq`) or "direct"
+(propose `Q` via `direct[current_page]`) — then accepts with the standard MH ratio,
+using each table's symmetry to make the reverse probability always computable
+instead of a lookup that's usually missing. Rejected proposals self-loop (repeat the
+current page) — a normal MH outcome, not an error.
+
+In practice `direct` reproduces the source's popularity profile almost exactly
+(measured: 99% of a Zipfian source's distinct pages recovered, hot-page share within
+~0.2pp of the source); `relative` mixes much more poorly here, because a jump size
+pooled from a hash-scrambled key space (e.g. Zipfian's own key hashing) spans nearly
+the whole page range, so `current_page + D` rarely lands back on one of the source's
+actually-popular pages at all. Keep `--markov-relative-weight` low (the default `0.5`
+already leans this way; go lower, e.g. `0.1`, for closer fidelity to the source's own
+hit-rate profile) — `relative` still contributes some jump-based structure, but
+shouldn't dominate. If neither kernel has an entry for the current state (e.g. right
+after seeding), the step falls back to proposing directly from the target
+distribution, which is always accepted. The `--markov-samples` pages used for
+training are never themselves emitted as requests — `--requests` counts only the
+generated stream.
 
 #### Op-type modeling and scan semantics
 

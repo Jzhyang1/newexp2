@@ -31,6 +31,24 @@ constexpr std::size_t kPageBytes = 4096;
 auto no_first_time = std::chrono::steady_clock::time_point::max();
 auto no_last_time = std::chrono::steady_clock::time_point::min();
 
+// Real (wall-clock) nanoseconds elapsed since `start`. Used to measure the
+// actual compute cost of policy hooks and app think-time, both of which are
+// otherwise invisible to the simulated clock (`Stats::sim_time_elapsed`).
+inline std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+// A steady_clock::time_point, as ns since that clock's epoch -- the form
+// app_real_time_start stores, since it's shared across WorkerThreads that
+// only agree on a common clock, not on any particular time_point object.
+inline std::uint64_t to_ns(std::chrono::steady_clock::time_point tp) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+}
+inline std::uint64_t steady_ns() {
+    return to_ns(std::chrono::steady_clock::now());
+}
+
 struct Args {
     std::string evict_policy = "lru";
     std::string prefetch_policy = "none";
@@ -54,6 +72,8 @@ struct Stats {
     std::atomic<std::uint64_t> bytes_read{0};
     std::atomic<std::uint64_t> bytes_written{0};
     std::atomic<std::uint64_t> total_latencies{0};
+    std::atomic<std::uint64_t> app_latency_ns{0};     // real time apps spent between handoff and their next request
+    std::atomic<std::uint64_t> policy_latency_ns{0};  // real compute time spent inside evict/prefetch policy hooks
 };
 
 struct App {
@@ -169,7 +189,33 @@ struct WorkerThread {
     std::shared_mutex& mu;
     std::priority_queue<ResumeContext>& pq;
     std::unordered_map<std::uint64_t, std::vector<BlockedApp>*>& rmap;    // in-flight map
+    std::unordered_map<std::uint64_t, std::uint64_t>& app_real_time_start;    // when we handed off to each app (so that we can get the actual time when control is handed to the worker)
     const std::uint64_t warmup;
+
+    // Times `fn` (a policy hook invocation) and charges its real wall-clock
+    // cost as simulated delay, added onto `sink` -- so a computationally
+    // expensive policy shows up as real added latency in the simulation
+    // instead of being free. Also folds the same measurement into
+    // stats.policy_latency_ns for visibility, unless still in warmup.
+    // Returns the measured ns in case the caller needs it too (e.g. to also
+    // advance stats.sim_time_elapsed).
+    template <typename Fn>
+    inline std::uint64_t charge_policy_ns(std::uint64_t& sink, bool count_stats, Fn&& fn) {
+        auto perf_start = std::chrono::steady_clock::now();
+        fn();
+        std::uint64_t ns = elapsed_ns(perf_start);
+        sink += ns;
+        if (count_stats) stats.policy_latency_ns.fetch_add(ns);
+        return ns;
+    }
+
+    // Same, but the delay belongs to a ResumeContext's `ready` time rather
+    // than a bare accumulator (used everywhere past the point where the
+    // ResumeContext for this fetch exists).
+    template <typename Fn>
+    inline std::uint64_t charge_policy_ns(ResumeContext& ctx, bool count_stats, Fn&& fn) {
+        return charge_policy_ns(ctx.ready, count_stats, std::forward<Fn>(fn));
+    }
 
     void operator()() {
         std::string line;
@@ -204,14 +250,29 @@ struct WorkerThread {
 
         // manage simulation timings
         std::uint64_t global_idx = stats.request_count.fetch_add(1) + 1;
+        bool count_stats = global_idx > warmup;
 
         // manage cache
         policy::PrefetchRequest prefetch_req;
         bool hit;
         ResumeContext resume;
+        std::uint64_t app_latency_ns = 0;
         {
             std::lock_guard _{mu};
             hit = cache.present(page);
+            std::uint64_t prefetch_skew_ns = 0;  // Time skew from prefetching work
+
+            // Real (wall-clock) time this app spent between receiving its
+            // previous response and issuing this request -- i.e. the app's
+            // own think/compute time, entirely outside dat's critical path.
+            // Only present once this app has been handed a response before
+            // (see the handoff site below where the entry is written).
+            auto app_start = app_real_time_start.find(self.id);
+            if (app_start != app_real_time_start.end()) {
+                std::uint64_t now_ns = to_ns(real_time);
+                app_latency_ns = now_ns > app_start->second ? now_ns - app_start->second : 0;
+                app_real_time_start.erase(app_start);
+            }
 
             // True critical section -- we update priority queue and cache
 
@@ -220,17 +281,32 @@ struct WorkerThread {
             // mining/recency state -- e.g. an association table -- is shared
             // across concurrently-running WorkerThreads, so calling this
             // outside the lock is a data race even though it looks read-only)
-            if (prefetch_policy) prefetch_policy->on_prefetch_request(self.id, page, prefetch_req);
+            if (prefetch_policy) {
+                charge_policy_ns(prefetch_skew_ns, count_stats, [&]{
+                    prefetch_policy->on_prefetch_request(self.id, page, prefetch_req);
+                });
+            }
 
-            add_to_queue(page, false);
+            add_to_queue(page, false, prefetch_skew_ns);
             for (std::uint64_t i = 0; i < prefetch_req.n_pages && i < MAX_PREFETCH_PAGES; ++i) {
-                add_to_queue(prefetch_req.pages[i], true);
+                add_to_queue(prefetch_req.pages[i], true, prefetch_skew_ns);
             }
 
             // Pop all fetched pages that arrive by the next timestamp
-            resume = pop_from_queue(global_idx > warmup);
-            if (evict_policy) evict_policy->on_access(resume.trigger_app, resume.page);
-            if (prefetch_policy) prefetch_policy->on_access(resume.trigger_app, resume.page);
+            resume = pop_from_queue(count_stats);
+            // Once popped, resume.ready is no longer picked up by any later
+            // store into stats.sim_time_elapsed (unlike inside pop_from_queue
+            // itself), so on_access overhead has to bump both explicitly.
+            if (evict_policy) {
+                stats.sim_time_elapsed.fetch_add(charge_policy_ns(resume, count_stats, [&]{
+                    evict_policy->on_access(resume.trigger_app, resume.page);
+                }));
+            }
+            if (prefetch_policy) {
+                stats.sim_time_elapsed.fetch_add(charge_policy_ns(resume, count_stats, [&]{
+                    prefetch_policy->on_access(resume.trigger_app, resume.page);
+                }));
+            }
 
             if (resume.blocked_apps) {
                 // this cleanup is unsafe outside of critical section
@@ -249,11 +325,19 @@ struct WorkerThread {
                     app.res->set_value(3);   // crash due to pipe failure
                     return;
                 }
-                
+
+                // Record when we handed off control to this app so that,
+                // when it comes back with its next request, we can measure
+                // the actual (real) time it took -- see app_latency_ns above.
+                {
+                    std::lock_guard _{mu};
+                    app_real_time_start[app.id] = steady_ns();
+                }
+
                 std::thread(WorkerThread{
                     app,
                     cache, evict_policy, prefetch_policy,
-                    stats, mu, pq, rmap,
+                    stats, mu, pq, rmap, app_real_time_start,
                     warmup
                 }).detach();
                 total_blocked_time += resume.ready - app.block_time;
@@ -262,14 +346,15 @@ struct WorkerThread {
         }
 
         // log metrics
-        if (global_idx > warmup) {
+        if (count_stats) {
             stats.hits.fetch_add(hit);
             stats.misses.fetch_add(1 - hit);
             stats.total_latencies.fetch_add(total_blocked_time);
+            stats.app_latency_ns.fetch_add(app_latency_ns);
         }
     }
 
-    void add_to_queue(std::uint64_t page, bool is_prefetch) {
+    void add_to_queue(std::uint64_t page, bool is_prefetch, std::uint64_t skew_ns) {
         // non-thread safe
         // adds the page to in-flight queue
         // returns the time elapsed before the page will be available again
@@ -281,7 +366,7 @@ struct WorkerThread {
         std::vector<BlockedApp>* resume_apps;
         std::uint64_t sim_time = stats.sim_time_elapsed.load();
         if (in_flight == rmap.end()) {
-            std::uint64_t sim_elapsed_ns = cache.get_page_ns(page);
+            std::uint64_t sim_elapsed_ns = cache.get_page_ns(page) + skew_ns;
             resume_apps = new std::vector<BlockedApp>{};
 
             pq.emplace(
@@ -321,7 +406,8 @@ struct WorkerThread {
             resume = pq.top(); pq.pop();
         }
         add_to_cache(resume, count_stats);   // this is the actual page that things are blocked on
-        stats.sim_time_elapsed.store(resume.ready);
+        std::uint64_t cur_time = stats.sim_time_elapsed.load();
+        if (resume.ready > cur_time) stats.sim_time_elapsed.store(resume.ready);
         return resume;
     }
 
@@ -333,13 +419,17 @@ struct WorkerThread {
             // (we get to evict faster later) but for simulation, it will not matter.
 
         policy::EvictRequest evictions;
-        if(evict_policy) evict_policy->on_evict_request(ctx.trigger_app, ctx.page, evictions);
+        if(evict_policy) {
+            charge_policy_ns(ctx, count_stats, [&]{
+                evict_policy->on_evict_request(ctx.trigger_app, ctx.page, evictions);
+            });
+        }
 
         // we will accept all suggested evictions for now
         for (std::uint64_t i = 0; i < evictions.n_pages; ++i) {
             auto evict_page = evictions.pages[i];
             cache.evict(evict_page);
-            notify_evict(ctx.trigger_app, evict_page, count_stats);
+            notify_evict(ctx, evict_page, count_stats);
         }
 
         // admit
@@ -348,9 +438,9 @@ struct WorkerThread {
             std::cerr << "random eviction: " << force_evicted.second << std::endl;
             // if the eviction request doesn't free up space, then
             // we need to evict another page
-            notify_evict(ctx.trigger_app, force_evicted.second, count_stats);
+            notify_evict(ctx, force_evicted.second, count_stats);
         }
-        notify_admit(ctx.trigger_app, ctx.page);
+        notify_admit(ctx, ctx.page, count_stats);
     }
 
     // Notify the eviction policy of a page transition exactly once, regardless
@@ -358,13 +448,17 @@ struct WorkerThread {
     // finishes prefetching before any real request arrives for it still needs
     // to be tracked here -- otherwise it stays resident in `cache` but becomes
     // invisible to the policy's own eviction-candidate bookkeeping.
-    inline void notify_evict(std::uint64_t context, std::uint64_t page, bool count_stats) {
-        if (evict_policy) evict_policy->on_evict(context, page);
+    inline void notify_evict(ResumeContext& ctx, std::uint64_t page, bool count_stats) {
+        if (evict_policy) {
+            charge_policy_ns(ctx, count_stats, [&]{ evict_policy->on_evict(ctx.trigger_app, page); });
+        }
         if (count_stats) stats.evictions.fetch_add(1);
     }
 
-    inline void notify_admit(std::uint64_t context, std::uint64_t page) {
-        if (evict_policy) evict_policy->on_admit(context, page);
+    inline void notify_admit(ResumeContext& ctx, std::uint64_t page, bool count_stats) {
+        if (evict_policy) {
+            charge_policy_ns(ctx, count_stats, [&]{ evict_policy->on_admit(ctx.trigger_app, page); });
+        }
     }
 };
 
@@ -413,6 +507,7 @@ int main(int argc, char** argv) {
         std::vector<PipePair> pipes(n);
         std::priority_queue<ResumeContext> pq;
         std::unordered_map<std::uint64_t, std::vector<BlockedApp>*> rmap;
+        std::unordered_map<std::uint64_t, std::uint64_t> app_real_time_start;
         std::shared_mutex mu;   // Protects critical sections
 
         for (std::size_t worker_id = 0; worker_id < args.w_pipes.size(); ++worker_id) {
@@ -426,7 +521,7 @@ int main(int argc, char** argv) {
             std::thread(WorkerThread{
                 {&pipes[worker_id], &promises[worker_id], worker_id},
                 cache, evict_policy, prefetch_policy,
-                stats, mu, pq, rmap,
+                stats, mu, pq, rmap, app_real_time_start,
                 warmup
             }).detach();
         }
@@ -450,6 +545,8 @@ int main(int argc, char** argv) {
                   << "bytes_read=" << stats.bytes_read << ' '
                   << "bytes_written=" << stats.bytes_written << ' '
                   << "avg_latency_ns=" << avg_latency << ' '
+                  << "app_latency_ns=" << stats.app_latency_ns << ' '
+                  << "policy_latency_ns=" << stats.policy_latency_ns << ' '
                   << "runtime_seconds=" << runtime_seconds << ' '
                   << "hit_ratio=" << (measured == 0 ? 0.0 : (double)stats.hits / measured)
                   << "\n";

@@ -6,7 +6,7 @@
 # model from the first 10000 pages a Zipfian(0.99) generator itself produces,
 # then generates the actual request stream from that model, so prefetching
 # has genuine (if synthetic) sequential structure to find.
-markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.99
-markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.99
-markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.99
-markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.99
+markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.1
+markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.1
+markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.1
+markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.1

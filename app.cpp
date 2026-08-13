@@ -35,7 +35,7 @@ constexpr double kDefaultScanRatio = 0.0;
 // can't write through a null/undersized pointer.
 constexpr long kScratchValueSize = 16;
 
-constexpr double kDefaultMarkovRelativeWeight = 0.99;
+constexpr double kDefaultMarkovRelativeWeight = 0.5;
 
 struct Args {
     std::string behavior = "random-read";

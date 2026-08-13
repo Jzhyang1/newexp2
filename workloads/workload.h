@@ -176,23 +176,58 @@ private:
 	void generate_value_string(char *value_buffer);
 };
 
-// Non-parametric, read-only workload: fits a lightweight Markov model from
-// the first `train_samples` pages of another workload's own output, then
-// generates new page requests from that fitted model instead of replaying
-// the source. Gives prefetchers that mine page-follows-page associations
-// (see policies/assoc_miner.h) genuine sequential structure to learn, unlike
-// the i.i.d. Zipfian/Latest draws the source workloads normally produce.
+// Non-parametric, read-only workload: fits a lightweight model from the first
+// `train_samples` pages of another workload's own output, then generates new
+// page requests via a Metropolis-Hastings (MH) random walk instead of
+// replaying the source. Gives prefetchers that mine page-follows-page
+// associations (see policies/assoc_miner.h) genuine *local* sequential
+// structure to learn, while -- unlike naively composing observed jumps --
+// provably converging to the source's own page-popularity distribution
+// (empirically, visits_[page]/train_samples) as its stationary distribution.
+// That matters because the source's popularity concentration (e.g.
+// Zipfian's hot set) is what actually drives cache hit ratio; a generator
+// that wanders off it produces a much harder, unrealistic workload. See
+// README.md's "Markov workload" section for the derivation.
 //
-// Three count tables are fit from consecutive pages (page[i-1] -> page[i])
-// and their deltas (delta[i] = page[i] - page[i-1]):
-//   - direct[P]      -> {Q: count}   how often Q follows P directly
-//   - rel_to_page[D]  -> {Q: count}   how often Q follows a jump of size D
-//   - rel_to_rel[D]   -> {D': count}  how often jump D' follows jump D
-// Generation draws two independent Bernoulli(relative_weight) coins: the
-// first picks "relative" vs "direct" (table 1); the second, only when
-// "relative", picks rel_to_rel vs rel_to_page. That makes
-// P(rel_to_rel) = relative_weight^2, P(rel_to_page) = relative_weight *
-// (1 - relative_weight), P(direct) = 1 - relative_weight.
+// Two tables are fit from the training pages:
+//   - direct[P]     -> {Q: count}  how often Q follows P directly
+//   - delta_freq[D] -> count       how often a jump of (signed) size D was
+//                                  observed between consecutive pages,
+//                                  *symmetrized*: every observed d also adds
+//                                  a count to -d, so delta_freq[D] ==
+//                                  delta_freq[-D] always, by construction.
+// plus a marginal visits_[P] -> count (the empirical target distribution
+// pi(P), used only to accept/reject -- never to propose).
+//
+// Each generation step draws Bernoulli(relative_weight) to pick a proposal
+// kernel -- "relative" (propose cur_page + D via delta_freq) or "direct"
+// (propose Q via direct[cur_page]) -- then accepts with the MH ratio
+// min(1, pi(candidate)*q(cur|candidate) / (pi(cur)*q(candidate|cur))); on
+// rejection the walk self-loops (repeats cur_page). For "direct", q(cur|
+// candidate) is the reverse lookup direct[candidate][cur_page]/total. For
+// "relative", delta_freq's symmetry makes q(cur|candidate) == q(candidate|
+// cur) identically, so no lookup is needed -- this is deliberate, and not
+// just a simplification: an earlier version conditioned delta_freq on the
+// *incoming* jump size (a proper 2nd-order relative-step model) and
+// evaluated its reverse via a per-incoming-delta table, but jump sizes
+// between hash-scrambled pages (e.g. Zipfian's key hashing) are almost all
+// numerically unique, so the exact negated delta the reverse lookup needed
+// almost never existed -- acceptance collapsed to ~0 and the walk got stuck
+// self-looping (measured: 3 distinct pages touched in 20k generated ops).
+// Pooling and symmetrizing trades that 2nd-order conditioning for actually
+// working: candidates stay reachable and the walk's long-run page-visit
+// frequency converges to pi as intended. See README.md for the full
+// derivation and that failure mode.
+//
+// A third kernel from an earlier version -- predicting an absolute page
+// purely from the previous jump size, ignoring current position -- is
+// dropped entirely: it has no well-defined reverse move to Hastings-correct
+// against, so it can't be made MH-valid without discarding exactly the
+// property (page-identity-agnostic jumps) that defined it.
+//
+// If neither kernel has an entry for the current state (e.g. right after
+// seeding), the step falls back to an independence proposal drawn directly
+// from visits_ -- which, proposing exactly from pi, is always accepted.
 struct MarkovWorkload : public Workload {
 	/* configuration */
 	long nr_op;
@@ -203,7 +238,6 @@ struct MarkovWorkload : public Workload {
 	unsigned int seed;
 	long cur_nr_op;
 	uint64_t cur_page;
-	int64_t cur_delta;
 
 	// Takes ownership of `source`: pulls exactly `train_samples` ops from it
 	// to fit the model, then deletes it -- `source` is never touched again.
@@ -214,11 +248,14 @@ struct MarkovWorkload : public Workload {
 
 private:
 	std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> direct_;
-	std::unordered_map<int64_t, std::unordered_map<uint64_t, uint64_t>> rel_to_page_;
-	std::unordered_map<int64_t, std::unordered_map<int64_t, uint64_t>> rel_to_rel_;
+	std::unordered_map<int64_t, uint64_t> delta_freq_;
+	std::unordered_map<uint64_t, uint64_t> visits_;
 
-	bool try_direct(uint64_t &next_page);
-	bool try_rel_to_page(uint64_t &next_page);
-	bool try_rel_to_rel(uint64_t &next_page);
+	// Proposes a candidate (and its forward/reverse proposal densities) from
+	// the given kernel; returns false if the kernel has no entry to propose
+	// from (only possible for "direct", pre-seed/pre-any-training-pair).
+	bool propose_direct(uint64_t &candidate, double &q_fwd, double &q_rev);
+	bool propose_relative(uint64_t &candidate, double &q_fwd, double &q_rev);
+	uint64_t sample_from_visits();
 	uint64_t wrap_page(int64_t page) const;
 };
