@@ -89,3 +89,101 @@ run: all print-config
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
+
+# ---------------------------------------------------------------------------
+# userfaultfd variant: lhook (LD_PRELOAD mmap interceptor), ldat (uffd-driven
+# cache/policy daemon), lrunner (orchestrator). Linux-only (userfaultfd,
+# process_madvise, /proc) -- not part of `all`/`run` since they cannot build
+# on macOS. Build these inside the Linux VM with `make luffd`.
+LIB_DIR := lib
+LHOOK_SRC := lhook.cpp
+LDAT_SRC := ldat.cpp
+LRUNNER_SRC := lrunner.cpp
+UFFD_PROTOCOL_HDR := uffd_protocol.h
+
+LHOOK_LIB := $(LIB_DIR)/liblhook.so
+LDAT_BIN := $(BIN_DIR)/ldat
+LRUNNER_BIN := $(BIN_DIR)/lrunner
+
+# lapp: a twin of app.cpp that actually performs its accesses (mmap + real
+# reads) instead of describing them over a pipe -- see lapp.cpp. It has no
+# userfaultfd dependency itself, so it builds on macOS too, but it's only
+# useful for its intended purpose (verifying the uffd pipeline) run under
+# lrunner on Linux, so it's grouped with the rest of luffd below.
+LAPP_SRC := lapp.cpp
+LAPP_BIN := $(BIN_DIR)/lapp
+
+# Watch prefix + hook lib path for `make lrun`; APP_CMD is the unmodified
+# real application to launch, e.g. APP_CMD="redis-server --daemonize no".
+WATCH_PREFIX ?= /mnt/remote
+SOCKET_PATH ?= /tmp/ldat_uffd.sock
+APP_CMD ?=
+
+# `make lverify` defaults: runs lapp itself (not a real app) through lrunner,
+# as a self-contained sanity check of the whole uffd pipeline.
+LAPP_FILE ?= $(WATCH_PREFIX)/lapp_test.dat
+LAPP_BEHAVIOR ?= zipfian
+LAPP_REQUESTS ?= 20000
+
+.PHONY: luffd lhook ldat lrunner lapp lrun lverify ldirs
+
+ldirs:
+	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR) ./logs
+
+luffd: lhook ldat lrunner lapp
+
+lhook: $(LHOOK_LIB)
+
+$(LHOOK_LIB): $(LHOOK_SRC) $(UFFD_PROTOCOL_HDR) | ldirs
+	$(CXX) $(CXXFLAGS) -shared -fPIC $(LHOOK_SRC) -o $@ -ldl
+
+ldat: $(LDAT_BIN)
+
+$(LDAT_BIN): $(LDAT_SRC) $(POLICY_SRCS) $(UFFD_PROTOCOL_HDR) | ldirs
+	$(CXX) $(CXXFLAGS) $(LDAT_SRC) $(POLICY_SRCS) -o $@ $(LDFLAGS)
+
+lrunner: $(LRUNNER_BIN)
+
+$(LRUNNER_BIN): $(LRUNNER_SRC) $(UFFD_PROTOCOL_HDR) | ldirs
+	$(CXX) $(CXXFLAGS) $(LRUNNER_SRC) -o $@ $(LDFLAGS)
+
+lapp: $(LAPP_BIN)
+
+$(LAPP_BIN): $(LAPP_SRC) $(WORKLOAD_SRCS) | ldirs
+	$(CXX) $(CXXFLAGS) $(LAPP_SRC) $(WORKLOAD_SRCS) -o $@ $(LDFLAGS)
+
+# Run one real-app experiment via lrunner. Override vars at invocation time,
+# e.g.: make lrun WATCH_PREFIX=/mnt/remote APP_CMD="redis-server /etc/redis.conf"
+lrun: luffd
+	$(LRUNNER_BIN) \
+		--evict-policy $(EVICT_POLICY) \
+		--prefetch-policy $(PREFETCH_POLICY) \
+		--capacity $(CAPACITY) \
+		--miss-delay $(MISS_DELAY_NS) \
+		--hit-delay $(HIT_DELAY_NS) \
+		--watch-prefix $(WATCH_PREFIX) \
+		--socket $(SOCKET_PATH) \
+		--hook-lib $(LHOOK_LIB) \
+		--warmup-period $(WARMUP) \
+		--log ./logs/lresults.csv \
+		-- $(APP_CMD)
+
+# Self-contained sanity check: runs lapp (not a real app) through lrunner, so
+# there's nothing external to install first. A working run should show
+# ldat's STATS line with a plausible hit_ratio, and lapp's own
+# pages_touched count matching --requests (scan/zipfian's default
+# scan-ratio=0 makes that an exact match; override LAPP_BEHAVIOR=scan or
+# pass --scan-ratio to exercise multi-page ops too).
+lverify: luffd
+	$(LRUNNER_BIN) \
+		--evict-policy $(EVICT_POLICY) \
+		--prefetch-policy $(PREFETCH_POLICY) \
+		--capacity $(CAPACITY) \
+		--miss-delay $(MISS_DELAY_NS) \
+		--hit-delay $(HIT_DELAY_NS) \
+		--watch-prefix $(WATCH_PREFIX) \
+		--socket $(SOCKET_PATH) \
+		--hook-lib $(LHOOK_LIB) \
+		--warmup-period $(WARMUP) \
+		--log ./logs/lverify.csv \
+		-- $(LAPP_BIN) --behavior $(LAPP_BEHAVIOR) --file $(LAPP_FILE) --page-span $(PAGE_SPAN) --requests $(LAPP_REQUESTS)
