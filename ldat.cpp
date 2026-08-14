@@ -192,6 +192,22 @@ int get_file_fd(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         std::perror(("ldat: open() backing file " + path).c_str());
+    } else {
+        // Every fetch here is already gated by our own policy::Cache -- a
+        // page we're pread()ing is one the simulated cache just decided was
+        // NOT resident. Sequential kernel readahead on this fd would let a
+        // scan-like access pattern quietly get served from pages the kernel
+        // prefetched on a previous read, understating the real fetch cost
+        // for that pattern relative to one that defeats readahead (e.g.
+        // Zipfian's effectively-random offsets) -- exactly the kind of
+        // locality-dependent latency gap that showed up comparing scan vs
+        // zipfian runs. This just asks the kernel to stop readahead-ing this
+        // fd; it does NOT stop an already-cached page from being served fast
+        // on a later pread() to the same offset (that would need
+        // POSIX_FADV_DONTNEED after each read, or O_DIRECT).
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) != 0) {
+            std::perror(("ldat: posix_fadvise(POSIX_FADV_RANDOM) on " + path).c_str());
+        }
     }
     g_open_files.emplace(path, fd);
     return fd;
