@@ -21,9 +21,14 @@
 
 namespace policy {
 
+struct FetchRange {
+    std::uint32_t block_offset;
+    std::uint32_t block_length;
+};
+
 struct PrefetchRequest {
-    std::uint64_t n_pages = 0;
-    std::uint64_t pages[MAX_PREFETCH_PAGES];
+    std::uint64_t fetch_count = 0;
+    FetchRange fetch_ranges[MAX_PREFETCH_PAGES];
 };
 
 struct EvictRequest {

@@ -1,0 +1,46 @@
+# Example config for launch.py.
+#
+# `defaults:` applies to every VM under `vms:`; each VM entry is deep-merged
+# on top of it, so a VM only needs to specify what differs. Each VM lists its
+# own `disks:` -- one entry per remote NBD volume to attach. Disks are wired
+# up in list order, so the first entry becomes /dev/vda inside the guest, the
+# second /dev/vdb, and so on. Every disk is a `driver=nbd` QEMU block backend
+# (compatible with nbd.cpp), so it looks and behaves like an ordinary local
+# disk to the guest -- the NBD transport is invisible to it.
+
+defaults:
+  qemu_binary: qemu-system-x86_64
+  kvm: true
+  vcpus: 2
+  memory: 2G
+  run_dir: /tmp/kvm-launch
+  log_dir: /tmp/kvm-launch
+  daemonize: true
+  display: none          # "none" -> serial console only; or "gtk", "vnc=:0", etc.
+  network:
+    type: user             # user | tap | none
+    hostfwd: []             # e.g. ["tcp::2222-:22"] for user-mode port forwarding
+
+vms:
+  - name: vm0
+    disks:
+      - nbd: {host: 10.0.0.5, port: 10809, export: vm0-root}   # -> /dev/vda
+      - nbd: {host: 10.0.0.5, port: 10809, export: vm0-data}   # -> /dev/vdb
+    network:
+      hostfwd: ["tcp::2200-:22"]
+
+  - name: vm1
+    memory: 4G
+    disks:
+      - nbd: {host: 10.0.0.5, port: 10810, export: vm1-root}   # -> /dev/vda
+    network:
+      hostfwd: ["tcp::2201-:22"]
+
+  - name: vm2
+    vcpus: 4
+    disks:
+      - nbd: {host: 10.0.0.6, port: 10809, export: vm2-root}   # -> /dev/vda
+      - nbd: {host: 10.0.0.6, port: 10811, export: vm2-scratch} # -> /dev/vdb
+      - nbd: {host: 10.0.0.6, port: 10812, export: vm2-extra}   # -> /dev/vdc
+    network:
+      hostfwd: ["tcp::2202-:22"]
