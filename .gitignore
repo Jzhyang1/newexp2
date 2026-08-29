@@ -1,3 +1,6 @@
 bin/
 logs/
 *.bin
+disk/data/
+disk/nbd_server.pid
+disk/nbd_server.log

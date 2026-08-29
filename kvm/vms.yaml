@@ -1,0 +1,29 @@
+# Default VM config for `make vms-up` / `make experiment`, matching the
+# default disk/nbd.yaml (`make nbd-config`'s defaults): one nbd_server
+# listening on 127.0.0.1:10809. See kvm/vms.example.yaml for the full schema
+# and a multi-VM/multi-disk example.
+#
+# No kernel/OS image is configured here, since disk/data/nbd_disk.img starts
+# out as a plain zero-filled file (see `make disk`) -- this VM will sit at
+# its firmware's "no bootable device" screen, which is still a real
+# end-to-end check that QEMU successfully attached the NBD disk (watch
+# nbd_server's stderr/log for "client connected"). Point `kernel`/`initrd`/
+# `append` at a real image (or install an OS onto the backing file) to do
+# more than that.
+
+defaults:
+  qemu_binary: qemu-system-x86_64
+  kvm: false          # set true on a host with /dev/kvm access for real performance
+  vcpus: 1
+  memory: 512M
+  run_dir: /tmp/kvm-launch
+  log_dir: /tmp/kvm-launch
+  daemonize: true
+  display: none
+  network:
+    type: none
+
+vms:
+  - name: vm0
+    disks:
+      - nbd: {host: 127.0.0.1, port: 10809, export: vm0-root}   # -> /dev/vda
