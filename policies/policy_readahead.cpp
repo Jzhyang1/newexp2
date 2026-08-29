@@ -17,13 +17,11 @@ void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page) {
 
 void ReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request) {
     (void)context;
-    request.n_pages = MAX_PREFETCH_PAGES;
-
-    // Suggest the next N pages for prefetching
-    for (std::uint64_t i = 0; i < MAX_PREFETCH_PAGES; ++i) {
-        std::uint64_t next_page = page + i + 1;
-        request.pages[i] = next_page;
-    }
+    // Suggest the next MAX_PREFETCH_PAGES pages for prefetching, as one
+    // contiguous range starting just past `page`.
+    request.fetch_count = 1;
+    request.fetch_ranges[0] =
+        FetchRange{static_cast<std::uint32_t>(page + 1), MAX_PREFETCH_PAGES};
 };
 
 }  // namespace policy

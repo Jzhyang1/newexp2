@@ -1,5 +1,7 @@
 #include "policy_api.h"
 
+#include <algorithm>
+
 namespace policy {
 
 namespace {
@@ -18,7 +20,7 @@ MithrilPolicy::MithrilPolicy(Cache& cache, std::size_t window_size, std::uint32_
 void MithrilPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t page,
                                          PrefetchRequest& request) {
     (void)context;
-    request.n_pages = 0;
+    request.fetch_count = 0;
 
     // Frequency prior to this visit: pages already accessed often enough to
     // stay resident under plain LRU aren't worth spending mining budget on
@@ -28,7 +30,14 @@ void MithrilPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t pag
     std::uint32_t freq_before = freq_[page]++;
     if (freq_before >= hot_threshold_) return;
 
-    assoc_.predict(kSharedKey, page, request.pages, request.n_pages, top_k_);
+    std::uint64_t predicted[MAX_PREFETCH_PAGES];
+    std::uint64_t predicted_n = 0;
+    std::uint64_t capacity = std::min<std::uint64_t>(top_k_, MAX_PREFETCH_PAGES);
+    assoc_.predict(kSharedKey, page, predicted, predicted_n, capacity);
+    request.fetch_count = predicted_n;
+    for (std::uint64_t i = 0; i < predicted_n; ++i) {
+        request.fetch_ranges[i] = FetchRange{static_cast<std::uint32_t>(predicted[i]), 1};
+    }
     assoc_.observe(kSharedKey, page);
 }
 

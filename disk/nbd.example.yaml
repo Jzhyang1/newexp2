@@ -1,0 +1,24 @@
+# Example config for nbd.cpp.
+#
+# One nbd server process backs a single file and listens on one TCP port per
+# entry in `ports:`. Each port is a distinct client identity: a VM whose
+# disk dials a given port is charged simulated hit/miss latency and tracked
+# for virtual-time/prefetch purposes separately from every other port, so
+# assign one port per VM disk you want the simulator to treat as a distinct
+# client (see kvm/vms.example.yaml, where each VM disk names the host:port
+# of the nbd server it should attach to).
+#
+# This is a deliberately small subset of YAML: flat `key: value` lines,
+# `#` comments, and one inline list (`ports:`). Nesting is not supported.
+
+source: local              # only "local" (a real backing file) is implemented
+file: ./data.bin            # exported device size == this file's size
+ports: [10809, 10810, 10811]
+
+capacity: 4096              # cache capacity, in SECTOR_SIZE (512B) pages
+hit_latency_ns: 30000
+miss_latency_ns: 300000
+warmup: 0                   # requests to skip before counting stats
+
+evict_policy: lru           # none | fifo | lifo | lru
+prefetch_policy: none       # none | readahead | cminer | quickmine | mithril
