@@ -58,7 +58,8 @@
 namespace nbd {
 
 constexpr uint64_t kNbdMagic = 0x4e42444d41474943ULL;   // "NBDMAGIC"
-constexpr uint64_t kIhaveOpt = 0x49484156454f5054ULL;   // "IHAVEOPT"
+constexpr uint64_t kIhaveOpt = 0x49484156454f5054ULL;   // "IHAVEOPT" -- client->server option-request magic
+constexpr uint64_t kRepMagic = 0x0003e889045565a9ULL;   // NBD_REP_MAGIC -- server->client option-reply magic
 constexpr uint32_t kRequestMagic = 0x25609513;
 constexpr uint32_t kSimpleReplyMagic = 0x67446698;
 
@@ -175,7 +176,7 @@ bool DoHandshake(int fd, uint64_t size) {
           uint32_t opt;
           uint32_t reply;
           uint32_t len;
-        } __attribute__((packed)) rep{htobe64(kIhaveOpt), htobe32(opt),
+        } __attribute__((packed)) rep{htobe64(kRepMagic), htobe32(opt),
                                        htobe32(kRepErrUnsup), 0};
         if (!WriteFull(fd, &rep, sizeof(rep))) return false;
         continue;
@@ -202,7 +203,7 @@ bool DoHandshake(int fd, uint64_t size) {
         uint32_t opt;
         uint32_t reply;
         uint32_t len;
-      } __attribute__((packed)) rep{htobe64(kIhaveOpt), htobe32(opt),
+      } __attribute__((packed)) rep{htobe64(kRepMagic), htobe32(opt),
                                      htobe32(kRepAck), 0};
       WriteFull(fd, &rep, sizeof(rep));
       return false;
@@ -214,7 +215,7 @@ bool DoHandshake(int fd, uint64_t size) {
       uint32_t opt;
       uint32_t reply;
       uint32_t len;
-    } __attribute__((packed)) rep{htobe64(kIhaveOpt), htobe32(opt),
+    } __attribute__((packed)) rep{htobe64(kRepMagic), htobe32(opt),
                                    htobe32(kRepErrUnsup), 0};
     if (!WriteFull(fd, &rep, sizeof(rep))) return false;
     if (opt == kOptList) continue;  // client may keep negotiating

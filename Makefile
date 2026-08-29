@@ -125,6 +125,9 @@ nbd-stop:
 # one or more QEMU guests and wires each guest's disks to nbd_server over the
 # network via `driver=nbd`. Point VMS_CONFIG at your own file once its
 # `nbd.host`/`nbd.port` entries need to differ from the defaults.
+#
+# Needs qemu-system-x86_64 on PATH -- `make install-qemu` if it isn't there
+# yet.
 VMS_CONFIG ?= kvm/vms.yaml
 
 .PHONY: vms-up vms-down
@@ -133,6 +136,37 @@ vms-up:
 
 vms-down:
 	python3 kvm/launch.py $(VMS_CONFIG) --stop
+
+# Installs qemu-system-x86_64 via whatever package manager this host has, a
+# no-op if it's already on PATH. Uses sudo unless already running as root.
+# Only x86_64 is covered since that's what VMS_CONFIG/vms.example.yaml's
+# qemu_binary defaults to -- override the package name below if you need a
+# different arch's qemu-system-* package.
+SUDO := $(shell [ "$$(id -u)" = "0" ] && echo || echo sudo)
+
+.PHONY: install-qemu
+install-qemu:
+	@if command -v qemu-system-x86_64 >/dev/null 2>&1; then \
+		echo "qemu-system-x86_64 already installed: $$(command -v qemu-system-x86_64)"; \
+	elif command -v apt-get >/dev/null 2>&1; then \
+		$(SUDO) apt-get update && $(SUDO) apt-get install -y qemu-system-x86; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		$(SUDO) dnf install -y qemu-kvm; \
+	elif command -v yum >/dev/null 2>&1; then \
+		$(SUDO) yum install -y qemu-kvm; \
+	elif command -v pacman >/dev/null 2>&1; then \
+		$(SUDO) pacman -Sy --noconfirm qemu-system-x86; \
+	elif command -v zypper >/dev/null 2>&1; then \
+		$(SUDO) zypper install -y qemu-kvm; \
+	elif command -v apk >/dev/null 2>&1; then \
+		$(SUDO) apk add qemu-system-x86_64; \
+	elif command -v brew >/dev/null 2>&1; then \
+		brew install qemu; \
+	else \
+		echo "no supported package manager found (looked for apt-get/dnf/yum/pacman/zypper/apk/brew);" >&2; \
+		echo "install qemu-system-x86_64 manually" >&2; \
+		exit 1; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Stages 1-3 end-to-end: create the disk, start the disk server in the
