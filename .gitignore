@@ -4,3 +4,4 @@ logs/
 disk/data/
 disk/nbd_server.pid
 disk/nbd_server.log
+__pycache__/

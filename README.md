@@ -140,7 +140,9 @@ make nbd-run NBD_PORTS="10809 10810" NBD_EVICT_POLICY=lru NBD_PREFETCH_POLICY=cm
 make vms-up
 ```
 
-4. **Test on VMs** — ssh/console into a guest and drive it directly; its
+4. **Test on VMs** — ssh (if `network.type: user` with `hostfwd`) or drive a
+   guest's serial console via its monitor socket (`<run_dir>/<name>.monitor`)
+   and its console output at `<log_dir>/<name>.serial.log`; either way, its
    disk I/O is going through `nbd_server`'s cache simulation. `nbd_server`'s
    stderr logs a line per accepted connection, so that's the first signal a
    guest actually reached it.

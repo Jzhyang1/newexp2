@@ -16,7 +16,7 @@ defaults:
   run_dir: /tmp/kvm-launch
   log_dir: /tmp/kvm-launch
   daemonize: true
-  display: none          # "none" -> serial console only; or "gtk", "vnc=:0", etc.
+  display: none          # "none" -> serial logged to <log_dir>/<name>.serial.log; or "gtk", "vnc=:0", etc.
   network:
     type: user             # user | tap | none
     hostfwd: []             # e.g. ["tcp::2222-:22"] for user-mode port forwarding

@@ -117,6 +117,10 @@ def log_path(vm):
     return os.path.join(vm["log_dir"], f"{vm['name']}.log")
 
 
+def serial_log_path(vm):
+    return os.path.join(vm["log_dir"], f"{vm['name']}.serial.log")
+
+
 def disk_device_name(index):
     """0 -> vda, 1 -> vdb, ... 25 -> vdz, 26 -> vdaa, matching Linux's virtio-blk naming."""
     letters = ""
@@ -209,7 +213,12 @@ def build_command(vm):
 
     display = vm.get("display", "none")
     if display == "none":
-        cmd += ["-display", "none", "-serial", "mon:stdio"]
+        # mon:stdio doesn't work with -daemonize (QEMU detaches from the
+        # controlling terminal before the chardev would attach), and isn't
+        # useful for daemonize:false's own already-redirected stdout either
+        # -- route serial to its own log file instead, which works the same
+        # way in both modes and persists the console for later inspection.
+        cmd += ["-display", "none", "-serial", f"file:{serial_log_path(vm)}"]
     else:
         cmd += ["-display", display]
 
