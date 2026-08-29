@@ -288,6 +288,30 @@ def start_vm(vm, dry_run):
         print(f"{vm['name']}: started (pid {proc.pid}, log {log_path(vm)})")
 
 
+def wait_vms(vms, interval):
+    """Block until every VM's pidfile is gone or its process has exited --
+    e.g. after a guest-initiated poweroff once a baked-in workload finishes
+    (see kvm/guest/build_image.sh's workload.service)."""
+    pending = {vm["name"]: pidfile_path(vm) for vm in vms}
+    if not pending:
+        return
+    print("waiting for: " + ", ".join(pending))
+    while pending:
+        for name, pidfile in list(pending.items()):
+            if not os.path.exists(pidfile):
+                print(f"{name}: exited (pidfile gone)")
+                del pending[name]
+                continue
+            try:
+                pid = int(open(pidfile).read().strip())
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError, PermissionError):
+                print(f"{name}: exited")
+                del pending[name]
+        if pending:
+            time.sleep(interval)
+
+
 def stop_vm(vm, force):
     pidfile = pidfile_path(vm)
     if not os.path.exists(pidfile):
@@ -315,6 +339,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="print qemu-system commands instead of running them")
     parser.add_argument("--stop", action="store_true", help="stop VMs instead of starting them")
     parser.add_argument("--force", action="store_true", help="with --stop, SIGKILL instead of SIGTERM")
+    parser.add_argument("--wait", action="store_true",
+                         help="block until every targeted VM's QEMU process exits "
+                              "(e.g. after a guest-initiated poweroff), then exit")
+    parser.add_argument("--wait-interval", type=float, default=2.0,
+                         help="seconds between pidfile checks with --wait (default: 2)")
     args = parser.parse_args()
 
     vms = load_config(args.config)
@@ -322,6 +351,10 @@ def main():
         vms = [vm for vm in vms if vm["name"] == args.only]
         if not vms:
             sys.exit(f"no VM named {args.only!r} in {args.config}")
+
+    if args.wait:
+        wait_vms(vms, args.wait_interval)
+        return
 
     for vm in vms:
         if args.stop:

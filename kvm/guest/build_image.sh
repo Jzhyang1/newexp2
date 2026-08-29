@@ -70,13 +70,23 @@ chroot "$MNT" pip3 install --break-system-packages --no-cache-dir faiss-cpu
 mkdir -p "$MNT/opt/workload"
 cp "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 
+# Powers the guest off once the workload exits (success or failure) so that
+# a host-side `kvm/launch.py --wait` can detect completion by watching for
+# the QEMU process to exit, rather than polling the serial log's output.
+cat > "$MNT/opt/workload/run.sh" <<'EOF'
+#!/bin/sh
+python3 /opt/workload/run.py
+poweroff
+EOF
+chmod +x "$MNT/opt/workload/run.sh"
+
 cat > "$MNT/etc/systemd/system/workload.service" <<'EOF'
 [Unit]
 Description=Boot-time workload
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/workload/run.py
+ExecStart=/opt/workload/run.sh
 StandardOutput=journal+console
 StandardError=journal+console
 

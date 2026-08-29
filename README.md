@@ -174,6 +174,11 @@ make vms-up
    stderr logs a line per accepted connection, so that's the first signal a
    guest actually reached it.
 
+   If the guest is a `make guest-image` build, `workload.service` powers it
+   off once the baked-in workload script exits, so `make vms-wait` (wraps
+   `kvm/launch.py --wait`) blocks until every VM's QEMU process has exited
+   and is the signal that it's safe to move on to step 5.
+
 5. **Stop and collect measurements** — Ctrl-C (or `SIGTERM`) the server from
    step 2; it appends one row to the CSV log (see below), then:
 

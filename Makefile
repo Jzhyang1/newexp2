@@ -77,6 +77,7 @@ GUEST_INITRD ?= disk/data/initrd.img
 
 .PHONY: guest-image
 guest-image:
+	$(SUDO) apt-get install debootstrap
 	$(SUDO) env ROOTFS_IMG=$(DISK_IMG) ROOTFS_SIZE=$(GUEST_ROOTFS_SIZE) DISTRO=$(GUEST_DISTRO) \
 	  ARCH=$(GUEST_ARCH) MIRROR=$(GUEST_MIRROR) WORKLOAD_SCRIPT=$(WORKLOAD_SCRIPT) \
 	  KERNEL_OUT=$(GUEST_KERNEL) INITRD_OUT=$(GUEST_INITRD) \
@@ -159,12 +160,19 @@ nbd-stop:
 # yet.
 VMS_CONFIG ?= kvm/vms.yaml
 
-.PHONY: vms-up vms-down
+.PHONY: vms-up vms-down vms-wait
 vms-up:
 	python3 kvm/launch.py $(VMS_CONFIG)
 
 vms-down:
 	python3 kvm/launch.py $(VMS_CONFIG) --stop
+
+# Blocks until every VM's QEMU process exits -- e.g. a guest-image VM
+# powering itself off once its baked-in workload.service finishes (see
+# kvm/guest/build_image.sh) -- so a driver script knows when it's safe to
+# collect the serial log and run `make vms-down`/`experiment-down`.
+vms-wait:
+	python3 kvm/launch.py $(VMS_CONFIG) --wait
 
 # Installs qemu-system-x86_64 via whatever package manager this host has, a
 # no-op if it's already on PATH. Uses sudo unless already running as root.
