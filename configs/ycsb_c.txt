@@ -1,7 +1,0 @@
-# YCSB Workload C: Read only.
-# Reference: My-YCSB rocksdb/config/ycsb_c.yaml (op proportions read=1.0,
-# request_distribution=zipfian, zipfian_constant=0.99).
-zipfian alpha=0.99
-zipfian alpha=0.99
-zipfian alpha=0.99
-zipfian alpha=0.99

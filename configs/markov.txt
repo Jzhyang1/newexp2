@@ -1,1 +1,0 @@
-markov base=zipfian samples=10000 alpha=0.99 relative-weight=0.1

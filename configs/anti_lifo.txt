@@ -1,4 +1,0 @@
-# with cache size 2
-# lifo will have 0 hits
-# fifo and LRU will have 4 hits
-trace file=traces/scan_then_loop.txt
