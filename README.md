@@ -111,6 +111,25 @@ ordinary local block device (`/dev/vda`, `/dev/vdb`, ...); the NBD
 transport is invisible to it. Requires PyYAML and, wherever it actually
 runs, `qemu-system-{arch}` with KVM available.
 
+### kvm/guest/build_image.sh (`make guest-image`)
+
+Builds a real bootable guest instead of a blank disk: a Debian rootfs
+(debootstrap) with Python, numpy, and faiss baked in, plus a systemd unit
+(`workload.service`) that runs a workload script once on every boot, and
+extracts the kernel/initrd `kvm/vms.yaml` boots via `-kernel`/`-initrd`.
+Override `WORKLOAD_SCRIPT` to bake in a different script (default
+[`kvm/guest/workloads/faiss_bench.py`](kvm/guest/workloads/faiss_bench.py),
+a CPU-heavy FAISS HNSW index-build-and-search benchmark); its stdout lands
+on the guest's serial console, logged to `<log_dir>/<name>.serial.log`.
+
+This writes straight to `disk/data/nbd_disk.img` via `debootstrap`/`chroot`
+on the host — a completely different path from `nbd_server`, which discards
+every write a *running* guest makes to that same file (see `disk/sim.hpp`
+above). That's why `kvm/vms.yaml`'s default `append` boots with
+`systemd.volatile=yes`: root is mounted read-only with a tmpfs overlay for
+`/etc`/`/var`, so the guest never depends on a write actually landing on
+disk mid-run. Needs root and `debootstrap`, and is Debian/Ubuntu-only.
+
 ## Build and Run
 
 Everything below is Linux-only (`disk/nbd.cpp` needs `<endian.h>`;
@@ -123,6 +142,14 @@ host/VM that will actually host the disk server and the guests.
 
 ```bash
 make disk DISK_SIZE=4G
+```
+
+   To instead boot a real guest that runs a workload script on boot, build
+   a Debian image with Python/numpy/faiss baked in (needs root and
+   `debootstrap`, Debian/Ubuntu-only) instead of the plain zero-filled file:
+
+```bash
+make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
 ```
 
 2. **Build and start the disk server** — builds `nbd_server`, generates

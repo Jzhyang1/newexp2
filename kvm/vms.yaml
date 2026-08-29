@@ -3,25 +3,37 @@
 # listening on 127.0.0.1:10809. See kvm/vms.example.yaml for the full schema
 # and a multi-VM/multi-disk example.
 #
-# No kernel/OS image is configured here, since disk/data/nbd_disk.img starts
-# out as a plain zero-filled file (see `make disk`) -- this VM will sit at
-# its firmware's "no bootable device" screen, which is still a real
+# kernel/initrd/append below boot the Debian guest image that `make
+# guest-image` bakes onto disk/data/nbd_disk.img (see kvm/guest/build_image.sh)
+# -- it runs WORKLOAD_SCRIPT (default kvm/guest/workloads/faiss_bench.py)
+# once via systemd's workload.service on every boot, with output visible on
+# the serial console (<log_dir>/vm0.serial.log). `systemd.volatile=yes`
+# mounts root read-only with a tmpfs overlay for /etc and /var, since
+# nbd_server discards every write a *running* guest makes anyway
+# (disk/sim.hpp) -- this keeps the guest from depending on writes that would
+# otherwise silently vanish.
+#
+# If you haven't run `make guest-image` yet -- or just want the plain
+# simulator with no guest workload -- run `make disk` instead (a zero-filled
+# file) and delete the kernel/initrd/append lines below; the VM will then
+# sit at its firmware's "no bootable device" screen, which is still a real
 # end-to-end check that QEMU successfully attached the NBD disk (watch
-# nbd_server's stderr/log for "client connected"). Point `kernel`/`initrd`/
-# `append` at a real image (or install an OS onto the backing file) to do
-# more than that.
+# nbd_server's stderr/log for "client connected").
 
 defaults:
   qemu_binary: qemu-system-x86_64
-  kvm: false          # set true on a host with /dev/kvm access for real performance
-  vcpus: 1
-  memory: 512M
+  kvm: false          # set true on a host with /dev/kvm access -- faiss/numpy are CPU-heavy and much slower under TCG emulation
+  vcpus: 4
+  memory: 4G
   run_dir: /tmp/kvm-launch
   log_dir: /tmp/kvm-launch
   daemonize: true
   display: none
   network:
     type: none
+  kernel: disk/data/vmlinuz
+  initrd: disk/data/initrd.img
+  append: "root=/dev/vda ro console=ttyS0 systemd.volatile=yes"
 
 vms:
   - name: vm0

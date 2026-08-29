@@ -7,6 +7,10 @@
 # second /dev/vdb, and so on. Every disk is a `driver=nbd` QEMU block backend
 # (compatible with nbd.cpp), so it looks and behaves like an ordinary local
 # disk to the guest -- the NBD transport is invisible to it.
+#
+# To boot a real guest that runs a workload script on boot instead of a
+# blank disk, see kvm/vms.yaml's `kernel`/`initrd`/`append` and `make
+# guest-image` (kvm/guest/build_image.sh).
 
 defaults:
   qemu_binary: qemu-system-x86_64

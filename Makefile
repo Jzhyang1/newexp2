@@ -54,6 +54,35 @@ disk-clean:
 	rm -rf $(dir $(DISK_IMG))
 
 # ---------------------------------------------------------------------------
+# Stage 1b (optional): a real bootable guest image instead of the plain
+# zero-filled file from `make disk` above -- a Debian rootfs with Python +
+# numpy + faiss baked in, plus a systemd service (workload.service) that
+# runs WORKLOAD_SCRIPT once on every boot. Also extracts the kernel/initrd
+# QEMU needs to boot it (kvm/vms.yaml's kernel/initrd/append point at the
+# GUEST_KERNEL/GUEST_INITRD defaults below).
+#
+# Everything this writes goes straight to $(DISK_IMG) via debootstrap/chroot
+# on the host -- a different path from nbd_server, which discards every
+# write a *running* guest makes to this same file (disk/sim.hpp), which is
+# why the default append line boots with systemd.volatile=yes. Needs root
+# and debootstrap, and is Debian/Ubuntu-only -- skip it and use `make disk`
+# instead if you just want the plain simulator with no guest workload.
+GUEST_DISTRO ?= bookworm
+GUEST_ARCH ?= amd64
+GUEST_MIRROR ?= http://deb.debian.org/debian
+GUEST_ROOTFS_SIZE ?= 3G
+WORKLOAD_SCRIPT ?= kvm/guest/workloads/faiss_bench.py
+GUEST_KERNEL ?= disk/data/vmlinuz
+GUEST_INITRD ?= disk/data/initrd.img
+
+.PHONY: guest-image
+guest-image:
+	$(SUDO) env ROOTFS_IMG=$(DISK_IMG) ROOTFS_SIZE=$(GUEST_ROOTFS_SIZE) DISTRO=$(GUEST_DISTRO) \
+	  ARCH=$(GUEST_ARCH) MIRROR=$(GUEST_MIRROR) WORKLOAD_SCRIPT=$(WORKLOAD_SCRIPT) \
+	  KERNEL_OUT=$(GUEST_KERNEL) INITRD_OUT=$(GUEST_INITRD) \
+	  bash kvm/guest/build_image.sh
+
+# ---------------------------------------------------------------------------
 # Stage 2: the disk server. nbd_server (disk/nbd.cpp) serves $(DISK_IMG)
 # over the NBD wire protocol so that QEMU VMs can attach it as a plain
 # virtio-blk disk -- see disk/nbd.example.yaml for the config schema.
