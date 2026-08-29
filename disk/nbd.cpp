@@ -4,19 +4,17 @@
 // export, simple-reply transmission) over TCP so that the in-kernel nbd
 // driver's `nbd-client` (or qemu-nbd, etc.) can attach to it as /dev/nbdN.
 // Reads are served from a real backing file through the simulator's
-// BlockReadClass (nbd.hpp/sim.hpp) -- this is the same cache/policy
-// simulation used by dat.cpp, so an attached VM's disk traffic is charged
-// simulated hit/miss latency and mined for prefetch opportunities exactly
-// like a synthetic workload run through dat.cpp would be. Writes/trims/
-// flushes are accepted and discarded; nothing written by a guest is ever
-// persisted.
+// BlockReadClass (nbd.hpp/sim.hpp), so an attached VM's disk traffic is
+// charged simulated hit/miss latency and mined for prefetch opportunities
+// under a configured policy (see policies/). Writes/trims/flushes are
+// accepted and discarded; nothing written by a guest is ever persisted.
 //
 // The server listens on one TCP port per entry in `ports:` in its config
 // file. Each port is its own client identity ("worker_id" in
 // BlockReadClass terms): a VM's disk that dials a particular port is
 // distinguished from every other VM's disk by which port it connected to,
 // so the simulator can track per-client virtual time separately. See
-// kvm/vms.example.yaml for how launch.py assigns VMs to ports.
+// kvm/vms.yaml for how launch.py assigns VMs to ports.
 //
 // Linux-only (uses <endian.h>). Build with a C++17 compiler:
 //   g++ -O2 -o nbd_server nbd.cpp ../policies/*.cpp

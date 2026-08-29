@@ -159,9 +159,10 @@ make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
 make nbd-run NBD_PORTS="10809 10810" NBD_EVICT_POLICY=lru NBD_PREFETCH_POLICY=cminer
 ```
 
-3. **Spin up VMs** — copy `kvm/vms.example.yaml` to `kvm/vms.yaml` (or set
-   `VMS_CONFIG`), point each disk's `nbd.host`/`nbd.port` at the machine and
-   port(s) from step 2, then:
+3. **Spin up VMs** — `kvm/vms.yaml` is the default (`VMS_CONFIG`), already
+   matching disk/nbd.yaml's defaults; edit it (or point `VMS_CONFIG` at your
+   own copy of `kvm/vms.example.yaml`) if each disk's `nbd.host`/`nbd.port`
+   needs to differ from the machine and port(s) from step 2, then:
 
 ```bash
 make vms-up
