@@ -15,6 +15,7 @@
 #include <iostream>
 
 #include "assoc_miner.h"
+#include "stream_tracker.h"
 
 #define MAX_PREFETCH_PAGES 32
 #define MAX_EVICT_PAGES 128
@@ -132,6 +133,49 @@ class ReadaheadPolicy : public CachePolicy {
 public:
     ReadaheadPolicy(Cache& cache);
     void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+};
+
+// Groups reads into per-context "streams" the way a hardware stride/stream
+// prefetcher does (see stream_tracker.h) and runs LRU over streams rather
+// than individual pages: a stream is promoted to MRU as a whole whenever any
+// of its pages is touched, and its member pages are evicted together,
+// oldest-first, once it becomes the coldest stream.
+class ContextAwareLRUPolicy : public CachePolicy {
+    detail::StreamTracker tracker_;
+
+    struct Stream {
+        detail::StreamTracker::StreamId id;
+        std::list<std::uint64_t> pages;  // member pages, oldest first
+    };
+    std::list<Stream> streams_;  // recency order: front = MRU stream, back = LRU stream
+    std::unordered_map<detail::StreamTracker::StreamId, std::list<Stream>::iterator> id_to_stream_;
+
+    struct PageLoc {
+        std::list<Stream>::iterator stream;
+        std::list<std::uint64_t>::iterator page_it;
+    };
+    std::unordered_map<std::uint64_t, PageLoc> page_loc_;
+
+public:
+    explicit ContextAwareLRUPolicy(Cache& cache, std::uint64_t attach_window = 8,
+                                    std::size_t max_streams_per_context = 8);
+    void on_access(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
+    void on_evict(std::uint64_t context, std::uint64_t page);
+};
+
+// Prefetches ahead of a detected stream's head, extrapolating in the
+// stream's detected direction (see stream_tracker.h). An access that starts
+// a brand-new stream -- i.e. doesn't land near any head we're already
+// tracking for that context -- triggers no prefetch, since there's no
+// direction yet to extrapolate from.
+class ContextAwareReadaheadPolicy : public CachePolicy {
+    detail::StreamTracker tracker_;
+public:
+    explicit ContextAwareReadaheadPolicy(Cache& cache, std::uint64_t attach_window = 8,
+                                          std::size_t max_streams_per_context = 8);
     void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
 };
 

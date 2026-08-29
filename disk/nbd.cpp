@@ -357,8 +357,8 @@ struct Config {
   uint64_t hit_latency_ns = 0;
   uint64_t miss_latency_ns = 0;
   uint64_t warmup = 0;
-  std::string evict_policy = "none";      // none | fifo | lifo | lru
-  std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril
+  std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware
+  std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril | readahead_cxt_aware
   std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
 };
 
@@ -443,6 +443,7 @@ policy::CachePolicy* MakeEvictPolicy(const std::string& name, policy::Cache& cac
   if (name == "fifo") return new policy::FIFOPolicy(cache);
   if (name == "lifo") return new policy::LIFOPolicy(cache);
   if (name == "lru") return new policy::LRUPolicy(cache);
+  if (name == "lru_cxt_aware") return new policy::ContextAwareLRUPolicy(cache);
   if (name == "none") return nullptr;
   throw std::runtime_error("Unsupported evict_policy: " + name);
 }
@@ -452,6 +453,7 @@ policy::CachePolicy* MakePrefetchPolicy(const std::string& name, policy::Cache& 
   if (name == "cminer") return new policy::CMinerPolicy(cache);
   if (name == "quickmine") return new policy::QuickMinePolicy(cache);
   if (name == "mithril") return new policy::MithrilPolicy(cache);
+  if (name == "readahead_cxt_aware") return new policy::ContextAwareReadaheadPolicy(cache);
   if (name == "none") return nullptr;
   throw std::runtime_error("Unsupported prefetch_policy: " + name);
 }
