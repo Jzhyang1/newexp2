@@ -38,11 +38,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -356,6 +359,7 @@ struct Config {
   uint64_t warmup = 0;
   std::string evict_policy = "none";      // none | fifo | lifo | lru
   std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril
+  std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
 };
 
 std::string Trim(const std::string& s) {
@@ -423,6 +427,8 @@ Config LoadConfig(const std::string& path) {
       cfg.evict_policy = value;
     } else if (key == "prefetch_policy") {
       cfg.prefetch_policy = value;
+    } else if (key == "log") {
+      cfg.log = value;
     } else {
       throw std::runtime_error("unknown config key: " + key);
     }
@@ -448,6 +454,119 @@ policy::CachePolicy* MakePrefetchPolicy(const std::string& name, policy::Cache& 
   if (name == "mithril") return new policy::MithrilPolicy(cache);
   if (name == "none") return nullptr;
   throw std::runtime_error("Unsupported prefetch_policy: " + name);
+}
+
+// ---------------------------------------------------------------------------
+// Stats logging: modeled on dat.cpp's "STATS key=value ..." summary line and
+// runner.cpp's append_log (see their last version in git history, e.g.
+// `git show HEAD:runner.cpp`) -- printed once on a clean shutdown (SIGINT/
+// SIGTERM), since nbd_server has no fixed request count to run out of the
+// way dat.cpp did.
+// ---------------------------------------------------------------------------
+
+std::string GetHostname() {
+  char host[256];
+  if (gethostname(host, sizeof(host)) != 0) return "unknown-host";
+  host[sizeof(host) - 1] = '\0';
+  return host;
+}
+
+std::string GetGitCommit() {
+  FILE* fp = popen("git rev-parse --short HEAD 2>/dev/null", "r");
+  if (!fp) return "unknown";
+  char buf[128];
+  std::string out;
+  if (fgets(buf, sizeof(buf), fp) != nullptr) out = buf;
+  pclose(fp);
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+  return out.empty() ? "unknown" : out;
+}
+
+std::string JoinPorts(const std::vector<uint16_t>& ports) {
+  std::string out;
+  for (size_t i = 0; i < ports.size(); ++i) {
+    if (i) out += ';';
+    out += std::to_string(ports[i]);
+  }
+  return out;
+}
+
+void PrintStatsLine(const Stats& stats) {
+  const uint64_t measured = stats.hits + stats.misses;
+  const double avg_latency_ns = stats.request_count == 0
+      ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(stats.request_count);
+  std::cout << "STATS "
+            << "hits=" << stats.hits << ' '
+            << "misses=" << stats.misses << ' '
+            << "evictions=" << stats.evictions << ' '
+            << "bytes_read=" << stats.bytes_read << ' '
+            << "bytes_written=" << stats.bytes_written << ' '
+            << "avg_latency_ns=" << avg_latency_ns << ' '
+            << "worker_latency_ns=" << stats.worker_latency_ns << ' '
+            << "policy_latency_ns=" << stats.policy_latency_ns << ' '
+            << "runtime_seconds=" << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ' '
+            << "hit_ratio=" << (measured == 0 ? 0.0 : static_cast<double>(stats.hits) / measured)
+            << "\n";
+}
+
+// Appends one CSV row to cfg.log, writing a header first if the file is new
+// or empty -- same convention runner.cpp used for its results log.
+void AppendLog(const Config& cfg, const Stats& stats) {
+  std::filesystem::path log_path(cfg.log);
+  if (!log_path.parent_path().empty()) {
+    std::filesystem::create_directories(log_path.parent_path());
+  }
+
+  bool need_header = true;
+  {
+    std::ifstream in(cfg.log);
+    need_header = !in.good() || in.peek() == std::ifstream::traits_type::eof();
+  }
+
+  std::ofstream out(cfg.log, std::ios::app);
+  if (!out) {
+    std::fprintf(stderr, "nbd: failed to open log file: %s\n", cfg.log.c_str());
+    return;
+  }
+
+  if (need_header) {
+    out << "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
+           "warmup,evict_policy,prefetch_policy,request_count,hits,misses,hit_ratio,evictions,"
+           "bytes_read,bytes_written,avg_latency_ns,worker_latency_ns,policy_latency_ns,"
+           "runtime_seconds\n";
+  }
+
+  const uint64_t measured = stats.hits + stats.misses;
+  const double avg_latency_ns = stats.request_count == 0
+      ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(stats.request_count);
+  const auto now = std::chrono::system_clock::now();
+  const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+
+  out << ts << ','
+      << GetHostname() << ','
+      << GetGitCommit() << ','
+      << cfg.file << ','
+      << JoinPorts(cfg.ports) << ','
+      << cfg.capacity << ','
+      << cfg.hit_latency_ns << ','
+      << cfg.miss_latency_ns << ','
+      << cfg.warmup << ','
+      << cfg.evict_policy << ','
+      << cfg.prefetch_policy << ','
+      << stats.request_count << ','
+      << stats.hits << ','
+      << stats.misses << ','
+      << (measured == 0 ? 0.0 : static_cast<double>(stats.hits) / measured) << ','
+      << stats.evictions << ','
+      << stats.bytes_read << ','
+      << stats.bytes_written << ','
+      << avg_latency_ns << ','
+      << stats.worker_latency_ns << ','
+      << stats.policy_latency_ns << ','
+      << static_cast<double>(stats.real_time_elapsed_ns) / 1e9
+      << '\n';
+
+  std::fprintf(stderr, "nbd: appended stats to %s\n", cfg.log.c_str());
 }
 
 }  // namespace nbd
@@ -494,6 +613,16 @@ int main(int argc, char **argv) {
 
   signal(SIGPIPE, SIG_IGN);
 
+  // Block SIGINT/SIGTERM here, before spawning any threads, so every accept
+  // thread inherits the mask and only the sigwait() below ever receives
+  // them (same pattern ldat.cpp used) -- lets the server log final stats on
+  // a clean shutdown instead of just dying mid-request.
+  sigset_t wait_set;
+  sigemptyset(&wait_set);
+  sigaddset(&wait_set, SIGTERM);
+  sigaddset(&wait_set, SIGINT);
+  pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
+
   std::vector<int> listen_fds(cfg.ports.size());
   for (size_t i = 0; i < cfg.ports.size(); ++i) {
     listen_fds[i] = nbd::Listen(cfg.ports[i]);
@@ -503,14 +632,17 @@ int main(int argc, char **argv) {
   std::fprintf(stderr, "nbd server: exporting %llu bytes from %s over %zu port(s)\n",
                static_cast<unsigned long long>(size), cfg.file.c_str(), cfg.ports.size());
 
-  std::vector<std::thread> accept_threads;
-  for (size_t i = 0; i + 1 < cfg.ports.size(); ++i) {
-    accept_threads.emplace_back(nbd::AcceptLoop, listen_fds[i], cfg.ports[i], reader, size,
-                                 static_cast<uint64_t>(i));
+  for (size_t i = 0; i < cfg.ports.size(); ++i) {
+    std::thread(nbd::AcceptLoop, listen_fds[i], cfg.ports[i], reader, size,
+                static_cast<uint64_t>(i)).detach();
   }
-  // Run the last port's accept loop on the main thread instead of detaching
-  // every one of them, so the process has something to block on.
-  nbd::AcceptLoop(listen_fds.back(), cfg.ports.back(), reader, size,
-                   static_cast<uint64_t>(cfg.ports.size() - 1));
-  for (auto& t : accept_threads) t.join();
+
+  int sig = 0;
+  sigwait(&wait_set, &sig);
+  std::fprintf(stderr, "nbd server: received signal %d, shutting down\n", sig);
+
+  const nbd::Stats& stats = reader->get_stats();
+  nbd::PrintStatsLine(stats);
+  nbd::AppendLog(cfg, stats);
+  return 0;
 }

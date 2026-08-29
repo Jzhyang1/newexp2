@@ -22,3 +22,7 @@ warmup: 0                   # requests to skip before counting stats
 
 evict_policy: lru           # none | fifo | lifo | lru
 prefetch_policy: none       # none | readahead | cminer | quickmine | mithril
+
+# CSV stats log, appended to (header written once) on a clean shutdown
+# (SIGINT/SIGTERM) -- see disk/nbd.cpp's AppendLog.
+log: ./logs/nbd_results.csv

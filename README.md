@@ -1,314 +1,180 @@
-# newexp2 Cache Policy Experiment
+# newexp2: NBD-backed disk cache-policy simulator
 
-This experiment compares software-managed cache replacement policies for N server apps that access a shared remote volume.
+This repo serves a backing file to real QEMU VMs over the NBD wire protocol,
+running every read through a software-managed cache/policy simulator, so
+that cache replacement and prefetch policies can be measured against actual
+VM disk traffic rather than a synthetic workload generator.
 
-The runtime model is:
+The workflow is:
 
-1. `runner` creates 2*N pipes and starts one `dat` process.
-2. `runner` starts N app processes, each with a configured behavior (`scan`, `random-read`, `zipfian`, `latest`, or `trace`).
-3. Each app sends requests to `dat` over an outbound pipe and receives data over an inbound pipe.
-4. `dat` serves each request from cache (hit) or backing store (miss), optionally adding configured latency.
-5. `runner` aggregates metrics and appends a log row.
-
-## Architectural Design
+1. **Create disk** — provision a backing file (`make disk`).
+2. **Spin up disk server** — `nbd_server` (`disk/nbd.cpp`) serves that file
+   over NBD, one TCP port per client identity, running every read through
+   `policy::Cache` and a configured evict/prefetch policy (`make nbd-run`).
+3. **Spin up VMs** — QEMU guests attach the server's ports as ordinary
+   virtio-blk disks (`make vms-up`, wraps `kvm/launch.py`).
+4. **Test on VMs** — drive the guests directly (ssh/console); their disk
+   I/O is transparently going through the simulator.
+5. **Get measurements & log** — stop the server (Ctrl-C/SIGTERM); it
+   appends one row of hit/miss/latency stats to a CSV log.
 
 ```mermaid
 flowchart LR
-	subgraph Apps[App Processes]
-		A0[app_0]
-		A1[app_1]
-		AN[app_n]
+	subgraph VMs[QEMU Guests]
+		V0[vm0]
+		V1[vm1]
+		VN[vm_n]
 	end
 
-	subgraph CacheNode[dat Process]
-		D[Request Dispatcher\n+Policy Engine\n+Latency Model]
-		P1[policy_lru]
-		P2[policy_lru_cxt_aware]
+	subgraph Server[nbd_server]
+		N[NBD Protocol\n+ SimReadClass]
+		P1[evict policy]
+		P2[prefetch policy]
 	end
 
-	subgraph Remote[Backing Store]
-		F[file_data]
+	subgraph Disk[Backing Store]
+		F[disk image]
 	end
 
-	A0 -->|out pipe| D
-	A1 -->|out pipe| D
-	AN -->|out pipe| D
+	V0 -->|NBD: port 0| N
+	V1 -->|NBD: port 1| N
+	VN -->|NBD: port n| N
 
-	D -->|in pipe data| A0
-	D -->|in pipe data| A1
-	D -->|in pipe data| AN
-
-	D --> P1
-	D --> P2
-	D -->|cache miss read/write| F
+	N --> P1
+	N --> P2
+	N -->|cache miss read| F
+	N -->|on shutdown| L[CSV log]
 ```
 
 ## Components
 
-### app.cpp
+### disk/nbd.cpp (`nbd_server`)
 
-Represents one server workload process.
+Implements the NBD wire protocol (fixed newstyle handshake,
+`NBD_OPT_EXPORT_NAME`, simple-reply transmission) so the in-kernel `nbd`
+driver, `nbd-client`, or QEMU's `driver=nbd` block backend can attach to it
+directly. Reads are served through `disk/sim.hpp`'s `SimReadClass`, so every
+byte a guest reads is charged simulated hit/miss latency and run through
+whatever evict/prefetch policy is configured — writes/trims/flushes are
+accepted and discarded (nothing a guest writes is ever persisted).
 
-- `--behavior`: `scan`, `random-read`, `zipfian`, `latest`, `trace`, or `markov`
-- `--seed`: per-process deterministic seed
-- `--in-pipe`: read data replies from `dat`
-- `--out-pipe`: send IO requests to `dat`
-- `--requests`: number of ops this app issues (default `20000`)
-- `--page-span`: size of the address space apps draw pages from (default `65536`)
-- `--zipfian-alpha`: Zipfian skew constant, used by `--behavior zipfian` and `--behavior latest` (default `0.99`)
-- `--read-ratio`: fraction of ops that are reads (vs. inserts of new "latest" keys), used only by `--behavior latest` (default `0.5`)
-- `--scan-length`: pages walked per scan op, used by `--behavior zipfian`/`random-read` when `--scan-ratio > 0` (default `100`, matching YCSB's default `maxscanlength`)
-- `--scan-ratio`: fraction of ops that are scans (vs. single-page reads), used by `--behavior zipfian`/`random-read` (default `0`)
-- `--trace-file`: path to a trace, used only when `--behavior trace`; a newline-separated list of `uint64` page numbers replayed in order
-- `--markov-base`: the behavior to sample training data from, used only when `--behavior markov` (any other behavior name)
-- `--markov-samples`: number of pages sampled from `--markov-base` to fit the model, used only when `--behavior markov` (must be `>= 3`)
-- `--markov-relative-weight`: see "Markov workload" below, used only when `--behavior markov` (default `0.5`)
+The server listens on one TCP port per entry in a config file's `ports:`
+list. **Each port is its own client identity**: a VM disk that dials a given
+port is tracked separately from every other VM's disk for cache
+virtual-time/prefetch purposes (`worker_id` in `SimReadClass`) — assign one
+port per VM disk you want the simulator to treat as distinct. Note that all
+ports on one `nbd_server` process still read from the *same* backing file;
+if VMs need genuinely different disk contents, run separate `nbd_server`
+processes (or configs) with different `file:` paths.
 
-Each app runs independently in parallel, and multiple app instances can run on the same machine.
+Takes a single argument: a config file path (a deliberately small YAML
+subset — flat `key: value` lines, `#` comments, one inline list for
+`ports:`). See [`disk/nbd.example.yaml`](disk/nbd.example.yaml) for the full
+schema (backing file, ports, cache capacity, hit/miss latency, warmup,
+evict/prefetch policy, log path).
 
-#### Markov workload
+### disk/sim.hpp (`SimReadClass`)
 
-`--behavior markov` exists because Zipfian/Latest draw each page i.i.d. from a
-distribution — there's no real "page X is followed by page Y" structure, so
-prefetchers that mine page-follows-page associations (`cminer`/`quickmine`/`mithril`,
-see [`policies/assoc_miner.h`](policies/assoc_miner.h)) have nothing genuine to learn
-from them. `markov` fits a model from the first `--markov-samples` pages of another
-workload's own output (`--markov-base`), then generates its actual request stream via
-a Metropolis-Hastings (MH) random walk over that fit, instead of replaying the source.
+Drives `policy::Cache`/`policy::CachePolicy` from real NBD read requests
+(offset/length in bytes, converted to `SECTOR_SIZE`-sized pages) instead of
+a synthetic request generator. For each request it: checks cache presence
+per page, runs the configured prefetch policy's `on_prefetch_request` (then
+admits whatever it suggests), runs the evict policy's `on_access`, and
+charges simulated latency accordingly — then serves the actual bytes via
+`pread` on the backing file (thread-safe/offset-explicit, since the backing
+`FILE*` is shared across every client thread).
 
-MH matters here, not just a stylistic choice: an earlier version generated pages by
-composing observed jumps directly (`next = current_page + jump`), with no guarantee
-about where that composition ends up. Empirically it didn't stay anywhere near the
-source's own popularity concentration — 20k generated pages from a `Zipfian(0.99)`
-source visited 99.45% distinct pages spanning the *entire* page span, vs. 58% distinct
-for the source itself. Since a source's popularity concentration (e.g. Zipfian's hot
-set) is exactly what drives cache hit ratio, that made `markov` a much harder,
-unrealistic workload rather than a like-for-like comparison. MH fixes this: it's an
-accept/reject scheme with a mathematical guarantee that the walk's long-run page-visit
-frequency converges to a specified target distribution — here, the source's own
-empirical histogram — no matter what "local" proposal moves drive it.
+### policies/
 
-The model fits two tables from consecutive training pages `page[i-1] -> page[i]`,
-plus the marginal visit count per page (the MH target distribution):
+Evict policies (`evict_policy:` in the config): `none`, `fifo`, `lifo`,
+`lru`.
 
-- `direct[P] -> {Q: count}` — how often `Q` was adjacent to `P` in training.
-  Built as a **symmetric** table (`direct[P][Q] == direct[Q][P]`, both directions
-  incremented for every observed pair) so that every proposed edge has a
-  well-defined, always-computable reverse probability. An earlier, directed-only
-  version relied on the reverse pair also having been independently observed in
-  training, which at realistic sample sizes it almost never was — most edges are
-  singleton observations — collapsing MH's acceptance rate to ~0 and leaving the
-  walk stuck self-looping on its seed page.
-- `delta_freq[D] -> count` — how often a (signed) jump of size `D` was observed
-  between consecutive training pages, **symmetrized** (`delta_freq[D] ==
-  delta_freq[-D]` by construction: every observed `d` adds a count to `-d` too).
+Prefetch policies (`prefetch_policy:`): `none`, `readahead` (fetches the
+next `MAX_PREFETCH_PAGES` pages), and three association-mining policies
+sharing one engine ([`policies/assoc_miner.h`](policies/assoc_miner.h)) —
+`cminer` (one shared association table across all clients), `quickmine`
+(one table per client context, so unrelated clients' accesses don't pollute
+each other's associations), and `mithril` (like `cminer`, but skips pages
+that have already gone "hot," reserving mining budget for
+sporadically-recurring pages).
 
-Each generation step draws `Bernoulli(--markov-relative-weight)` to pick a proposal
-kernel — "relative" (propose `current_page + D` via `delta_freq`) or "direct"
-(propose `Q` via `direct[current_page]`) — then accepts with the standard MH ratio,
-using each table's symmetry to make the reverse probability always computable
-instead of a lookup that's usually missing. Rejected proposals self-loop (repeat the
-current page) — a normal MH outcome, not an error.
+`policy_lru_cxt_aware.cpp` is a context-aware LRU variant, partitioned by
+client identity while keeping total cache capacity fixed.
 
-In practice `direct` reproduces the source's popularity profile almost exactly
-(measured: 99% of a Zipfian source's distinct pages recovered, hot-page share within
-~0.2pp of the source); `relative` mixes much more poorly here, because a jump size
-pooled from a hash-scrambled key space (e.g. Zipfian's own key hashing) spans nearly
-the whole page range, so `current_page + D` rarely lands back on one of the source's
-actually-popular pages at all. Keep `--markov-relative-weight` low (the default `0.5`
-already leans this way; go lower, e.g. `0.1`, for closer fidelity to the source's own
-hit-rate profile) — `relative` still contributes some jump-based structure, but
-shouldn't dominate. If neither kernel has an entry for the current state (e.g. right
-after seeding), the step falls back to proposing directly from the target
-distribution, which is always accepted. The `--markov-samples` pages used for
-training are never themselves emitted as requests — `--requests` counts only the
-generated stream.
+### kvm/launch.py
 
-#### Op-type modeling and scan semantics
-
-`dat` has no op-type-aware backend: every request is just "fetch this page," so there
-is nothing for a UPDATE/INSERT/READ_MODIFY_WRITE op to do differently from a READ. The
-only op type that changes wire behavior is SCAN, which walks `scan_length` consecutive
-pages (wrapping modulo `--page-span`) from a single chosen start key, mirroring how
-My-YCSB's backend clients implement `do_scan()` (see [`workloads/workload.h`](workloads/workload.h),
-ported from [My-YCSB](https://github.com/xrp-project/My-YCSB)). So reproducing a target
-YCSB op mix here only requires a read/scan split via `--scan-ratio`; a workload's
-update/insert/read-modify-write proportion is represented as reads. This is not just a
-simplification — for the workloads this repo runs (A/B/C/F: no scans), it produces
-the *exact* page-access sequence real YCSB would, because My-YCSB's own key generation
-is identical across UPDATE/INSERT/READ/READ_MODIFY_WRITE (only SCAN differs). See
-[`tools/verify_against_myycsb/`](tools/verify_against_myycsb/) for a reproducible check
-of this against the actual upstream source.
-
-One consequence: since A, B, C, and F all reduce to a pure `Zipfian(0.99)` read stream
-here, they will produce identical hit ratios in this simulator — that's expected, not a
-bug. Only D (latest distribution) and E (scan-length) touch pages differently.
-
-### dat.cpp
-
-Represents the software-managed cache process.
-
-- `--evict-policy`: `lru` or `lru-cxt-aware`
-- `--capacity`: cache size in pages
-- `--in-pipes`: list of app inbound pipes (`dat` writes responses)
-- `--out-pipes`: list of app outbound pipes (`dat` reads requests)
-- `--miss-delay`: minimum miss latency in ns
-- `--hit-delay`: minimum hit latency in ns
-- `--file-data`: path to file-backed remote store
-
-The `dat` process is expected to have one blocked worker per outbound pipe so request handling can overlap across apps.
-
-### policies/policy_lru.cpp
-
-Global LRU replacement policy.
-
-### policies/policy_lru_cxt_aware.cpp
-
-Context-aware LRU replacement policy, partitioned by process identity while keeping total cache capacity fixed.
-
-### runner.cpp
-
-Experiment orchestrator.
-
-- `--seed`: base seed (`seed + i` for app `i`)
-- `--evict-policy`: `lru`, `lifo`, `fifo`, or `none`
-- `--prefetch-policy`: `readahead` or `none`
-- `--capacity`: cache size in pages
-- `--miss-delay`: miss latency floor in ns
-- `--hit-delay`: hit latency floor in ns
-- `--file-data`: backing file path for `dat`
-- `--requests`: ops per app, applied uniformly to every app (default `20000`)
-- `--page-span`: shared address space size, applied uniformly to every app (default `65536`)
-- `--warmup-period`: requests to exclude from reporting
-- `--log`: output log path (append mode)
-- `--config`: path to a config file; one app per line (see below)
-
-The number of app processes (`-n` in older versions of this tool) is implicit: it's
-the number of lines in `--config`.
-
-The config file has one line per app process: `<behavior> [key=value ...]`. Keys are
-behavior-specific and match the `app.cpp` flags above minus the `--` prefix; unset
-keys fall back to `app.cpp`'s defaults, unless noted:
-
-```
-scan
-random-read
-random-read scan-ratio=0.3 scan-length=20
-zipfian
-zipfian alpha=1.2                          # Zipfian skew (default 0.99)
-zipfian alpha=0.99 scan-ratio=0.95 scan-length=100
-latest read-ratio=0.95                     # fraction reads vs. inserts (default 0.5)
-trace file=traces/db_trace.txt             # replays the given trace file (see app.cpp above)
-markov base=zipfian samples=5000 alpha=0.99 relative-weight=0.99  # see "Markov workload" above
-```
-
-Supported keys per behavior: `trace` requires `file=`; `zipfian` and `random-read`
-accept `scan-ratio=` and `scan-length=` (`zipfian` also accepts `alpha=`); `latest`
-accepts `read-ratio=`; `scan` and `random-read` (beyond the scan keys) accept none;
-`markov` requires `base=` (any other behavior name) and `samples=` (`>= 3`), accepts
-`relative-weight=` (default `0.99`), and otherwise accepts whatever keys its `base=`
-behavior would (e.g. `base=zipfian` also accepts `alpha=`, `scan-ratio=`, etc.).
-Using a key with the wrong behavior, or omitting a required one, is a config error.
-
-Blank lines and lines starting with `#` are ignored.
-
-## YCSB Workloads
-
-[`configs/ycsb_a.txt`](configs/ycsb_a.txt) through [`configs/ycsb_f.txt`](configs/ycsb_f.txt)
-reproduce the six standard YCSB core workloads' *page-access patterns*, sourced from
-[My-YCSB](https://github.com/xrp-project/My-YCSB)'s own `rocksdb/config/ycsb_*.yaml`
-reference configs:
-
-| Workload | Mix (YCSB)                  | Distribution | Notes |
-|----------|------------------------------|--------------|-------|
-| A        | 50% read / 50% update        | zipfian(0.99)| update collapses to read here |
-| B        | 95% read / 5% update         | zipfian(0.99)| update collapses to read here |
-| C        | 100% read                    | zipfian(0.99)| |
-| D        | 95% read / 5% insert         | latest       | only workload besides E with a distinct access pattern |
-| E        | 95% scan / 5% insert         | zipfian(0.99)| scan-length=100; insert collapses to read |
-| F        | 50% read / 50% read-modify-write | zipfian(0.99) | read-modify-write collapses to read here |
-
-See "Op-type modeling and scan semantics" above for why update/insert/read-modify-write
-collapse to reads without changing the resulting page-access sequence. Run one with, e.g.:
-
-```bash
-make run CONFIG=configs/ycsb_e.txt PAGE_SPAN=10485760 REQUESTS=200000
-```
-
-### Verifying against real YCSB
-
-[`tools/verify_against_myycsb/run.sh`](tools/verify_against_myycsb/) is a concrete,
-reproducible check of `workloads/workload.cpp` against the exact upstream source it
-was ported from (My-YCSB, pinned to a specific commit). It builds two tiny harnesses —
-one linked against our `workloads/workload.cpp`, one linked against the untouched
-upstream `core/workload.cpp` — runs both with identical seeds and parameters for each
-YCSB-relevant workload shape (zipfian read, zipfian scan, latest, uniform), and diffs
-the resulting key/scan-length sequences. Because both sides use the same `rand_r()`
-seed and the same zipfian/latest formulas, a faithful port should produce byte-for-byte
-identical output, not just a statistical match — this is exactly what the script checks:
-
-```bash
-tools/verify_against_myycsb/run.sh
-```
-
-It clones My-YCSB into `build/vendor/my-ycsb` on first run (network required) and
-reuses it afterward. The only patch applied to the upstream file is stripping two
-`#include <bpf/...>` lines that are unreachable dead code in the pinned commit (the
-BPF calls they support are already commented out) and exist only to support Linux;
-no logic is modified.
-
-Notes:
-
-- Although component behavior is listed as command-line arguments, normal usage should be via `runner`-managed process startup.
-- Hit and miss delays are awaited concurrently per request path and model local-vs-remote latency differences.
+Spins up/tears down one or more QEMU guests from a YAML config (see
+[`kvm/vms.example.yaml`](kvm/vms.example.yaml)) — every disk a VM lists gets
+its own `driver=nbd` QEMU block backend pointed at an `nbd_server`
+host:port, so inside the guest each disk enumerates as a completely
+ordinary local block device (`/dev/vda`, `/dev/vdb`, ...); the NBD
+transport is invisible to it. Requires PyYAML and, wherever it actually
+runs, `qemu-system-{arch}` with KVM available.
 
 ## Build and Run
 
-1. Build all binaries:
+Everything below is Linux-only (`disk/nbd.cpp` needs `<endian.h>`;
+`kvm/launch.py` needs `qemu-system` and `/dev/kvm`) — run it on the Linux
+host/VM that will actually host the disk server and the guests.
+
+1. **Create the disk** — a sparse, zero-filled backing file, left alone
+   after creation (delete it yourself to resize/reset; `dd` real content
+   into it, or write files to it from inside a guest, once VMs can attach):
 
 ```bash
-make
+make disk DISK_SIZE=4G
 ```
 
-2. Run a sample experiment:
+2. **Build and start the disk server** — builds `nbd_server`, generates
+   `disk/nbd.yaml` from the `NBD_*` variables, and runs in the foreground:
 
 ```bash
-make run \
-  SEED=7 \
-  EVICT_POLICY=lru \
-  PREFETCH_POLICY=readahead \
-  CAPACITY=8192 \
-  MISS_DELAY_NS=500000 \
-  HIT_DELAY_NS=30000 \
-  WARMUP=10000 \
-  FILE_DATA=./data.bin \
-  LOG=./logs/results.csv \
-  CONFIG=configs/ycsb_c.txt
+make nbd-run NBD_PORTS="10809 10810" NBD_EVICT_POLICY=lru NBD_PREFETCH_POLICY=cminer
 ```
 
-The number of app processes comes from the number of lines in `CONFIG`, not a
-separate `N` variable.
-
-3. Remove build artifacts:
+3. **Spin up VMs** — copy `kvm/vms.example.yaml` to `kvm/vms.yaml` (or set
+   `VMS_CONFIG`), point each disk's `nbd.host`/`nbd.port` at the machine and
+   port(s) from step 2, then:
 
 ```bash
-make clean
+make vms-up
 ```
+
+4. **Test on VMs** — ssh/console into a guest and drive it directly; its
+   disk I/O is going through `nbd_server`'s cache simulation. `nbd_server`'s
+   stderr logs a line per accepted connection, so that's the first signal a
+   guest actually reached it.
+
+5. **Stop and collect measurements** — Ctrl-C (or `SIGTERM`) the server from
+   step 2; it appends one row to the CSV log (see below), then:
+
+```bash
+make vms-down
+```
+
+Remove build artifacts (binaries only — the disk image and logs are left
+alone) with `make clean`; `make disk-clean` removes the disk image
+specifically.
+
+All `NBD_*`/`DISK_*`/`VMS_CONFIG` Makefile variables can be overridden at
+invocation; see the Makefile for the full list and their defaults.
 
 ## Logging Schema
 
-Each run appends a row that includes:
+On a clean shutdown (`SIGINT`/`SIGTERM`), `nbd_server` prints one
+`STATS key=value ...` summary line to stdout and appends one CSV row to the
+config's `log:` path (default `./logs/nbd_results.csv`), writing a header
+first if the file is new or empty. Columns:
 
-- input configuration
-- machine identifier
-- commit-hash
-- hits
-- misses
-- hit ratio
-- evictions
-- bytes read
-- bytes written
-- average latency
+- `timestamp`, `machine`, `commit_hash` — when/where/which commit ran
+- `file`, `ports`, `capacity`, `hit_latency_ns`, `miss_latency_ns`,
+  `warmup`, `evict_policy`, `prefetch_policy` — the run's config
+- `request_count`, `hits`, `misses`, `hit_ratio`, `evictions`, `bytes_read`,
+  `bytes_written` — cache outcomes
+- `avg_latency_ns`, `worker_latency_ns`, `policy_latency_ns` — timing
+  breakdown (total simulated latency charged per request; time attributed
+  to client think-time vs. evict/prefetch policy hook compute, respectively)
+- `runtime_seconds` — wall-clock time the server was up
 
 ## Commenting and Code Style Guidance
 
@@ -316,7 +182,7 @@ To keep implementation readable while performance-tuning:
 
 - Comment synchronization decisions (lock ordering, atomic ownership, wait conditions).
 - Comment policy edge cases (eviction tie-breaks, per-context partition behavior).
-- Comment wire format assumptions for request/response messages over pipes.
+- Comment wire format assumptions for request/response messages (NBD protocol, config parsing).
 - Avoid redundant comments for obvious operations.
 
 Example style:
@@ -330,4 +196,3 @@ if (request_index < warmup_period) {
 	return;
 }
 ```
-

@@ -1,3 +1,15 @@
+# Builds and runs the disk-cache-policy simulation pipeline:
+#
+#   1. create disk   -> make disk
+#   2. disk server   -> make nbd-run      (build + serve the disk over NBD)
+#   3. spin up VMs   -> make vms-up       (attach VMs to the running server)
+#   4. test on VMs   -> (interactive; ssh/console into a VM and drive it)
+#   5. tear down     -> make vms-down
+#
+# All of it is Linux-only (disk/nbd.cpp needs <endian.h>; kvm/launch.py needs
+# qemu-system and /dev/kvm) -- run this on the Linux host/VM that will
+# actually host the disk server and the guests.
+
 # Toolchain
 CXX := g++
 
@@ -9,181 +21,105 @@ LDFLAGS ?=
 BUILD_DIR := build
 BIN_DIR := bin
 
-# Source layout
 POLICY_SRCS := $(wildcard policies/*.cpp)
-WORKLOAD_SRCS := $(wildcard workloads/*.cpp)
-APP_SRC := app.cpp
-DAT_SRC := dat.cpp
-RUNNER_SRC := runner.cpp
 
-APP_BIN := $(BIN_DIR)/app
-DAT_BIN := $(BIN_DIR)/dat
-RUNNER_BIN := $(BIN_DIR)/runner
-
-# Default experiment parameters for `make run`
-SEED ?= 1
-CAPACITY ?= 4096
-EVICT_POLICY ?= lru
-PREFETCH_POLICY ?= none
-MISS_DELAY_NS ?= 300000
-HIT_DELAY_NS ?=  100000
-FILE_DATA ?= ./data.bin
-CONFIG ?= configs/zipfian.txt
-WARMUP ?= 0
-LOG ?= ./logs/results.csv
-PAGE_SPAN ?= 10485760
-REQUESTS ?= 200000
-
-# Ensure these targets always run when requested.
-.PHONY: all dirs app dat runner run clean print-config
-
-all: dirs app dat runner
-
+.PHONY: dirs clean
 dirs:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR) ./logs
-
-# Build the app workload executable.
-app: $(APP_BIN)
-
-$(APP_BIN): $(APP_SRC) $(WORKLOAD_SRCS) | dirs
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Build the cache daemon with policy implementations linked in.
-dat: $(DAT_BIN)
-
-$(DAT_BIN): $(DAT_SRC) $(POLICY_SRCS) | dirs
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Build the experiment orchestrator.
-runner: $(RUNNER_BIN)
-
-$(RUNNER_BIN): $(RUNNER_SRC) | dirs
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
-
-print-config:
-	@echo "N=$(N)"
-	@echo "SEED=$(SEED)"
-	@echo "EVICT_POLICY=$(EVICT_POLICY)"
-	@echo "CAPACITY=$(CAPACITY)"
-	@echo "MISS_DELAY_NS=$(MISS_DELAY_NS)"
-	@echo "HIT_DELAY_NS=$(HIT_DELAY_NS)"
-	@echo "FILE_DATA=$(FILE_DATA)"
-	@echo "FRAC_SCAN=$(FRAC_SCAN)"
-	@echo "WARMUP=$(WARMUP)"
-	@echo "LOG=$(LOG)"
-
-# Run one full experiment via runner. Override vars at invocation time.
-run: all print-config
-	$(RUNNER_BIN) \
-		--seed $(SEED) \
-		--evict-policy $(EVICT_POLICY) \
-		--prefetch-policy $(PREFETCH_POLICY) \
-		--capacity $(CAPACITY) \
-		--miss-delay $(MISS_DELAY_NS) \
-		--hit-delay $(HIT_DELAY_NS) \
-		--file-data $(FILE_DATA) \
-		--warmup-period $(WARMUP) \
-		--log $(LOG) \
-		--requests $(REQUESTS) \
-		--config $(CONFIG)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
 
 # ---------------------------------------------------------------------------
-# userfaultfd variant: lhook (LD_PRELOAD mmap interceptor), ldat (uffd-driven
-# cache/policy daemon), lrunner (orchestrator). Linux-only (userfaultfd,
-# process_madvise, /proc) -- not part of `all`/`run` since they cannot build
-# on macOS. Build these inside the Linux VM with `make luffd`.
-LIB_DIR := lib
-LHOOK_SRC := lhook.cpp
-LDAT_SRC := ldat.cpp
-LRUNNER_SRC := lrunner.cpp
-UFFD_PROTOCOL_HDR := uffd_protocol.h
+# Stage 1: the disk. A backing file that disk/nbd.cpp will serve over the
+# NBD wire protocol -- created once as a sparse, zero-filled file of
+# DISK_SIZE and left alone after that (delete it yourself to resize/reset).
+# `dd` real content into it, or write files to it from inside a guest, once
+# VMs can attach.
+DISK_IMG ?= disk/data/nbd_disk.img
+DISK_SIZE ?= 1G
 
-LHOOK_LIB := $(LIB_DIR)/liblhook.so
-LDAT_BIN := $(BIN_DIR)/ldat
-LRUNNER_BIN := $(BIN_DIR)/lrunner
+.PHONY: disk disk-clean
+disk: $(DISK_IMG)
 
-# lapp: a twin of app.cpp that actually performs its accesses (mmap + real
-# reads) instead of describing them over a pipe -- see lapp.cpp. It has no
-# userfaultfd dependency itself, so it builds on macOS too, but it's only
-# useful for its intended purpose (verifying the uffd pipeline) run under
-# lrunner on Linux, so it's grouped with the rest of luffd below.
-LAPP_SRC := lapp.cpp
-LAPP_BIN := $(BIN_DIR)/lapp
+$(DISK_IMG):
+	@mkdir -p $(dir $(DISK_IMG))
+	truncate -s $(DISK_SIZE) $(DISK_IMG)
 
-# Watch prefix + hook lib path for `make lrun`; APP_CMD is the unmodified
-# real application to launch, e.g. APP_CMD="redis-server --daemonize no".
-WATCH_PREFIX ?= /mnt/remote
-SOCKET_PATH ?= /tmp/ldat_uffd.sock
-APP_CMD ?=
+disk-clean:
+	rm -rf $(dir $(DISK_IMG))
 
-# `make lverify` defaults: runs lapp itself (not a real app) through lrunner,
-# as a self-contained sanity check of the whole uffd pipeline.
-LAPP_FILE ?= $(WATCH_PREFIX)/lapp_test.dat
-LAPP_BEHAVIOR ?= zipfian
-LAPP_REQUESTS ?= 20000
+# ---------------------------------------------------------------------------
+# Stage 2: the disk server. nbd_server (disk/nbd.cpp) serves $(DISK_IMG)
+# over the NBD wire protocol so that QEMU VMs can attach it as a plain
+# virtio-blk disk -- see disk/nbd.example.yaml for the config schema.
+NBD_SRC := disk/nbd.cpp
+NBD_BIN := $(BIN_DIR)/nbd_server
+NBD_CONFIG ?= disk/nbd.yaml
 
-.PHONY: luffd lhook ldat lrunner lapp lrun lverify ldirs
+# One TCP port per client identity the simulator should track separately
+# (see disk/nbd.example.yaml) -- space-separated, e.g. NBD_PORTS = 10809 10810.
+NBD_PORTS ?= 10809
+NBD_CAPACITY ?= 4096
+NBD_HIT_LATENCY_NS ?= 30000
+NBD_MISS_LATENCY_NS ?= 300000
+NBD_WARMUP ?= 0
+NBD_EVICT_POLICY ?= lru
+NBD_PREFETCH_POLICY ?= none
+NBD_LOG ?= ./logs/nbd_results.csv
 
-ldirs:
-	@mkdir -p $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR) ./logs
+comma := ,
+empty :=
+space := $(empty) $(empty)
+NBD_PORTS_YAML := $(subst $(space),$(comma)$(space),$(strip $(NBD_PORTS)))
 
-luffd: lhook ldat lrunner lapp
+.PHONY: nbd nbd-config nbd-run
+nbd: $(NBD_BIN)
 
-lhook: $(LHOOK_LIB)
+$(NBD_BIN): $(NBD_SRC) disk/nbd.hpp disk/sim.hpp $(POLICY_SRCS) | dirs
+	$(CXX) $(CXXFLAGS) $(NBD_SRC) $(POLICY_SRCS) -o $@ $(LDFLAGS)
 
-$(LHOOK_LIB): $(LHOOK_SRC) $(UFFD_PROTOCOL_HDR) | ldirs
-	$(CXX) $(CXXFLAGS) -shared -fPIC $(LHOOK_SRC) -o $@ -ldl
+# Regenerated on every invocation (cheap, and keeps it in sync with the
+# NBD_* variables) -- unlike the disk image, there's no state here worth
+# preserving between runs.
+nbd-config:
+	@mkdir -p $(dir $(NBD_CONFIG))
+	@printf '%s\n' \
+		'# Generated by `make nbd-config`; see disk/nbd.example.yaml for the schema.' \
+		'source: local' \
+		'file: $(DISK_IMG)' \
+		'ports: [$(NBD_PORTS_YAML)]' \
+		'' \
+		'capacity: $(NBD_CAPACITY)' \
+		'hit_latency_ns: $(NBD_HIT_LATENCY_NS)' \
+		'miss_latency_ns: $(NBD_MISS_LATENCY_NS)' \
+		'warmup: $(NBD_WARMUP)' \
+		'' \
+		'evict_policy: $(NBD_EVICT_POLICY)' \
+		'prefetch_policy: $(NBD_PREFETCH_POLICY)' \
+		'' \
+		'log: $(NBD_LOG)' \
+		> $(NBD_CONFIG)
+	@echo "wrote $(NBD_CONFIG)"
 
-ldat: $(LDAT_BIN)
+# Build, provision the backing disk, regenerate the config, and run in the
+# foreground. Ctrl-C (or SIGTERM) stops it cleanly and appends one row of
+# stats to NBD_LOG. Override any NBD_*/DISK_* variable at invocation, e.g.:
+#   make nbd-run NBD_PORTS="10809 10810" DISK_SIZE=4G NBD_EVICT_POLICY=fifo
+nbd-run: nbd nbd-config disk
+	$(NBD_BIN) $(NBD_CONFIG)
 
-$(LDAT_BIN): $(LDAT_SRC) $(POLICY_SRCS) $(UFFD_PROTOCOL_HDR) | ldirs
-	$(CXX) $(CXXFLAGS) $(LDAT_SRC) $(POLICY_SRCS) -o $@ $(LDFLAGS)
+# ---------------------------------------------------------------------------
+# Stage 3: the VMs. Wraps kvm/launch.py, which reads a YAML config (see
+# kvm/vms.example.yaml) describing one or more QEMU guests and wires each
+# guest's disks to nbd_server over the network via `driver=nbd` -- copy
+# vms.example.yaml to VMS_CONFIG and point its `nbd.host`/`nbd.port` entries
+# at wherever `make nbd-run` above is listening before using this.
+VMS_CONFIG ?= kvm/vms.yaml
 
-lrunner: $(LRUNNER_BIN)
+.PHONY: vms-up vms-down
+vms-up:
+	python3 kvm/launch.py $(VMS_CONFIG)
 
-$(LRUNNER_BIN): $(LRUNNER_SRC) $(UFFD_PROTOCOL_HDR) | ldirs
-	$(CXX) $(CXXFLAGS) $(LRUNNER_SRC) -o $@ $(LDFLAGS)
-
-lapp: $(LAPP_BIN)
-
-$(LAPP_BIN): $(LAPP_SRC) $(WORKLOAD_SRCS) | ldirs
-	$(CXX) $(CXXFLAGS) $(LAPP_SRC) $(WORKLOAD_SRCS) -o $@ $(LDFLAGS)
-
-# Run one real-app experiment via lrunner. Override vars at invocation time,
-# e.g.: make lrun WATCH_PREFIX=/mnt/remote APP_CMD="redis-server /etc/redis.conf"
-lrun: luffd
-	$(LRUNNER_BIN) \
-		--evict-policy $(EVICT_POLICY) \
-		--prefetch-policy $(PREFETCH_POLICY) \
-		--capacity $(CAPACITY) \
-		--miss-delay $(MISS_DELAY_NS) \
-		--hit-delay $(HIT_DELAY_NS) \
-		--watch-prefix $(WATCH_PREFIX) \
-		--socket $(SOCKET_PATH) \
-		--hook-lib $(LHOOK_LIB) \
-		--warmup-period $(WARMUP) \
-		--log ./logs/lresults.csv \
-		-- $(APP_CMD)
-
-# Self-contained sanity check: runs lapp (not a real app) through lrunner, so
-# there's nothing external to install first. A working run should show
-# ldat's STATS line with a plausible hit_ratio, and lapp's own
-# pages_touched count matching --requests (scan/zipfian's default
-# scan-ratio=0 makes that an exact match; override LAPP_BEHAVIOR=scan or
-# pass --scan-ratio to exercise multi-page ops too).
-lverify: luffd
-	$(LRUNNER_BIN) \
-		--evict-policy $(EVICT_POLICY) \
-		--prefetch-policy $(PREFETCH_POLICY) \
-		--capacity $(CAPACITY) \
-		--miss-delay $(MISS_DELAY_NS) \
-		--hit-delay $(HIT_DELAY_NS) \
-		--watch-prefix $(WATCH_PREFIX) \
-		--socket $(SOCKET_PATH) \
-		--hook-lib $(LHOOK_LIB) \
-		--warmup-period $(WARMUP) \
-		--log ./logs/lverify.csv \
-		-- $(LAPP_BIN) --behavior $(LAPP_BEHAVIOR) --file $(LAPP_FILE) --page-span $(PAGE_SPAN) --requests $(LAPP_REQUESTS)
+vms-down:
+	python3 kvm/launch.py $(VMS_CONFIG) --stop
