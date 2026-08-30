@@ -148,6 +148,15 @@ nbd-stop:
 		echo "nbd_server not running (no $(NBD_PIDFILE))"; \
 	fi
 
+# Fast, deterministic capture-correctness check: speaks the NBD wire
+# protocol directly (no QEMU/VM needed) against a fresh nbd_server and
+# verifies every read it sends is captured with the right worker_id/offset/
+# length and correct data. See disk/test_protocol.py's docstring for the
+# real-VM end-to-end complement (kvm/verify_capture.py).
+.PHONY: test-protocol
+test-protocol: nbd
+	python3 disk/test_protocol.py --binary $(NBD_BIN)
+
 # ---------------------------------------------------------------------------
 # Stage 3: the VMs. Wraps kvm/launch.py, which reads a YAML config (see
 # kvm/vms.yaml, a single VM matching the default disk/nbd.yaml; or

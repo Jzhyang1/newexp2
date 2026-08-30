@@ -40,6 +40,11 @@ class SimReadClass : public BlockReadClass {
     policy::Cache& cache;
     policy::CachePolicy* evict_policy;
     policy::CachePolicy* prefetch_policy;
+    // Optional per-request event log (worker_id,offset,length,hits,total),
+    // independent of warmup/Stats -- lets a test cross-check exactly which
+    // NBD read requests this class saw against what a client/guest actually
+    // issued. Null (the common case) disables it entirely.
+    FILE* access_log;
     uint64_t sim_start;
     std::atomic<uint64_t> global_idx;
 
@@ -55,10 +60,12 @@ public:
             uint64_t vm_count,
             uint64_t warmup,
             policy::Cache& cache,
-            policy::CachePolicy* evict_policy, 
-            policy::CachePolicy* prefetch_policy
+            policy::CachePolicy* evict_policy,
+            policy::CachePolicy* prefetch_policy,
+            FILE* access_log = nullptr
         ):  f(f), warmup(warmup), cache(cache),
-            evict_policy(evict_policy), prefetch_policy(prefetch_policy) {
+            evict_policy(evict_policy), prefetch_policy(prefetch_policy),
+            access_log(access_log) {
                 sim_start = steady_ns();
             }
 
@@ -151,6 +158,18 @@ public:
             if (worker_virt_end_ns > steady_max_virt_ns) steady_max_virt_ns = worker_virt_end_ns;
             worker_virtual_time[worker_id] = worker_virt_end_ns;
             // disk_access_times.emplace_back(worker_virt_start_ns + worker_run_ns, worker_virt_end_ns);
+
+            // Logged unconditionally (unlike Stats, which skips warmup) so
+            // the log is a faithful record of every request this class saw.
+            if (access_log) {
+                std::fprintf(access_log, "%llu,%llu,%zu,%llu,%llu\n",
+                    static_cast<unsigned long long>(worker_id),
+                    static_cast<unsigned long long>(offset),
+                    length,
+                    static_cast<unsigned long long>(hit_count),
+                    static_cast<unsigned long long>(total_count));
+                std::fflush(access_log);
+            }
         }
 
         // perform the actual response. pread (rather than fseek+fread) is

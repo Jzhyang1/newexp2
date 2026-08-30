@@ -1,0 +1,33 @@
+# VM config for the real-VM capture-correctness test (kvm/verify_capture.py).
+# Matches disk/nbd.test.yaml's two ports: 10809 is the normal boot disk
+# (/dev/vda), 10810 is a second disk (/dev/vdb) that only
+# kvm/guest/workloads/known_pattern.py ever reads from -- see
+# kvm/verify_capture.py's docstring for the full setup/run recipe.
+#
+# kernel/initrd point at the dedicated capture-test image (built via
+# `make guest-image DISK_IMG=disk/data/capture_test_disk.img
+# GUEST_KERNEL=disk/data/capture_test_vmlinuz
+# GUEST_INITRD=disk/data/capture_test_initrd.img
+# WORKLOAD_SCRIPT=kvm/guest/workloads/known_pattern.py`), kept separate from
+# the normal faiss_bench.py image so this doesn't overwrite it.
+
+defaults:
+  qemu_binary: qemu-system-x86_64
+  kvm: false          # set true on a host with /dev/kvm access -- much faster
+  vcpus: 2
+  memory: 2G
+  run_dir: /tmp/kvm-launch
+  log_dir: /tmp/kvm-launch
+  daemonize: true
+  display: none
+  network:
+    type: none
+  kernel: disk/data/capture_test_vmlinuz
+  initrd: disk/data/capture_test_initrd.img
+  append: "root=/dev/vda ro console=ttyS0 systemd.volatile=yes"
+
+vms:
+  - name: vm0
+    disks:
+      - nbd: {host: 127.0.0.1, port: 10809, export: vm0-root}      # -> /dev/vda (boot)
+      - nbd: {host: 127.0.0.1, port: 10810, export: vm0-scratch}   # -> /dev/vdb (known_pattern.py reads here)

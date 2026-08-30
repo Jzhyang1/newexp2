@@ -359,6 +359,8 @@ struct Config {
   std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware
   std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril | readahead_cxt_aware
   std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
+  std::string access_log = "";  // optional: per-request (worker_id,offset,length,hits,total)
+                                 // event log, for verifying capture correctness; disabled if empty
 };
 
 std::string Trim(const std::string& s) {
@@ -428,6 +430,8 @@ Config LoadConfig(const std::string& path) {
       cfg.prefetch_policy = value;
     } else if (key == "log") {
       cfg.log = value;
+    } else if (key == "access_log") {
+      cfg.access_log = value;
     } else {
       throw std::runtime_error("unknown config key: " + key);
     }
@@ -609,8 +613,23 @@ int main(int argc, char **argv) {
   policy::CachePolicy* evict_policy = nbd::MakeEvictPolicy(cfg.evict_policy, cache);
   policy::CachePolicy* prefetch_policy = nbd::MakePrefetchPolicy(cfg.prefetch_policy, cache);
 
+  FILE* access_log = nullptr;
+  if (!cfg.access_log.empty()) {
+    std::filesystem::path access_log_path(cfg.access_log);
+    if (!access_log_path.parent_path().empty()) {
+      std::filesystem::create_directories(access_log_path.parent_path());
+    }
+    access_log = fopen(cfg.access_log.c_str(), "w");
+    if (!access_log) {
+      perror(("failed to open access_log " + cfg.access_log).c_str());
+      return 1;
+    }
+    std::fprintf(access_log, "worker_id,offset,length,hits,total\n");
+    std::fflush(access_log);
+  }
+
   nbd::BlockReadClass* reader = new nbd::SimReadClass(
-      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy);
+      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log);
 
   signal(SIGPIPE, SIG_IGN);
 

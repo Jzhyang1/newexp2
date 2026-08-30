@@ -1,0 +1,24 @@
+# nbd_server config for the real-VM capture-correctness test
+# (kvm/verify_capture.py). See disk/nbd.example.yaml for the full schema.
+#
+# Same backing file as the normal capture-test guest image (built separately
+# from your regular `make guest-image` -- see kvm/verify_capture.py's
+# docstring), but with a *second* port: kvm/vms.test.yaml wires it up as
+# /dev/vdb, a disk the guest never touches except via
+# kvm/guest/workloads/known_pattern.py, so every event captured under that
+# port's worker_id is unambiguously attributable to that known workload.
+
+source: local
+file: disk/data/capture_test_disk.img
+ports: [10809, 10810]        # 10809 -> /dev/vda (boot), 10810 -> /dev/vdb (known_pattern.py)
+
+capacity: 4096
+hit_latency_ns: 30000
+miss_latency_ns: 300000
+warmup: 0
+
+evict_policy: lru
+prefetch_policy: none
+
+log: ./logs/nbd_results.csv
+access_log: ./logs/nbd_access_test.csv

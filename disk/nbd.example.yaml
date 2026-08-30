@@ -26,3 +26,11 @@ prefetch_policy: none       # none | readahead | cminer | quickmine | mithril
 # CSV stats log, appended to (header written once) on a clean shutdown
 # (SIGINT/SIGTERM) -- see disk/nbd.cpp's AppendLog.
 log: ./logs/nbd_results.csv
+
+# Optional: per-request event log (worker_id,offset,length,hits,total -- one
+# CSV row per read() call SimReadClass sees, written+flushed immediately,
+# unlike `log` above). Overwritten fresh on every server start. For verifying
+# that VM/client I/O is being captured correctly (see disk/test_protocol.py
+# and kvm/verify_capture.py) -- leave unset/empty to disable; it adds an
+# fflush() per request so don't leave it on for real experiments.
+# access_log: ./logs/nbd_access.csv
