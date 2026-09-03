@@ -6,11 +6,18 @@
 # cmdline). Invoked by `make guest-image` -- see the Makefile for the env
 # vars this expects and their defaults.
 #
+# If YCSB_ENABLE=1 (the Makefile's default), also downloads YCSB + a JRE and
+# pre-loads a SQLite dataset under /opt/workload, all baked into ROOTFS_IMG
+# here so kvm/guest/workloads/ycsb_bench.py has a real on-disk dataset to
+# run reads against at boot.
+#
 # All writes here go straight to ROOTFS_IMG on the host filesystem via
 # debootstrap/chroot -- a completely different path from nbd_server, which
 # discards every write a *running* guest makes to this same file (see
-# disk/sim.hpp). That's why the guest boots with systemd.volatile=yes: it
-# never depends on a write actually landing on disk mid-run.
+# disk/sim.hpp). That's why the guest boots with systemd.volatile=state
+# (root, including /opt, stays read-only from the real disk; only /var is a
+# tmpfs overlay) -- NOT systemd.volatile=yes, which would tmpfs everything
+# outside /usr and wipe /opt/workload on every boot.
 #
 # Must run as root (debootstrap/mount/chroot need it) on a Debian/Ubuntu
 # Linux host with debootstrap installed.
@@ -24,6 +31,23 @@ MIRROR=${MIRROR:-http://deb.debian.org/debian}
 WORKLOAD_SCRIPT=${WORKLOAD_SCRIPT:?WORKLOAD_SCRIPT not set}
 KERNEL_OUT=${KERNEL_OUT:?KERNEL_OUT not set}
 INITRD_OUT=${INITRD_OUT:?INITRD_OUT not set}
+
+# Optional: bake a real YCSB (Java) benchmark + a pre-loaded SQLite dataset
+# in under /opt, so kvm/guest/workloads/ycsb_bench.py has something real to
+# run reads against at boot. See the Makefile's GUEST_YCSB_* vars for how
+# these are set; the load phase (writes) happens here, at build time,
+# directly against $ROOTFS_IMG -- never at boot, where writes would land on
+# the guest's volatile tmpfs and vanish instead of exercising nbd_server.
+YCSB_ENABLE=${YCSB_ENABLE:-0}
+YCSB_VERSION=${YCSB_VERSION:-0.17.0}
+SQLITE_JDBC_VERSION=${SQLITE_JDBC_VERSION:-3.46.1.3}
+YCSB_RECORDS=${YCSB_RECORDS:-1000000}
+YCSB_FIELD_COUNT=${YCSB_FIELD_COUNT:-10}
+YCSB_FIELD_LENGTH=${YCSB_FIELD_LENGTH:-100}
+YCSB_WORKLOAD=${YCSB_WORKLOAD:-workloadc}
+YCSB_OPERATIONS=${YCSB_OPERATIONS:-200000}
+YCSB_DISTRIBUTION=${YCSB_DISTRIBUTION:-zipfian}
+YCSB_THREADS=${YCSB_THREADS:-4}
 
 if [[ $EUID -ne 0 ]]; then
     echo "build_image.sh must run as root (debootstrap/mount/chroot need it)" >&2
@@ -68,6 +92,57 @@ chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install
 chroot "$MNT" pip3 install --break-system-packages --no-cache-dir faiss-cpu
 
 mkdir -p "$MNT/opt/workload"
+
+if [[ "$YCSB_ENABLE" == "1" ]]; then
+    chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        openjdk-17-jre-headless sqlite3 curl
+
+    chroot "$MNT" mkdir -p /opt/ycsb
+    chroot "$MNT" curl -fsSL -o /tmp/ycsb.tar.gz \
+        "https://github.com/brianfrankcooper/YCSB/releases/download/${YCSB_VERSION}/ycsb-${YCSB_VERSION}.tar.gz"
+    chroot "$MNT" tar -xzf /tmp/ycsb.tar.gz -C /opt/ycsb --strip-components=1
+    chroot "$MNT" rm /tmp/ycsb.tar.gz
+
+    # Generic JDBC binding + SQLite driver -- YCSB has no bundled sqlite
+    # binding, but `db=jdbc` works against any JDBC driver on its classpath.
+    chroot "$MNT" mkdir -p /opt/ycsb/jdbc-binding/lib
+    chroot "$MNT" curl -fsSL \
+        -o "/opt/ycsb/jdbc-binding/lib/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar" \
+        "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/${SQLITE_JDBC_VERSION}/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar"
+
+    YCSB_DB=/opt/workload/ycsb.db
+    cols=""
+    for ((i = 0; i < YCSB_FIELD_COUNT; i++)); do
+        cols+="FIELD${i} TEXT, "
+    done
+    chroot "$MNT" sqlite3 "$YCSB_DB" \
+        "CREATE TABLE USERTABLE (YCSB_KEY VARCHAR(255) PRIMARY KEY, ${cols%, });"
+
+    # Load phase: writes the actual dataset, once, directly into $ROOTFS_IMG
+    # via this chroot -- a real disk write, unlike anything a *running*
+    # guest does. Single-threaded: SQLite serializes writers, so parallel
+    # `ycsb load` threads would just contend on the same file lock.
+    chroot "$MNT" bash -c "cd /opt/ycsb && python3 bin/ycsb load jdbc \
+        -P workloads/${YCSB_WORKLOAD} \
+        -p db.driver=org.sqlite.JDBC -p db.url=jdbc:sqlite:${YCSB_DB} \
+        -p recordcount=${YCSB_RECORDS} -p fieldcount=${YCSB_FIELD_COUNT} \
+        -p fieldlength=${YCSB_FIELD_LENGTH} -threads 1"
+
+    cat > "$MNT/opt/workload/ycsb_config.json" <<EOF
+{
+  "ycsb_home": "/opt/ycsb",
+  "db_path": "${YCSB_DB}",
+  "workload": "${YCSB_WORKLOAD}",
+  "recordcount": ${YCSB_RECORDS},
+  "operationcount": ${YCSB_OPERATIONS},
+  "fieldcount": ${YCSB_FIELD_COUNT},
+  "fieldlength": ${YCSB_FIELD_LENGTH},
+  "requestdistribution": "${YCSB_DISTRIBUTION}",
+  "threads": ${YCSB_THREADS}
+}
+EOF
+fi
+
 cp "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 
 # Powers the guest off once the workload exits (success or failure) so that
@@ -116,3 +191,6 @@ echo "guest image built: $ROOTFS_IMG"
 echo "kernel:  $KERNEL_OUT"
 echo "initrd:  $INITRD_OUT"
 echo "workload: $WORKLOAD_SCRIPT -> /opt/workload/run.py (runs once per boot via workload.service)"
+if [[ "$YCSB_ENABLE" == "1" ]]; then
+    echo "ycsb: ${YCSB_RECORDS} records loaded into /opt/workload/ycsb.db, ${YCSB_WORKLOAD} read at boot (see /opt/workload/ycsb_config.json)"
+fi

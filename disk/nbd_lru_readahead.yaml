@@ -1,0 +1,24 @@
+# nbd_server config for the "baseline" half of the lru+readahead vs.
+# lru_cxt_aware+readahead_cxt_aware comparison (`make experiment-lru-readahead`).
+# See disk/nbd.example.yaml for the full schema.
+#
+# Same backing file/ports as disk/nbd_cxt_aware.yaml and the same
+# kvm/vms_lru_vs_cxtaware.yaml VM group -- only evict_policy/prefetch_policy
+# and `log` differ, so the two runs (done sequentially, not concurrently,
+# since one nbd_server process's Cache/policy is shared across every VM
+# attached to it -- see disk/nbd.cpp's MakeEvictPolicy/MakePrefetchPolicy)
+# are otherwise an apples-to-apples comparison.
+
+source: local
+file: disk/data/nbd_disk.img
+ports: [10809, 10810]
+
+capacity: 4096
+hit_latency_ns: 30000
+miss_latency_ns: 300000
+warmup: 0
+
+evict_policy: lru
+prefetch_policy: readahead
+
+log: ./logs/nbd_results_lru_readahead.csv

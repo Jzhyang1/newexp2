@@ -6,9 +6,13 @@
 #   4. test on VMs   -> (interactive; ssh/console into a VM and drive it)
 #   5. tear down     -> make vms-down
 #
-# `make experiment` runs stages 1-3 in one shot (disk server backgrounded
-# instead of foregrounded, so it can move on to starting VMs) and leaves
-# everything up for stage 4; `make experiment-down` is stage 5.
+# `make experiment` runs all 5 stages end-to-end: disk server backgrounded
+# (instead of foregrounded, so it can move on to starting VMs), VMs brought
+# up, then it blocks until every VM's QEMU process exits on its own (e.g. a
+# guest-image VM powering itself off once its baked-in workload finishes)
+# before tearing everything down. `make experiment-down` remains available
+# to tear down by hand (e.g. after interactive testing against a blank-disk
+# VM, which never exits on its own).
 #
 # All of it is Linux-only (disk/nbd.cpp needs <endian.h>; kvm/launch.py needs
 # qemu-system and /dev/kvm) -- run this on the Linux host/VM that will
@@ -64,16 +68,44 @@ disk-clean:
 # Everything this writes goes straight to $(DISK_IMG) via debootstrap/chroot
 # on the host -- a different path from nbd_server, which discards every
 # write a *running* guest makes to this same file (disk/sim.hpp), which is
-# why the default append line boots with systemd.volatile=yes. Needs root
-# and debootstrap, and is Debian/Ubuntu-only -- skip it and use `make disk`
-# instead if you just want the plain simulator with no guest workload.
+# why the default append line boots with systemd.volatile=state (root +
+# /opt/etc read-only from the real disk, only /var as a tmpfs overlay --
+# NOT systemd.volatile=yes, which tmpfs's everything outside /usr and would
+# silently wipe anything baked in under /opt, e.g. the YCSB dataset below).
+# Needs root and debootstrap, and is Debian/Ubuntu-only -- skip it and use
+# `make disk` instead if you just want the plain simulator with no guest
+# workload.
 GUEST_DISTRO ?= bookworm
 GUEST_ARCH ?= amd64
 GUEST_MIRROR ?= http://deb.debian.org/debian
-GUEST_ROOTFS_SIZE ?= 3G
-WORKLOAD_SCRIPT ?= kvm/guest/workloads/faiss_bench.py
+# Sized for the default GUEST_YCSB=1 dataset (~11.5G) plus base OS/JRE
+# (~1G) and ext4 overhead -- drop back to 3G if you set GUEST_YCSB=0 and
+# use the plain faiss_bench.py workload instead.
+GUEST_ROOTFS_SIZE ?= 16G
+WORKLOAD_SCRIPT ?= kvm/guest/workloads/ycsb_bench.py
 GUEST_KERNEL ?= disk/data/vmlinuz
 GUEST_INITRD ?= disk/data/initrd.img
+
+# Bakes a real YCSB (Java) benchmark + a pre-loaded SQLite dataset into the
+# image at build time -- see kvm/guest/build_image.sh's YCSB_* block and
+# kvm/guest/workloads/ycsb_bench.py. Only the read-only transaction phase
+# runs at boot; the load phase runs here, at build time, so the dataset is
+# genuinely written to $(DISK_IMG) instead of the guest's volatile tmpfs.
+# Only read-only workloads are viable at boot (default workloadc, 100%
+# read) since the guest's root is mounted `ro`. The record count is chosen
+# to land well above kvm/vms.yaml's guest `memory: 4G` -- otherwise the
+# guest's own page cache would absorb repeats after the first pass and
+# nbd_server's cache/prefetch policies would rarely see a real miss.
+GUEST_YCSB ?= 1
+GUEST_YCSB_VERSION ?= 0.17.0
+SQLITE_JDBC_VERSION ?= 3.46.1.3
+GUEST_YCSB_RECORDS ?= 10000000
+GUEST_YCSB_FIELD_COUNT ?= 10
+GUEST_YCSB_FIELD_LENGTH ?= 100
+GUEST_YCSB_WORKLOAD ?= workloadc
+GUEST_YCSB_OPERATIONS ?= 200000
+GUEST_YCSB_DISTRIBUTION ?= zipfian
+GUEST_YCSB_THREADS ?= 4
 
 .PHONY: guest-image
 guest-image:
@@ -81,6 +113,11 @@ guest-image:
 	$(SUDO) env ROOTFS_IMG=$(DISK_IMG) ROOTFS_SIZE=$(GUEST_ROOTFS_SIZE) DISTRO=$(GUEST_DISTRO) \
 	  ARCH=$(GUEST_ARCH) MIRROR=$(GUEST_MIRROR) WORKLOAD_SCRIPT=$(WORKLOAD_SCRIPT) \
 	  KERNEL_OUT=$(GUEST_KERNEL) INITRD_OUT=$(GUEST_INITRD) \
+	  YCSB_ENABLE=$(GUEST_YCSB) YCSB_VERSION=$(GUEST_YCSB_VERSION) \
+	  SQLITE_JDBC_VERSION=$(SQLITE_JDBC_VERSION) YCSB_RECORDS=$(GUEST_YCSB_RECORDS) \
+	  YCSB_FIELD_COUNT=$(GUEST_YCSB_FIELD_COUNT) YCSB_FIELD_LENGTH=$(GUEST_YCSB_FIELD_LENGTH) \
+	  YCSB_WORKLOAD=$(GUEST_YCSB_WORKLOAD) YCSB_OPERATIONS=$(GUEST_YCSB_OPERATIONS) \
+	  YCSB_DISTRIBUTION=$(GUEST_YCSB_DISTRIBUTION) YCSB_THREADS=$(GUEST_YCSB_THREADS) \
 	  bash kvm/guest/build_image.sh
 
 # ---------------------------------------------------------------------------
@@ -98,8 +135,6 @@ NBD_CAPACITY ?= 4096
 NBD_HIT_LATENCY_NS ?= 30000
 NBD_MISS_LATENCY_NS ?= 300000
 NBD_WARMUP ?= 0
-NBD_EVICT_POLICY ?= lru
-NBD_PREFETCH_POLICY ?= none
 NBD_LOG ?= ./logs/nbd_results.csv
 
 comma := ,
@@ -117,7 +152,7 @@ $(NBD_BIN): $(NBD_SRC) disk/nbd.hpp disk/sim.hpp $(POLICY_SRCS) | dirs
 # Build, provision the backing disk, regenerate the config, and run in the
 # foreground. Ctrl-C (or SIGTERM) stops it cleanly and appends one row of
 # stats to NBD_LOG. Override any NBD_*/DISK_* variable at invocation, e.g.:
-#   make nbd-run NBD_PORTS="10809 10810" DISK_SIZE=4G NBD_EVICT_POLICY=fifo
+#   make nbd-run NBD_PORTS="10809 10810" DISK_SIZE=4G
 nbd-run: nbd nbd-config disk
 	$(NBD_BIN) $(NBD_CONFIG)
 
@@ -215,14 +250,36 @@ install-qemu:
 	fi
 
 # ---------------------------------------------------------------------------
-# Stages 1-3 end-to-end: create the disk, start the disk server in the
-# background, and bring up the VMs -- then leaves everything running for
-# stage 4 (test on VMs) interactively. Finish with `make experiment-down`,
-# which is stage 5 (VMs stopped, then the server SIGTERM'd so it logs stats).
+# Stages 1-5 end-to-end: create the disk, start the disk server in the
+# background, bring up the VMs, block until every VM's QEMU process exits on
+# its own (e.g. a guest-image VM powering itself off once its baked-in
+# workload.service finishes -- see kvm/guest/build_image.sh), then tear
+# everything down (VMs stopped, server SIGTERM'd so it logs stats).
+# `make experiment-down` remains available to tear down by hand instead
+# (e.g. after interactive testing against a blank-disk VM, which never
+# exits on its own).
 .PHONY: experiment experiment-down
 experiment: nbd-start vms-up
-	@echo ""
-	@echo "Disk server and VMs are up -- test against the VMs now, then run:"
-	@echo "  make experiment-down"
+	$(MAKE) vms-wait
+	$(MAKE) experiment-down
 
 experiment-down: vms-down nbd-stop
+
+# ---------------------------------------------------------------------------
+# lru+readahead vs. lru_cxt_aware+readahead_cxt_aware comparison: the same
+# 2-VM group (kvm/vms_lru_vs_cxtaware.yaml) run once against each policy
+# pair's nbd_server config (disk/nbd_lru_readahead.yaml /
+# disk/nbd_cxt_aware.yaml). Run sequentially, not concurrently -- one
+# nbd_server process's Cache/evict/prefetch policy is shared across every VM
+# attached to it (disk/nbd.cpp), so comparing two policy pairs needs two
+# separate runs, and running them at the same time would have the two
+# processes competing for host CPU during the VMs' workload, which would
+# skew the comparison. Each writes its own stats row to a separate CSV (see
+# each yaml's `log:`) for the two runs to be compared afterward. Needs
+# `make guest-image` to have been run first, same as `make experiment`.
+.PHONY: experiment-lru-readahead experiment-cxt-aware
+experiment-lru-readahead:
+	$(MAKE) experiment NBD_CONFIG=disk/nbd_lru_readahead.yaml VMS_CONFIG=kvm/vms_lru_vs_cxtaware.yaml
+
+experiment-cxt-aware:
+	$(MAKE) experiment NBD_CONFIG=disk/nbd_cxt_aware.yaml VMS_CONFIG=kvm/vms_lru_vs_cxtaware.yaml

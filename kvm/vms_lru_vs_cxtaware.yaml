@@ -1,14 +1,16 @@
-# Default VM config for `make vms-up` / `make experiment`, matching the
-# default disk/nbd.yaml (`make nbd-config`'s defaults): one nbd_server
-# listening on 127.0.0.1:10809. See kvm/vms.example.yaml for the full schema
-# and a multi-VM/multi-disk example.
+# VM config for the lru+readahead vs. lru_cxt_aware+readahead_cxt_aware
+# comparison (`make experiment-lru-readahead` / `make experiment-cxt-aware`).
+# Two VMs sharing one nbd_server's cache, one per port -- see
+# disk/nbd_lru_readahead.yaml and disk/nbd_cxt_aware.yaml, which both listen
+# on these same two ports so this same VM config drives both runs. See
+# kvm/vms.example.yaml for the full schema.
 #
 # kernel/initrd/append below boot the Debian guest image that `make
 # guest-image` bakes onto disk/data/nbd_disk.img (see kvm/guest/build_image.sh)
-# -- it runs WORKLOAD_SCRIPT (default kvm/guest/workloads/ycsb_bench.py,
-# a real YCSB benchmark reading a pre-loaded SQLite dataset baked in under
+# -- it runs WORKLOAD_SCRIPT (default kvm/guest/workloads/ycsb_bench.py, a
+# real YCSB benchmark reading a pre-loaded SQLite dataset baked in under
 # /opt/workload) once via systemd's workload.service on every boot, with
-# output visible on the serial console (<log_dir>/vm0.serial.log).
+# output visible on the serial console (<log_dir>/<name>.serial.log).
 # `systemd.volatile=state` mounts root (including /opt) read-only from the
 # real disk, with only /var as a tmpfs overlay, since nbd_server discards
 # every write a *running* guest makes anyway (disk/sim.hpp) -- this keeps
@@ -18,12 +20,10 @@
 # everything outside /usr, which would silently wipe /opt/workload (and the
 # baked-in dataset with it) on every boot.
 #
-# If you haven't run `make guest-image` yet -- or just want the plain
-# simulator with no guest workload -- run `make disk` instead (a zero-filled
-# file) and delete the kernel/initrd/append lines below; the VM will then
-# sit at its firmware's "no bootable device" screen, which is still a real
-# end-to-end check that QEMU successfully attached the NBD disk (watch
-# nbd_server's stderr/log for "client connected").
+# Needs `make guest-image` to have been run first -- otherwise both VMs will
+# just sit at their firmware's "no bootable device" screen (still a valid
+# check that QEMU attached the NBD disk, but no read traffic to compare
+# policies against).
 
 defaults:
   qemu_binary: qemu-system-x86_64
@@ -44,3 +44,7 @@ vms:
   - name: vm0
     disks:
       - nbd: {host: 127.0.0.1, port: 10809, export: vm0-root}   # -> /dev/vda
+
+  - name: vm1
+    disks:
+      - nbd: {host: 127.0.0.1, port: 10810, export: vm1-root}   # -> /dev/vda

@@ -118,17 +118,41 @@ Builds a real bootable guest instead of a blank disk: a Debian rootfs
 (`workload.service`) that runs a workload script once on every boot, and
 extracts the kernel/initrd `kvm/vms.yaml` boots via `-kernel`/`-initrd`.
 Override `WORKLOAD_SCRIPT` to bake in a different script (default
-[`kvm/guest/workloads/faiss_bench.py`](kvm/guest/workloads/faiss_bench.py),
-a CPU-heavy FAISS HNSW index-build-and-search benchmark); its stdout lands
-on the guest's serial console, logged to `<log_dir>/<name>.serial.log`.
+[`kvm/guest/workloads/ycsb_bench.py`](kvm/guest/workloads/ycsb_bench.py) —
+see below; [`kvm/guest/workloads/faiss_bench.py`](kvm/guest/workloads/faiss_bench.py),
+a CPU-heavy FAISS HNSW index-build-and-search benchmark, is still available
+by setting `WORKLOAD_SCRIPT` explicitly); its stdout lands on the guest's
+serial console, logged to `<log_dir>/<name>.serial.log`.
 
 This writes straight to `disk/data/nbd_disk.img` via `debootstrap`/`chroot`
 on the host — a completely different path from `nbd_server`, which discards
 every write a *running* guest makes to that same file (see `disk/sim.hpp`
 above). That's why `kvm/vms.yaml`'s default `append` boots with
-`systemd.volatile=yes`: root is mounted read-only with a tmpfs overlay for
-`/etc`/`/var`, so the guest never depends on a write actually landing on
-disk mid-run. Needs root and `debootstrap`, and is Debian/Ubuntu-only.
+`systemd.volatile=state`: root (including `/opt`, where baked-in data like
+the YCSB dataset lives) is mounted read-only from the real disk, with only
+`/var` as a tmpfs overlay, so the guest never depends on a write actually
+landing on disk mid-run while reads of baked-in data still genuinely reach
+`nbd_server`. (Not `systemd.volatile=yes` — that tmpfs's everything outside
+`/usr`, wiping `/opt/workload` on every boot.) Needs root and
+`debootstrap`, and is Debian/Ubuntu-only.
+
+#### YCSB workload (default)
+
+By default (`GUEST_YCSB=1`) the image also gets a real
+[YCSB](https://github.com/brianfrankcooper/YCSB) benchmark: a JRE, the YCSB
+release tarball, and the generic JDBC binding paired with a SQLite driver
+(YCSB has no bundled SQLite binding). At build time — not boot time — a
+`GUEST_YCSB_RECORDS`-record dataset (default 10,000,000, sized to land well
+above the guest's 4G RAM in `kvm/vms.yaml` so it can't all be absorbed by
+the guest's own page cache) is loaded into a SQLite table under
+`/opt/workload/ycsb.db`. Only `bin/ycsb run` (the transaction phase) runs
+at boot, driven by `kvm/guest/workloads/ycsb_bench.py`; only a read-only
+workload (default `GUEST_YCSB_WORKLOAD=workloadc`, 100% reads) is viable
+there, since `kvm/vms.yaml` mounts root `ro`. Tunable via `GUEST_YCSB_*`
+Makefile vars — see the Makefile's `guest-image` section for the full list
+(record/field count and size, operation count, key distribution, thread
+count, YCSB/sqlite-jdbc versions). Set `GUEST_YCSB=0` to skip all of this
+and use a smaller/faster `GUEST_ROOTFS_SIZE` with `faiss_bench.py` instead.
 
 ## Build and Run
 
@@ -145,12 +169,19 @@ make disk DISK_SIZE=4G
 ```
 
    To instead boot a real guest that runs a workload script on boot, build
-   a Debian image with Python/numpy/faiss baked in (needs root and
-   `debootstrap`, Debian/Ubuntu-only) instead of the plain zero-filled file:
+   a Debian image with Python/numpy/faiss and a real YCSB benchmark + a
+   pre-loaded SQLite dataset baked in (needs root and `debootstrap`,
+   Debian/Ubuntu-only, and takes a while — it downloads a JRE, YCSB, and
+   loads a multi-GB dataset) instead of the plain zero-filled file:
 
 ```bash
-make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
+make guest-image
 ```
+
+   (or `make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
+   GUEST_YCSB=0 GUEST_ROOTFS_SIZE=3G` for the smaller/faster FAISS-only
+   workload instead — see [YCSB workload](#ycsb-workload-default) above for
+   the full set of `GUEST_YCSB_*` tunables)
 
 2. **Build and start the disk server** — builds `nbd_server`, generates
    `disk/nbd.yaml` from the `NBD_*` variables, and runs in the foreground:

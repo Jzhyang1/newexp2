@@ -24,7 +24,7 @@ defaults:
     type: none
   kernel: disk/data/capture_test_vmlinuz
   initrd: disk/data/capture_test_initrd.img
-  append: "root=/dev/vda ro console=ttyS0 systemd.volatile=yes"
+  append: "root=/dev/vda ro console=ttyS0 systemd.volatile=state"
 
 vms:
   - name: vm0
