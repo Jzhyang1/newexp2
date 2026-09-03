@@ -12,3 +12,4 @@ evict_policy: lru
 prefetch_policy: none
 
 log: ./logs/nbd_results.csv
+access_log: ./logs/nbd_access.csv

@@ -359,8 +359,8 @@ struct Config {
   std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware
   std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril | readahead_cxt_aware
   std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
-  std::string access_log = "";  // optional: per-request (worker_id,offset,length,hits,total)
-                                 // event log, for verifying capture correctness; disabled if empty
+  std::string access_log = "./logs/nbd_access.csv";  // per-request (worker_id,offset,length,hits,total)
+                                 // event log, for verifying capture correctness; set to "" to disable
 };
 
 std::string Trim(const std::string& s) {
