@@ -121,24 +121,13 @@ mkdir -p "$MNT/opt/workload"
 
 if [[ "$YCSB_ENABLE" == "1" ]]; then
     chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless sqlite3 curl 2to3
+        openjdk-17-jre-headless sqlite3 curl
 
     chroot "$MNT" mkdir -p /opt/ycsb
     chroot "$MNT" curl -fsSL -o /tmp/ycsb.tar.gz \
         "https://github.com/brianfrankcooper/YCSB/releases/download/${YCSB_VERSION}/ycsb-${YCSB_VERSION}.tar.gz"
     chroot "$MNT" tar -xzf /tmp/ycsb.tar.gz -C /opt/ycsb --strip-components=1
     chroot "$MNT" rm /tmp/ycsb.tar.gz
-
-    # The official YCSB release tarball's bin/ycsb launcher (a thin Python
-    # CLI wrapper around `java` -- the actual benchmark logic is all Java,
-    # not Python) is written in Python 2 syntax (e.g. `except X, err:`), but
-    # this image only has python3 (Debian bookworm dropped python2 from the
-    # archive entirely) and both this script's `ycsb load` below and
-    # ycsb_bench.py's `ycsb run` invoke it as `python3 bin/ycsb ...`. Port it
-    # once, here -- fixing it in the image covers both call sites, since
-    # they're the same file -- rather than hand-patching SyntaxErrors as
-    # they surface one at a time.
-    chroot "$MNT" 2to3 -w -n /opt/ycsb/bin/ycsb
 
     # Generic JDBC binding + SQLite driver -- YCSB has no bundled sqlite
     # binding, but `db=jdbc` works against any JDBC driver on its classpath.
@@ -159,7 +148,17 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
     # via this chroot -- a real disk write, unlike anything a *running*
     # guest does. Single-threaded: SQLite serializes writers, so parallel
     # `ycsb load` threads would just contend on the same file lock.
-    chroot "$MNT" bash -c "cd /opt/ycsb && python3 bin/ycsb load jdbc \
+    #
+    # Invokes java directly instead of going through the release tarball's
+    # bin/ycsb launcher: that launcher is a thin Python 2 script (resolves
+    # "jdbc" -> a Java class via a hardcoded dict, builds this same
+    # classpath, execs java -load/-t) that doesn't run under python3 at all
+    # (Debian bookworm ships no python2), and porting it wasn't worth it for
+    # what amounts to four lines of classpath logic. See ycsb_bench.py's
+    # `run` invocation below for the matching boot-time command.
+    YCSB_CP="/opt/ycsb/jdbc-binding/conf:/opt/ycsb/conf:/opt/ycsb/lib/*:/opt/ycsb/jdbc-binding/lib/*"
+    chroot "$MNT" bash -c "cd /opt/ycsb && java -cp '$YCSB_CP' site.ycsb.Client -load \
+        -db site.ycsb.db.JdbcDBClient \
         -P workloads/${YCSB_WORKLOAD} \
         -p db.driver=org.sqlite.JDBC -p db.url=jdbc:sqlite:${YCSB_DB} \
         -p recordcount=${YCSB_RECORDS} -p fieldcount=${YCSB_FIELD_COUNT} \

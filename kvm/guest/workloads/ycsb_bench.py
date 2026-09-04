@@ -16,9 +16,22 @@ import subprocess
 with open("/opt/workload/ycsb_config.json") as f:
     cfg = json.load(f)
 
+ycsb_home = cfg["ycsb_home"]
+# Invokes java directly instead of the release tarball's bin/ycsb launcher --
+# that launcher is a thin Python 2 script (Debian bookworm ships no python2)
+# that just resolves "jdbc" to this same Java class and builds this same
+# classpath before exec'ing java itself; see build_image.sh's matching
+# `ycsb load` invocation for why it wasn't worth porting.
+classpath = ":".join([
+    f"{ycsb_home}/jdbc-binding/conf",
+    f"{ycsb_home}/conf",
+    f"{ycsb_home}/lib/*",
+    f"{ycsb_home}/jdbc-binding/lib/*",
+])
 cmd = [
-    "python3", f"{cfg['ycsb_home']}/bin/ycsb", "run", "jdbc",
-    "-P", f"{cfg['ycsb_home']}/workloads/{cfg['workload']}",
+    "java", "-cp", classpath, "site.ycsb.Client", "-t",
+    "-db", "site.ycsb.db.JdbcDBClient",
+    "-P", f"{ycsb_home}/workloads/{cfg['workload']}",
     "-p", "db.driver=org.sqlite.JDBC",
     "-p", f"db.url=jdbc:sqlite:{cfg['db_path']}",
     "-p", f"recordcount={cfg['recordcount']}",
