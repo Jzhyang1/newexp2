@@ -13,7 +13,7 @@
 
 defaults:
   qemu_binary: qemu-system-x86_64
-  kvm: false          # set true on a host with /dev/kvm access -- much faster
+  kvm: true          # set true on a host with /dev/kvm access -- much faster
   vcpus: 2
   memory: 2G
   run_dir: /tmp/kvm-launch
