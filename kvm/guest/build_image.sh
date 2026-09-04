@@ -180,7 +180,31 @@ StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 EOF
-chroot "$MNT" systemctl enable workload.service
+
+# `systemctl enable` inside a bare chroot (no live systemd/D-Bus) falls back
+# to a filesystem-only "offline enablement" heuristic that isn't guaranteed
+# to fire the same way on every systemd version/host -- and the failure mode
+# when it doesn't is a guest that boots perfectly fine and then just sits at
+# a login prompt forever, since nothing ever runs the workload or calls
+# poweroff. That's expensive to debug (looks identical to a real hang) and
+# cheap to rule out here, so enable it ourselves with the one symlink
+# `[Install] WantedBy=multi-user.target` means, then verify it -- and the
+# files it points at -- actually exist before calling the image done.
+mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
+ln -sf ../workload.service "$MNT/etc/systemd/system/multi-user.target.wants/workload.service"
+
+if [[ ! -L "$MNT/etc/systemd/system/multi-user.target.wants/workload.service" ]]; then
+    echo "build_image.sh: FAILED to enable workload.service -- the guest would boot fine and never run its workload" >&2
+    exit 1
+fi
+if [[ ! -x "$MNT/opt/workload/run.sh" ]]; then
+    echo "build_image.sh: FAILED -- /opt/workload/run.sh is missing or not executable" >&2
+    exit 1
+fi
+if [[ ! -f "$MNT/opt/workload/run.py" ]]; then
+    echo "build_image.sh: FAILED -- /opt/workload/run.py (from WORKLOAD_SCRIPT=$WORKLOAD_SCRIPT) is missing" >&2
+    exit 1
+fi
 
 # Autologin on the serial console so kvm/launch.py's display:none serial log
 # (<log_dir>/<name>.serial.log) shows the workload's output with no ssh/network
