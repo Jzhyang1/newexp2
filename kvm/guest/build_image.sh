@@ -121,13 +121,24 @@ mkdir -p "$MNT/opt/workload"
 
 if [[ "$YCSB_ENABLE" == "1" ]]; then
     chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless sqlite3 curl
+        openjdk-17-jre-headless sqlite3 curl 2to3
 
     chroot "$MNT" mkdir -p /opt/ycsb
     chroot "$MNT" curl -fsSL -o /tmp/ycsb.tar.gz \
         "https://github.com/brianfrankcooper/YCSB/releases/download/${YCSB_VERSION}/ycsb-${YCSB_VERSION}.tar.gz"
     chroot "$MNT" tar -xzf /tmp/ycsb.tar.gz -C /opt/ycsb --strip-components=1
     chroot "$MNT" rm /tmp/ycsb.tar.gz
+
+    # The official YCSB release tarball's bin/ycsb launcher (a thin Python
+    # CLI wrapper around `java` -- the actual benchmark logic is all Java,
+    # not Python) is written in Python 2 syntax (e.g. `except X, err:`), but
+    # this image only has python3 (Debian bookworm dropped python2 from the
+    # archive entirely) and both this script's `ycsb load` below and
+    # ycsb_bench.py's `ycsb run` invoke it as `python3 bin/ycsb ...`. Port it
+    # once, here -- fixing it in the image covers both call sites, since
+    # they're the same file -- rather than hand-patching SyntaxErrors as
+    # they surface one at a time.
+    chroot "$MNT" 2to3 -w -n /opt/ycsb/bin/ycsb
 
     # Generic JDBC binding + SQLite driver -- YCSB has no bundled sqlite
     # binding, but `db=jdbc` works against any JDBC driver on its classpath.
