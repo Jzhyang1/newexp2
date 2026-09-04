@@ -220,6 +220,14 @@ nbd-stats:
 test-protocol: nbd
 	python3 disk/test_protocol.py --binary $(NBD_BIN)
 
+# Renders the access_log CSV (see disk/nbd.example.yaml's `access_log` key)
+# as a page-access-density-over-time heatmap PNG. Needs matplotlib
+# (pip install matplotlib). Override the default ./logs/nbd_access.csv by
+# passing a path directly to disk/heatmap.py instead.
+.PHONY: heatmap
+heatmap:
+	python3 disk/heatmap.py
+
 # ---------------------------------------------------------------------------
 # Stage 3: the VMs. Wraps kvm/launch.py, which reads a YAML config (see
 # kvm/vms.yaml, a single VM matching the default disk/nbd.yaml; or

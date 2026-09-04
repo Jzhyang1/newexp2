@@ -242,6 +242,19 @@ first if the file is new or empty. Columns:
   to client think-time vs. evict/prefetch policy hook compute, respectively)
 - `runtime_seconds` — wall-clock time the server was up
 
+Independently, every request is also logged as it happens (not just on
+shutdown) to the config's `access_log:` path (default
+`./logs/nbd_access.csv`), overwritten fresh on each server start. Columns:
+`worker_id`, `offset`, `length` (bytes), `hits`, `total` (pages of the
+request that were a cache hit vs. touched overall). No timestamp column —
+row order is the access order. See `disk/sim.hpp`'s `SimReadClass` and
+`kvm/verify_capture.py`/`disk/test_protocol.py`, which cross-check it
+against known request patterns.
+
+`disk/heatmap.py` renders this log as a page-access-density-over-time
+heatmap (`make heatmap`, or `python3 disk/heatmap.py [access_log]`);
+requires matplotlib (`pip install matplotlib`).
+
 ## Commenting and Code Style Guidance
 
 To keep implementation readable while performance-tuning:
