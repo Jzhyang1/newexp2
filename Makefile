@@ -311,26 +311,16 @@ experiment: nbd-start vms-up
 experiment-down: vms-down nbd-stop
 
 # ---------------------------------------------------------------------------
-# Diagnostic: identical boot/NBD/cache pipeline to `make experiment`, but
-# workload.service runs kvm/guest/workloads/faiss_bench.py (CPU-only
-# numpy/faiss, no Java/SQLite/YCSB, no deliberate NBD read pattern) instead
-# of the default ycsb_bench.py. Re-syncs $(DISK_IMG) via guest-image's fast
-# rsync-only path (only WORKLOAD_SCRIPT changes -> no debootstrap/YCSB
-# reload needed) so it's cheap to run right after `make experiment` hangs.
-#
-# If this passes (WORKLOAD_RESULT: PASS, clean poweroff) but plain
-# `make experiment` hangs, the problem is specific to the YCSB/Java
-# workload (e.g. TCG-emulation slowness, or its particular NBD access
-# pattern). If experiment-2 *also* hangs, suspect the boot/NBD/cache
-# pipeline itself rather than YCSB.
-#
-# Note: this leaves $(DISK_IMG) baked with faiss_bench.py as its boot
-# workload -- re-run `make guest-image` (default WORKLOAD_SCRIPT) to swap
-# back to ycsb_bench.py before your next real `make experiment` run.
+# 2-VM concurrent YCSB run: same guest image/workload as `make experiment`
+# (default kvm/guest/workloads/ycsb_bench.py), but two VMs (kvm/vms_2vm.yaml)
+# attached to one nbd_server sharing its cache across ports 10809/10810
+# (disk/nbd_2vm.yaml) instead of just one. Same evict/prefetch policy as the
+# plain single-VM experiment -- this isn't a policy comparison (see
+# experiment-lru-readahead/experiment-cxt-aware below for that); it's for
+# exercising the cache/NBD path under concurrent guest traffic.
 .PHONY: experiment-2
 experiment-2:
-	$(MAKE) guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
-	$(MAKE) experiment
+	$(MAKE) experiment NBD_CONFIG=disk/nbd_2vm.yaml VMS_CONFIG=kvm/vms_2vm.yaml
 
 # ---------------------------------------------------------------------------
 # lru+readahead vs. lru_cxt_aware+readahead_cxt_aware comparison: the same

@@ -1,0 +1,22 @@
+# nbd_server config for `make experiment-2` -- two VMs (kvm/vms_2vm.yaml)
+# sharing one nbd_server's cache, one per port, both running the guest
+# image's baked-in workload (default kvm/guest/workloads/ycsb_bench.py) at
+# the same time. Same evict/prefetch policy as the default disk/nbd.yaml --
+# only `ports`/`log` differ, so this is `make experiment` with a second
+# concurrent VM added, not a policy comparison (see disk/nbd_lru_readahead.yaml
+# / disk/nbd_cxt_aware.yaml for that). See disk/nbd.example.yaml for the full
+# schema.
+
+source: local
+file: disk/data/nbd_disk.img
+ports: [10809, 10810]
+
+capacity: 4096
+hit_latency_ns: 30000
+miss_latency_ns: 300000
+warmup: 0
+
+evict_policy: lru
+prefetch_policy: none
+
+log: ./logs/nbd_results_2vm.csv

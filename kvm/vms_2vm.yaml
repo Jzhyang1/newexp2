@@ -1,0 +1,36 @@
+# VM config for `make experiment-2` -- two VMs booting the same guest image
+# as kvm/vms.yaml (ycsb_bench.py by default) concurrently, sharing one
+# nbd_server's cache via disk/nbd_2vm.yaml (ports 10809/10810). Unlike
+# kvm/vms_lru_vs_cxtaware.yaml, this isn't paired with a policy comparison --
+# it's the same single evict/prefetch policy as `make experiment`, just with
+# a second VM added to see whether concurrent guest traffic changes behavior
+# (e.g. different miss counts, cache contention, or a hang that only shows
+# up under concurrent access).
+#
+# See kvm/vms.yaml for what the kernel/initrd/append lines boot, and
+# kvm/vms.example.yaml for the full schema. Needs `make guest-image` to have
+# been run first, same as `make experiment`.
+
+defaults:
+  qemu_binary: qemu-system-x86_64
+  kvm: true          # set true on a host with /dev/kvm access -- the YCSB JVM is much slower under TCG emulation
+  vcpus: 4
+  memory: 4G
+  run_dir: /tmp/kvm-launch
+  log_dir: /tmp/kvm-launch
+  daemonize: true
+  display: none
+  network:
+    type: none
+  kernel: disk/data/vmlinuz
+  initrd: disk/data/initrd.img
+  append: "root=/dev/vda ro console=ttyS0 systemd.volatile=state"
+
+vms:
+  - name: vm0
+    disks:
+      - nbd: {host: 127.0.0.1, port: 10809, export: vm0-root}   # -> /dev/vda
+
+  - name: vm1
+    disks:
+      - nbd: {host: 127.0.0.1, port: 10810, export: vm1-root}   # -> /dev/vda
