@@ -21,6 +21,15 @@
 #
 # Must run as root (debootstrap/mount/chroot need it) on a Debian/Ubuntu
 # Linux host with debootstrap installed.
+#
+# If ROOTFS_IMG already exists, this defaults to a fast path: loop-mount the
+# existing image and rsync WORKLOAD_SCRIPT onto it (regenerating run.sh /
+# workload.service) instead of redoing debootstrap/apt/pip/YCSB-load from
+# scratch. That's the expensive ~minutes-to-tens-of-minutes part and it
+# doesn't depend on WORKLOAD_SCRIPT at all, so re-running it on every
+# workload-script edit was pure waste. Set FORCE_REBUILD=1 to get the old
+# full-rebuild behavior (needed after changing DISTRO/ARCH/packages/YCSB_*,
+# or if ROOTFS_IMG is missing/corrupt).
 set -euo pipefail
 
 ROOTFS_IMG=${ROOTFS_IMG:?ROOTFS_IMG not set}
@@ -31,6 +40,7 @@ MIRROR=${MIRROR:-http://deb.debian.org/debian}
 WORKLOAD_SCRIPT=${WORKLOAD_SCRIPT:?WORKLOAD_SCRIPT not set}
 KERNEL_OUT=${KERNEL_OUT:?KERNEL_OUT not set}
 INITRD_OUT=${INITRD_OUT:?INITRD_OUT not set}
+FORCE_REBUILD=${FORCE_REBUILD:-0}
 
 # Optional: bake a real YCSB (Java) benchmark + a pre-loaded SQLite dataset
 # in under /opt, so kvm/guest/workloads/ycsb_bench.py has something real to
@@ -53,7 +63,16 @@ if [[ $EUID -ne 0 ]]; then
     echo "build_image.sh must run as root (debootstrap/mount/chroot need it)" >&2
     exit 1
 fi
-for tool in debootstrap mkfs.ext4 losetup chroot; do
+
+if [[ -f "$ROOTFS_IMG" && "$FORCE_REBUILD" != "1" ]]; then
+    SYNC_ONLY=1
+else
+    SYNC_ONLY=0
+fi
+
+REQUIRED_TOOLS=(losetup chroot rsync)
+[[ "$SYNC_ONLY" == "1" ]] || REQUIRED_TOOLS+=(debootstrap mkfs.ext4)
+for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 [[ -f "$WORKLOAD_SCRIPT" ]] || { echo "workload script not found: $WORKLOAD_SCRIPT" >&2; exit 1; }
@@ -73,11 +92,18 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$(dirname "$ROOTFS_IMG")" "$(dirname "$KERNEL_OUT")" "$(dirname "$INITRD_OUT")"
-truncate -s "$ROOTFS_SIZE" "$ROOTFS_IMG"
-mkfs.ext4 -F -q "$ROOTFS_IMG"
+
+if [[ "$SYNC_ONLY" == "1" ]]; then
+    echo "build_image.sh: $ROOTFS_IMG already exists -- syncing $WORKLOAD_SCRIPT onto it instead of rebuilding (set FORCE_REBUILD=1 for a full rebuild)"
+else
+    truncate -s "$ROOTFS_SIZE" "$ROOTFS_IMG"
+    mkfs.ext4 -F -q "$ROOTFS_IMG"
+fi
 
 LOOP=$(losetup -f --show "$ROOTFS_IMG")
 mount "$LOOP" "$MNT"
+
+if [[ "$SYNC_ONLY" != "1" ]]; then
 
 debootstrap --arch="$ARCH" "$DISTRO" "$MNT" "$MIRROR"
 
@@ -143,7 +169,10 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
 EOF
 fi
 
-cp "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
+fi # SYNC_ONLY
+
+mkdir -p "$MNT/opt/workload"
+rsync -a "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 
 # Powers the guest off once the workload exits (success or failure) so that
 # a host-side `kvm/launch.py --wait` can detect completion by watching for
@@ -206,6 +235,8 @@ if [[ ! -f "$MNT/opt/workload/run.py" ]]; then
     exit 1
 fi
 
+if [[ "$SYNC_ONLY" != "1" ]]; then
+
 # Autologin on the serial console so kvm/launch.py's display:none serial log
 # (<log_dir>/<name>.serial.log) shows the workload's output with no ssh/network
 # needed -- root has no password, so this is only safe because network.type
@@ -223,7 +254,13 @@ INITRD_NAME=$(chroot "$MNT" bash -c "ls /boot | grep '^initrd.img-' | sort -V | 
 cp "$MNT/boot/$KVER" "$KERNEL_OUT"
 cp "$MNT/boot/$INITRD_NAME" "$INITRD_OUT"
 
-echo "guest image built: $ROOTFS_IMG"
+fi # SYNC_ONLY
+
+if [[ "$SYNC_ONLY" == "1" ]]; then
+    echo "guest image synced: $ROOTFS_IMG (workload only -- kernel/initrd/packages/YCSB dataset untouched; set FORCE_REBUILD=1 for a full rebuild)"
+else
+    echo "guest image built: $ROOTFS_IMG"
+fi
 echo "kernel:  $KERNEL_OUT"
 echo "initrd:  $INITRD_OUT"
 echo "workload: $WORKLOAD_SCRIPT -> /opt/workload/run.py (runs once per boot via workload.service)"

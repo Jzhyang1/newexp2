@@ -107,9 +107,17 @@ GUEST_YCSB_OPERATIONS ?= 200000
 GUEST_YCSB_DISTRIBUTION ?= zipfian
 GUEST_YCSB_THREADS ?= 4
 
+# FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
+# already exists -- default (0) is the fast path in build_image.sh: if
+# DISK_IMG is already there, it loop-mounts it and rsyncs WORKLOAD_SCRIPT
+# onto it instead of redoing debootstrap/apt/pip/YCSB-load, since none of
+# that depends on the workload script. Only install debootstrap when it's
+# actually needed, so the fast path doesn't touch the package manager at all.
+FORCE_REBUILD ?= 0
+
 .PHONY: guest-image
 guest-image:
-	$(SUDO) apt-get install debootstrap
+	@if [ "$(FORCE_REBUILD)" = "1" ] || [ ! -f "$(DISK_IMG)" ]; then $(SUDO) apt-get install -y debootstrap; fi
 	$(SUDO) env ROOTFS_IMG=$(DISK_IMG) ROOTFS_SIZE=$(GUEST_ROOTFS_SIZE) DISTRO=$(GUEST_DISTRO) \
 	  ARCH=$(GUEST_ARCH) MIRROR=$(GUEST_MIRROR) WORKLOAD_SCRIPT=$(WORKLOAD_SCRIPT) \
 	  KERNEL_OUT=$(GUEST_KERNEL) INITRD_OUT=$(GUEST_INITRD) \
@@ -118,6 +126,7 @@ guest-image:
 	  YCSB_FIELD_COUNT=$(GUEST_YCSB_FIELD_COUNT) YCSB_FIELD_LENGTH=$(GUEST_YCSB_FIELD_LENGTH) \
 	  YCSB_WORKLOAD=$(GUEST_YCSB_WORKLOAD) YCSB_OPERATIONS=$(GUEST_YCSB_OPERATIONS) \
 	  YCSB_DISTRIBUTION=$(GUEST_YCSB_DISTRIBUTION) YCSB_THREADS=$(GUEST_YCSB_THREADS) \
+	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh
 
 # ---------------------------------------------------------------------------
