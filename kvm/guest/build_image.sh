@@ -148,9 +148,21 @@ cp "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 # Powers the guest off once the workload exits (success or failure) so that
 # a host-side `kvm/launch.py --wait` can detect completion by watching for
 # the QEMU process to exit, rather than polling the serial log's output.
+# poweroff always runs regardless of the workload's exit status -- a guest
+# that doesn't power off on failure would just trade one hang for another --
+# but the WORKLOAD_RESULT line (StandardOutput=journal+console below sends
+# it to the serial console for free) lets the host tell a crashed run from a
+# successful one after the fact, since QEMU exiting looks identical either
+# way (see kvm/launch.py's check_workload_result()).
 cat > "$MNT/opt/workload/run.sh" <<'EOF'
 #!/bin/sh
 python3 /opt/workload/run.py
+status=$?
+if [ "$status" -eq 0 ]; then
+    echo "WORKLOAD_RESULT: PASS"
+else
+    echo "WORKLOAD_RESULT: FAIL exit=$status"
+fi
 poweroff
 EOF
 chmod +x "$MNT/opt/workload/run.sh"

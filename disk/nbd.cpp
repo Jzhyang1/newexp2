@@ -132,17 +132,30 @@ bool DiscardFull(int fd, uint64_t len) {
 
 // Performs the fixed-newstyle handshake and NBD_OPT_EXPORT_NAME negotiation.
 // Returns true if the connection should proceed to the transmission phase.
-bool DoHandshake(int fd, uint64_t size) {
+//
+// Every failure path logs a reason via `fail()` before returning false --
+// previously these were silent, so a wire-protocol bug (see this file's
+// header comment about DoHandshake's past IHAVEOPT/REP_MAGIC bug) looked
+// identical to an ordinary dropped connection with nothing in the log to
+// tell them apart.
+bool DoHandshake(int fd, uint64_t size, uint64_t worker_id) {
+  auto fail = [&](const char* reason) {
+    std::fprintf(stderr, "nbd: worker %llu handshake failed: %s\n",
+                 static_cast<unsigned long long>(worker_id), reason);
+    return false;
+  };
+
   struct {
     uint64_t magic;
     uint64_t opts_magic;
     uint16_t handshake_flags;
   } __attribute__((packed)) hello{htobe64(kNbdMagic), htobe64(kIhaveOpt),
                                    htobe16(kFlagFixedNewstyle | kFlagNoZeroes)};
-  if (!WriteFull(fd, &hello, sizeof(hello))) return false;
+  if (!WriteFull(fd, &hello, sizeof(hello))) return fail("failed to write server hello");
 
   uint32_t client_flags_be;
-  if (!ReadFull(fd, &client_flags_be, sizeof(client_flags_be))) return false;
+  if (!ReadFull(fd, &client_flags_be, sizeof(client_flags_be)))
+    return fail("failed to read client flags (peer closed before negotiating)");
   uint32_t client_flags = be32toh(client_flags_be);
   bool no_zeroes = client_flags & kClientFlagNoZeroes;
   (void)client_flags;  // fixed-newstyle bit is expected but not enforced
@@ -153,14 +166,16 @@ bool DoHandshake(int fd, uint64_t size) {
       uint32_t opt;
       uint32_t len;
     } __attribute__((packed)) opt_hdr;
-    if (!ReadFull(fd, &opt_hdr, sizeof(opt_hdr))) return false;
+    if (!ReadFull(fd, &opt_hdr, sizeof(opt_hdr)))
+      return fail("failed to read option header (peer closed mid-negotiation)");
     uint64_t magic = be64toh(opt_hdr.magic);
     uint32_t opt = be32toh(opt_hdr.opt);
     uint32_t len = be32toh(opt_hdr.len);
-    if (magic != kIhaveOpt) return false;
+    if (magic != kIhaveOpt) return fail("bad option magic (not a well-formed NBD client)");
 
     std::vector<char> data(len);
-    if (len > 0 && !ReadFull(fd, data.data(), len)) return false;
+    if (len > 0 && !ReadFull(fd, data.data(), len))
+      return fail("failed to read option payload (peer closed mid-negotiation)");
 
     if (opt == kOptExportName || opt == kOptGo) {
       // Ignore the requested export name/info requests: there is only one
@@ -176,7 +191,7 @@ bool DoHandshake(int fd, uint64_t size) {
           uint32_t len;
         } __attribute__((packed)) rep{htobe64(kRepMagic), htobe32(opt),
                                        htobe32(kRepErrUnsup), 0};
-        if (!WriteFull(fd, &rep, sizeof(rep))) return false;
+        if (!WriteFull(fd, &rep, sizeof(rep))) return fail("failed to write NBD_OPT_GO reply");
         continue;
       }
 
@@ -187,15 +202,16 @@ bool DoHandshake(int fd, uint64_t size) {
                                       htobe16(kTransHasFlags | kTransSendFlush |
                                               kTransSendTrim |
                                               kTransSendWriteZeroes)};
-      if (!WriteFull(fd, &info, sizeof(info))) return false;
+      if (!WriteFull(fd, &info, sizeof(info))) return fail("failed to write export info");
       if (!no_zeroes) {
         char zero_pad[124] = {0};
-        if (!WriteFull(fd, zero_pad, sizeof(zero_pad))) return false;
+        if (!WriteFull(fd, zero_pad, sizeof(zero_pad))) return fail("failed to write zero padding");
       }
       return true;  // handshake done; transmission phase follows
     }
 
     if (opt == kOptAbort) {
+      // Client explicitly asked to abort -- not a failure, so no fail() log.
       struct {
         uint64_t magic;
         uint32_t opt;
@@ -215,7 +231,7 @@ bool DoHandshake(int fd, uint64_t size) {
       uint32_t len;
     } __attribute__((packed)) rep{htobe64(kRepMagic), htobe32(opt),
                                    htobe32(kRepErrUnsup), 0};
-    if (!WriteFull(fd, &rep, sizeof(rep))) return false;
+    if (!WriteFull(fd, &rep, sizeof(rep))) return fail("failed to write unsupported-option reply");
     if (opt == kOptList) continue;  // client may keep negotiating
   }
 }
@@ -244,8 +260,12 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id) {
       uint64_t offset;
       uint32_t length;
     } __attribute__((packed)) req;
-    if (!ReadFull(fd, &req, sizeof(req))) return;
-    if (be32toh(req.magic) != kRequestMagic) return;
+    if (!ReadFull(fd, &req, sizeof(req))) return;  // ordinary peer disconnect -- not logged, happens on every routine VM shutdown
+    if (be32toh(req.magic) != kRequestMagic) {
+      std::fprintf(stderr, "nbd: worker %llu bad request magic, dropping connection\n",
+                   static_cast<unsigned long long>(worker_id));
+      return;
+    }
 
     uint16_t type = be16toh(req.type);
     uint64_t handle = req.handle;  // opaque; echoed back as-is
@@ -288,8 +308,21 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id) {
 void HandleClient(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker_id) {
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  if (DoHandshake(fd, size)) {
-    ServeTransmission(fd, reader, worker_id);
+  // Every connection runs on its own detached thread (see AcceptLoop below);
+  // an uncaught exception here (e.g. from a policy hook under cache.mu)
+  // would otherwise call std::terminate() and take down every VM on every
+  // port with just a generic "terminate called..." line and no chance to
+  // flush the CSV stats log. Contain it to this one connection instead.
+  try {
+    if (DoHandshake(fd, size, worker_id)) {
+      ServeTransmission(fd, reader, worker_id);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "nbd: worker %llu connection crashed: %s\n",
+                 static_cast<unsigned long long>(worker_id), e.what());
+  } catch (...) {
+    std::fprintf(stderr, "nbd: worker %llu connection crashed with unknown exception\n",
+                 static_cast<unsigned long long>(worker_id));
   }
   close(fd);
 }
@@ -633,14 +666,19 @@ int main(int argc, char **argv) {
 
   signal(SIGPIPE, SIG_IGN);
 
-  // Block SIGINT/SIGTERM here, before spawning any threads, so every accept
-  // thread inherits the mask and only the sigwait() below ever receives
-  // them (same pattern ldat.cpp used) -- lets the server log final stats on
-  // a clean shutdown instead of just dying mid-request.
+  // Block SIGINT/SIGTERM/SIGUSR1 here, before spawning any threads, so
+  // every accept thread inherits the mask and only the sigwait() below ever
+  // receives them (same pattern ldat.cpp used) -- lets the server log final
+  // stats on a clean shutdown instead of just dying mid-request. SIGUSR1
+  // additionally requests an on-demand stats snapshot without shutting
+  // down (see `make nbd-stats` / the sigwait loop below) -- useful for
+  // telling "still working" from "stuck" on a server left running
+  // unattended, without the cost of a periodic background timer thread.
   sigset_t wait_set;
   sigemptyset(&wait_set);
   sigaddset(&wait_set, SIGTERM);
   sigaddset(&wait_set, SIGINT);
+  sigaddset(&wait_set, SIGUSR1);
   pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
 
   std::vector<int> listen_fds(cfg.ports.size());
@@ -658,7 +696,16 @@ int main(int argc, char **argv) {
   }
 
   int sig = 0;
-  sigwait(&wait_set, &sig);
+  for (;;) {
+    sigwait(&wait_set, &sig);
+    if (sig == SIGUSR1) {
+      // Snapshot only -- stderr/NBD_SERVER_LOG, not AppendLog, so repeated
+      // snapshots don't append duplicate rows to cfg.log.
+      nbd::PrintStatsLine(reader->get_stats());
+      continue;
+    }
+    break;
+  }
   std::fprintf(stderr, "nbd server: received signal %d, shutting down\n", sig);
 
   const nbd::Stats& stats = reader->get_stats();

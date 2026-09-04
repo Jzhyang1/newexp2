@@ -163,7 +163,7 @@ nbd-run: nbd nbd-config disk
 NBD_PIDFILE ?= disk/nbd_server.pid
 NBD_SERVER_LOG ?= disk/nbd_server.log
 
-.PHONY: nbd-start nbd-stop
+.PHONY: nbd-start nbd-stop nbd-stats
 nbd-start: nbd nbd-config disk
 	@if [ -f $(NBD_PIDFILE) ] && kill -0 "$$(cat $(NBD_PIDFILE))" 2>/dev/null; then \
 		echo "nbd_server already running (pid $$(cat $(NBD_PIDFILE)))"; \
@@ -171,7 +171,14 @@ nbd-start: nbd nbd-config disk
 		nohup $(NBD_BIN) $(NBD_CONFIG) >$(NBD_SERVER_LOG) 2>&1 </dev/null & \
 		echo $$! > $(NBD_PIDFILE); \
 		sleep 1; \
-		echo "nbd_server started (pid $$(cat $(NBD_PIDFILE))), log: $(NBD_SERVER_LOG)"; \
+		if kill -0 "$$(cat $(NBD_PIDFILE))" 2>/dev/null; then \
+			echo "nbd_server started (pid $$(cat $(NBD_PIDFILE))), log: $(NBD_SERVER_LOG)"; \
+		else \
+			echo "nbd_server FAILED to start -- it exited immediately; last lines of $(NBD_SERVER_LOG):" >&2; \
+			tail -n 20 $(NBD_SERVER_LOG) >&2 || true; \
+			rm -f $(NBD_PIDFILE); \
+			exit 1; \
+		fi; \
 	fi
 
 nbd-stop:
@@ -179,6 +186,18 @@ nbd-stop:
 		kill -TERM "$$(cat $(NBD_PIDFILE))" 2>/dev/null || true; \
 		rm -f $(NBD_PIDFILE); \
 		echo "nbd_server stopped (stats appended to $(NBD_LOG))"; \
+	else \
+		echo "nbd_server not running (no $(NBD_PIDFILE))"; \
+	fi
+
+# Requests a one-shot "STATS ..." snapshot (stderr/$(NBD_SERVER_LOG) only --
+# not appended to $(NBD_LOG), to avoid duplicate CSV rows) from an
+# already-running nbd_server, without stopping it. Useful for telling
+# "still working" from "stuck" on a server left running unattended.
+nbd-stats:
+	@if [ -f $(NBD_PIDFILE) ] && kill -0 "$$(cat $(NBD_PIDFILE))" 2>/dev/null; then \
+		kill -USR1 "$$(cat $(NBD_PIDFILE))"; \
+		echo "requested stats snapshot from nbd_server (pid $$(cat $(NBD_PIDFILE))); see $(NBD_SERVER_LOG)"; \
 	else \
 		echo "nbd_server not running (no $(NBD_PIDFILE))"; \
 	fi
@@ -204,6 +223,15 @@ test-protocol: nbd
 # yet.
 VMS_CONFIG ?= kvm/vms.yaml
 
+# vms-wait progress/timeout: heartbeat prints "[Ns] still waiting for: ..."
+# every VMS_WAIT_HEARTBEAT seconds so a long wait isn't indistinguishable
+# from a hung one. VMS_WAIT_TIMEOUT is empty (disabled) by default so a
+# legitimately long benchmark run is never killed by a default -- set it
+# (seconds) when you specifically want vms-wait to give up and exit nonzero
+# instead of blocking forever.
+VMS_WAIT_TIMEOUT ?=
+VMS_WAIT_HEARTBEAT ?= 60
+
 .PHONY: vms-up vms-down vms-wait
 vms-up:
 	python3 kvm/launch.py $(VMS_CONFIG)
@@ -216,7 +244,7 @@ vms-down:
 # kvm/guest/build_image.sh) -- so a driver script knows when it's safe to
 # collect the serial log and run `make vms-down`/`experiment-down`.
 vms-wait:
-	python3 kvm/launch.py $(VMS_CONFIG) --wait
+	python3 kvm/launch.py $(VMS_CONFIG) --wait --wait-heartbeat $(VMS_WAIT_HEARTBEAT) $(if $(VMS_WAIT_TIMEOUT),--wait-timeout $(VMS_WAIT_TIMEOUT))
 
 # Installs qemu-system-x86_64 via whatever package manager this host has, a
 # no-op if it's already on PATH. Uses sudo unless already running as root.

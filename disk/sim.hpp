@@ -200,6 +200,12 @@ public:
     }
 
     const Stats& get_stats() override {
+        // Previously unlocked -- safe only because this was called exactly
+        // once, after sigwait() had already stopped accepting new work at
+        // shutdown. Now also called on demand (SIGUSR1, see nbd.cpp's
+        // main()) while request threads may still be mutating `stats` under
+        // `mu`, so it needs the same lock.
+        std::lock_guard _{mu};
         stats.real_time_elapsed_ns = steady_ns() - sim_start;
         return stats;
     }

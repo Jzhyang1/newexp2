@@ -28,6 +28,7 @@ this, qemu-system-{arch} with KVM available.
 import argparse
 import copy
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -119,6 +120,16 @@ def log_path(vm):
 
 def serial_log_path(vm):
     return os.path.join(vm["log_dir"], f"{vm['name']}.serial.log")
+
+
+def qemu_log_path(vm):
+    # QEMU's own -D logfile -- separate from log_path(vm), which only ever
+    # captures the pre-daemonize invocation's stdout/stderr. -D persists
+    # across -daemonize forking off and detaching from the terminal, so it's
+    # the only place QEMU's own runtime-internal messages can land once
+    # daemonized (best-effort: QEMU still redirects its own stdio internally
+    # on daemonize, so this isn't a guarantee for every runtime message).
+    return os.path.join(vm["log_dir"], f"{vm['name']}.qemu.log")
 
 
 def disk_device_name(index):
@@ -224,6 +235,7 @@ def build_command(vm):
 
     cmd += ["-monitor", f"unix:{monitor_path(vm)},server,nowait"]
     cmd += ["-pidfile", pidfile_path(vm)]
+    cmd += ["-D", qemu_log_path(vm)]
 
     if vm.get("daemonize", True):
         cmd += ["-daemonize"]
@@ -271,13 +283,24 @@ def start_vm(vm, dry_run):
     if vm.get("daemonize", True):
         # -daemonize backgrounds and detaches qemu itself; wait for it to
         # write the pidfile so callers know the launch actually succeeded.
-        subprocess.run(cmd, check=True)
+        # The pre-fork invocation's stdout/stderr are captured to log_path(vm)
+        # (same file the non-daemonize branch below uses) instead of being
+        # inherited, so an early failure (bad drive, bad extra_args, ...)
+        # leaves a record instead of vanishing once qemu daemonizes.
+        log = open(log_path(vm), "ab")
+        try:
+            subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"{vm['name']}: qemu failed to start (exit {e.returncode}) -- see {log_path(vm)}")
+        finally:
+            log.close()
         for _ in range(50):
             if os.path.exists(pidfile):
                 break
             time.sleep(0.1)
         else:
-            sys.exit(f"{vm['name']}: qemu did not write a pidfile within 5s")
+            sys.exit(f"{vm['name']}: qemu did not write a pidfile within 5s -- "
+                     f"check {log_path(vm)} and {qemu_log_path(vm)}")
         pid = open(pidfile).read().strip()
         print(f"{vm['name']}: started (pid {pid})")
     else:
@@ -288,28 +311,71 @@ def start_vm(vm, dry_run):
         print(f"{vm['name']}: started (pid {proc.pid}, log {log_path(vm)})")
 
 
-def wait_vms(vms, interval):
+WORKLOAD_RESULT_RE = re.compile(r"WORKLOAD_RESULT:\s*(PASS|FAIL(?:\s+exit=\d+)?)")
+
+
+def check_workload_result(vm):
+    """Best-effort: scan the serial log for build_image.sh's WORKLOAD_RESULT
+    marker (see kvm/guest/build_image.sh's run.sh). Returns None if there's
+    no serial log to check (e.g. display != none); otherwise the marker
+    found, or a note that none was found (the guest may not have reached/
+    finished workload.service at all -- e.g. an early-boot stall)."""
+    path = serial_log_path(vm)
+    if not os.path.exists(path):
+        return None
+    result = None
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            m = WORKLOAD_RESULT_RE.search(line)
+            if m:
+                result = m.group(0)
+    return result or "no WORKLOAD_RESULT marker found in serial log -- workload may not have run to completion"
+
+
+def wait_vms(vms, interval, timeout=None, heartbeat=30.0):
     """Block until every VM's pidfile is gone or its process has exited --
     e.g. after a guest-initiated poweroff once a baked-in workload finishes
-    (see kvm/guest/build_image.sh's workload.service)."""
-    pending = {vm["name"]: pidfile_path(vm) for vm in vms}
+    (see kvm/guest/build_image.sh's workload.service). Prints a heartbeat
+    every `heartbeat` seconds so a long-but-legitimate wait isn't
+    indistinguishable from a hang, and exits nonzero after `timeout` seconds
+    if given (default: wait forever)."""
+    pending = {vm["name"]: vm for vm in vms}
     if not pending:
         return
     print("waiting for: " + ", ".join(pending))
+    start = time.monotonic()
+    last_heartbeat = start
     while pending:
-        for name, pidfile in list(pending.items()):
+        for name, vm in list(pending.items()):
+            pidfile = pidfile_path(vm)
             if not os.path.exists(pidfile):
                 print(f"{name}: exited (pidfile gone)")
                 del pending[name]
-                continue
-            try:
-                pid = int(open(pidfile).read().strip())
-                os.kill(pid, 0)
-            except (ValueError, ProcessLookupError, PermissionError):
-                print(f"{name}: exited")
-                del pending[name]
-        if pending:
-            time.sleep(interval)
+            else:
+                try:
+                    pid = int(open(pidfile).read().strip())
+                    os.kill(pid, 0)
+                except (ValueError, ProcessLookupError, PermissionError):
+                    print(f"{name}: exited")
+                    del pending[name]
+                else:
+                    continue
+            note = check_workload_result(vm)
+            if note:
+                tag = "warn" if "FAIL" in note or "no WORKLOAD_RESULT" in note else "ok"
+                print(f"  [{tag}] {name}: {note}")
+        if not pending:
+            break
+        elapsed = time.monotonic() - start
+        if timeout is not None and elapsed >= timeout:
+            sys.exit(
+                f"timed out after {timeout:.0f}s waiting for: {', '.join(pending)} -- still running; "
+                f"check their serial logs (e.g. {serial_log_path(next(iter(pending.values())))})"
+            )
+        if time.monotonic() - last_heartbeat >= heartbeat:
+            print(f"[{elapsed:.0f}s] still waiting for: {', '.join(pending)}")
+            last_heartbeat = time.monotonic()
+        time.sleep(interval)
 
 
 def stop_vm(vm, force):
@@ -344,6 +410,11 @@ def main():
                               "(e.g. after a guest-initiated poweroff), then exit")
     parser.add_argument("--wait-interval", type=float, default=2.0,
                          help="seconds between pidfile checks with --wait (default: 2)")
+    parser.add_argument("--wait-timeout", type=float, default=None,
+                         help="give up and exit nonzero after this many seconds with --wait "
+                              "(default: wait forever)")
+    parser.add_argument("--wait-heartbeat", type=float, default=30.0,
+                         help="seconds between progress messages while waiting (default: 30)")
     args = parser.parse_args()
 
     vms = load_config(args.config)
@@ -353,7 +424,7 @@ def main():
             sys.exit(f"no VM named {args.only!r} in {args.config}")
 
     if args.wait:
-        wait_vms(vms, args.wait_interval)
+        wait_vms(vms, args.wait_interval, timeout=args.wait_timeout, heartbeat=args.wait_heartbeat)
         return
 
     for vm in vms:
