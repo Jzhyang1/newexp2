@@ -80,7 +80,8 @@ GUEST_ARCH ?= amd64
 GUEST_MIRROR ?= http://deb.debian.org/debian
 # Sized for the default GUEST_YCSB=1 dataset (~11.5G) plus base OS/JRE
 # (~1G) and ext4 overhead -- drop back to 3G if you set GUEST_YCSB=0 and
-# use the plain faiss_bench.py workload instead.
+# use the plain faiss_bench.py workload instead, or ~8G for GUEST_GUPS=1's
+# default table size (GUEST_GUPS_TABLE_MB) with GUEST_YCSB=0.
 GUEST_ROOTFS_SIZE ?= 16G
 WORKLOAD_SCRIPT ?= kvm/guest/workloads/ycsb_bench.py
 GUEST_KERNEL ?= disk/data/vmlinuz
@@ -107,6 +108,23 @@ GUEST_YCSB_OPERATIONS ?= 200000
 GUEST_YCSB_DISTRIBUTION ?= zipfian
 GUEST_YCSB_THREADS ?= 4
 
+# Bakes a disk-based analogue of the HPC Challenge "GUPS" (Giant Updates
+# Per Second) RandomAccess benchmark: a zero-filled table written for real
+# (not left sparse -- a sparse hole would let the guest's own ext4 resolve
+# reads as all-zero in-kernel without ever reaching nbd_server) at build
+# time, then read at random block-sized offsets at boot by
+# kvm/guest/workloads/gups_bench.py. Only the read half of GUPS's usual
+# read-XOR-write update runs at boot, same reasoning as GUEST_YCSB above --
+# a write from a running guest never reaches $(DISK_IMG) anyway. Off by
+# default; independent of GUEST_YCSB (set WORKLOAD_SCRIPT to pick which one
+# actually runs at boot -- both datasets can be baked into the same image).
+# GUEST_GUPS_TABLE_MB is chosen to land well above kvm/vms.yaml's guest
+# `memory: 4G` for the same reason as GUEST_YCSB_RECORDS.
+GUEST_GUPS ?= 0
+GUEST_GUPS_TABLE_MB ?= 6144
+GUEST_GUPS_UPDATES ?= 2000000
+GUEST_GUPS_BLOCK_SIZE ?= 4096
+
 # FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
 # already exists -- default (0) is the fast path in build_image.sh: if
 # DISK_IMG is already there, it loop-mounts it and rsyncs WORKLOAD_SCRIPT
@@ -126,6 +144,8 @@ guest-image:
 	  YCSB_FIELD_COUNT=$(GUEST_YCSB_FIELD_COUNT) YCSB_FIELD_LENGTH=$(GUEST_YCSB_FIELD_LENGTH) \
 	  YCSB_WORKLOAD=$(GUEST_YCSB_WORKLOAD) YCSB_OPERATIONS=$(GUEST_YCSB_OPERATIONS) \
 	  YCSB_DISTRIBUTION=$(GUEST_YCSB_DISTRIBUTION) YCSB_THREADS=$(GUEST_YCSB_THREADS) \
+	  GUPS_ENABLE=$(GUEST_GUPS) GUPS_TABLE_MB=$(GUEST_GUPS_TABLE_MB) \
+	  GUPS_UPDATES=$(GUEST_GUPS_UPDATES) GUPS_BLOCK_SIZE=$(GUEST_GUPS_BLOCK_SIZE) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh
 

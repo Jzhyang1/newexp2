@@ -11,6 +11,13 @@
 # here so kvm/guest/workloads/ycsb_bench.py has a real on-disk dataset to
 # run reads against at boot.
 #
+# If GUPS_ENABLE=1, also writes a real (non-sparse) zero-filled table file
+# under /opt/workload here, so kvm/guest/workloads/gups_bench.py -- a
+# disk-based analogue of the HPC Challenge "GUPS" RandomAccess benchmark --
+# has a real on-disk table to issue random-offset reads against at boot.
+# Independent of YCSB_ENABLE; both datasets can be baked into the same
+# image at once (WORKLOAD_SCRIPT picks which one actually runs at boot).
+#
 # All writes here go straight to ROOTFS_IMG on the host filesystem via
 # debootstrap/chroot -- a completely different path from nbd_server, which
 # discards every write a *running* guest makes to this same file (see
@@ -58,6 +65,18 @@ YCSB_WORKLOAD=${YCSB_WORKLOAD:-workloadc}
 YCSB_OPERATIONS=${YCSB_OPERATIONS:-200000}
 YCSB_DISTRIBUTION=${YCSB_DISTRIBUTION:-zipfian}
 YCSB_THREADS=${YCSB_THREADS:-4}
+
+# Optional: bake a disk-based GUPS RandomAccess table under /opt, so
+# kvm/guest/workloads/gups_bench.py has something real to issue random
+# reads against at boot. See the Makefile's GUEST_GUPS_* vars for how these
+# are set; the table write (like YCSB's load phase) happens here, at build
+# time, directly against $ROOTFS_IMG -- never at boot, where writes would
+# land on the guest's volatile tmpfs and vanish instead of exercising
+# nbd_server.
+GUPS_ENABLE=${GUPS_ENABLE:-0}
+GUPS_TABLE_MB=${GUPS_TABLE_MB:-6144}
+GUPS_UPDATES=${GUPS_UPDATES:-2000000}
+GUPS_BLOCK_SIZE=${GUPS_BLOCK_SIZE:-4096}
 
 if [[ $EUID -ne 0 ]]; then
     echo "build_image.sh must run as root (debootstrap/mount/chroot need it)" >&2
@@ -179,6 +198,25 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
 EOF
 fi
 
+if [[ "$GUPS_ENABLE" == "1" ]]; then
+    # Written with real zero bytes rather than left as a sparse hole: a
+    # hole would let the *guest's own* ext4 resolve reads as all-zero
+    # in-kernel without ever issuing a block I/O request, so nbd_server
+    # (and the cache/prefetch policy under test) would never see the
+    # access at all -- same reasoning as YCSB's real SQLite rows above.
+    GUPS_TABLE=/opt/workload/gups_table.bin
+    chroot "$MNT" dd if=/dev/zero of="$GUPS_TABLE" bs=1M count="$GUPS_TABLE_MB" status=none
+
+    cat > "$MNT/opt/workload/gups_config.json" <<EOF
+{
+  "table_path": "${GUPS_TABLE}",
+  "table_size_bytes": $((GUPS_TABLE_MB * 1024 * 1024)),
+  "updates": ${GUPS_UPDATES},
+  "block_size": ${GUPS_BLOCK_SIZE}
+}
+EOF
+fi
+
 fi # SYNC_ONLY
 
 mkdir -p "$MNT/opt/workload"
@@ -276,4 +314,7 @@ echo "initrd:  $INITRD_OUT"
 echo "workload: $WORKLOAD_SCRIPT -> /opt/workload/run.py (runs once per boot via workload.service)"
 if [[ "$YCSB_ENABLE" == "1" ]]; then
     echo "ycsb: ${YCSB_RECORDS} records loaded into /opt/workload/ycsb.db, ${YCSB_WORKLOAD} read at boot (see /opt/workload/ycsb_config.json)"
+fi
+if [[ "$GUPS_ENABLE" == "1" ]]; then
+    echo "gups: ${GUPS_TABLE_MB}MB table baked at /opt/workload/gups_table.bin, ${GUPS_UPDATES} random ${GUPS_BLOCK_SIZE}-byte reads at boot (see /opt/workload/gups_config.json)"
 fi

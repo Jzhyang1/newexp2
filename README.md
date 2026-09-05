@@ -120,9 +120,12 @@ extracts the kernel/initrd `kvm/vms.yaml` boots via `-kernel`/`-initrd`.
 Override `WORKLOAD_SCRIPT` to bake in a different script (default
 [`kvm/guest/workloads/ycsb_bench.py`](kvm/guest/workloads/ycsb_bench.py) —
 see below; [`kvm/guest/workloads/faiss_bench.py`](kvm/guest/workloads/faiss_bench.py),
-a CPU-heavy FAISS HNSW index-build-and-search benchmark, is still available
-by setting `WORKLOAD_SCRIPT` explicitly); its stdout lands on the guest's
-serial console, logged to `<log_dir>/<name>.serial.log`.
+a CPU-heavy FAISS HNSW index-build-and-search benchmark, and
+[`kvm/guest/workloads/gups_bench.py`](kvm/guest/workloads/gups_bench.py), a
+disk-based GUPS/RandomAccess benchmark — see [GUPS workload](#gups-workload)
+below — are still available by setting `WORKLOAD_SCRIPT` explicitly); its
+stdout lands on the guest's serial console, logged to
+`<log_dir>/<name>.serial.log`.
 
 This writes straight to `disk/data/nbd_disk.img` via `debootstrap`/`chroot`
 on the host — a completely different path from `nbd_server`, which discards
@@ -154,6 +157,28 @@ Makefile vars — see the Makefile's `guest-image` section for the full list
 count, YCSB/sqlite-jdbc versions). Set `GUEST_YCSB=0` to skip all of this
 and use a smaller/faster `GUEST_ROOTFS_SIZE` with `faiss_bench.py` instead.
 
+#### GUPS workload
+
+Set `GUEST_GUPS=1` to also bake in a disk-based analogue of the HPC
+Challenge ["GUPS" (RandomAccess)](https://hpcchallenge.org/) benchmark: at
+build time a `GUEST_GUPS_TABLE_MB`-megabyte table (default 6144, sized to
+land well above the guest's 4G RAM, same reasoning as `GUEST_YCSB_RECORDS`)
+is written — for real, not left sparse, since a sparse hole would let the
+guest's own ext4 resolve reads as all-zero in-kernel without ever reaching
+`nbd_server` — to `/opt/workload/gups_table.bin`. At boot,
+`kvm/guest/workloads/gups_bench.py` issues `GUEST_GUPS_UPDATES` (default
+2,000,000) pseudo-random `GUEST_GUPS_BLOCK_SIZE`-byte (default 4096) reads
+against that table and reports the achieved GUPS rate; only the read half
+of GUPS's usual read-XOR-write update runs, for the same read-only-root
+reason as YCSB above. `GUEST_GUPS` is independent of `GUEST_YCSB` — both
+datasets can be baked into the same image at once, with `WORKLOAD_SCRIPT`
+picking which one actually runs at boot:
+
+```bash
+make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/gups_bench.py \
+  GUEST_YCSB=0 GUEST_GUPS=1 GUEST_ROOTFS_SIZE=8G
+```
+
 ## Build and Run
 
 Everything below is Linux-only (`disk/nbd.cpp` needs `<endian.h>`;
@@ -181,7 +206,11 @@ make guest-image
    (or `make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/faiss_bench.py
    GUEST_YCSB=0 GUEST_ROOTFS_SIZE=3G` for the smaller/faster FAISS-only
    workload instead — see [YCSB workload](#ycsb-workload-default) above for
-   the full set of `GUEST_YCSB_*` tunables)
+   the full set of `GUEST_YCSB_*` tunables; or
+   `make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/gups_bench.py
+   GUEST_YCSB=0 GUEST_GUPS=1 GUEST_ROOTFS_SIZE=8G` for the GUPS/RandomAccess
+   workload — see [GUPS workload](#gups-workload) above for the
+   `GUEST_GUPS_*` tunables)
 
 2. **Build and start the disk server** — builds `nbd_server`, generates
    `disk/nbd.yaml` from the `NBD_*` variables, and runs in the foreground:
