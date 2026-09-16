@@ -1,7 +1,6 @@
-bin/
-logs/
-*.bin
-disk/data/
-disk/nbd_server.pid
-disk/nbd_server.log
-__pycache__/
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
+!kvm/
+!kvm/guest/
+!kvm/guest/workloads/
+!kvm/guest/workloads/thesios_bench.py

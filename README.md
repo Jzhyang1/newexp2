@@ -179,6 +179,31 @@ make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/gups_bench.py \
   GUEST_YCSB=0 GUEST_GUPS=1 GUEST_ROOTFS_SIZE=8G
 ```
 
+#### Thesios workload
+
+Set `GUEST_THESIOS=1` and select
+[`kvm/guest/workloads/thesios_bench.py`](kvm/guest/workloads/thesios_bench.py)
+to download and bake one public Thesios CSV shard, then replay its `READ`
+requests against the guest's raw root block device. The default shard is
+`cluster1_16TB/20240115/data-00000-of-00100`; override
+`GUEST_THESIOS_TRACE_URL` for another shard and
+`GUEST_THESIOS_MAX_REQUESTS` to bound the run. Thesios `file_offset` values
+are file-relative, so this replay preserves the recorded offsets as provided
+and requires an image/device large enough for them. The default cluster is
+16 TB, so use a sparse 16-TB root image when replaying it:
+
+```bash
+make guest-image \
+   WORKLOAD_SCRIPT=kvm/guest/workloads/thesios_bench.py \
+   GUEST_YCSB=0 GUEST_THESIOS=1 GUEST_ROOTFS_SIZE=16T \
+   GUEST_THESIOS_MAX_REQUESTS=1000000
+```
+
+Writes and malformed rows are skipped. The selected shard is downloaded at
+image-build time, so the guest does not need network access at boot. The
+dataset is published under CC-BY by the
+[Thesios project](https://github.com/google-research-datasets/thesios).
+
 ## Build and Run
 
 Everything below is Linux-only (`disk/nbd.cpp` needs `<endian.h>`;

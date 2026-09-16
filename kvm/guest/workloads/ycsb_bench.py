@@ -29,7 +29,7 @@ classpath = ":".join([
     f"{ycsb_home}/jdbc-binding/lib/*",
 ])
 cmd = [
-    "java", "-cp", classpath, "site.ycsb.Client", "-t",
+    "java", "-Djava.io.tmpdir=/var/tmp", "-cp", classpath, "site.ycsb.Client", "-t",
     "-db", "site.ycsb.db.JdbcDBClient",
     "-P", f"{ycsb_home}/workloads/{cfg['workload']}",
     "-p", "db.driver=org.sqlite.JDBC",

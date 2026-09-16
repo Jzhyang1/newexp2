@@ -9,7 +9,7 @@ miss_latency_ns: 300000
 warmup: 0
 
 evict_policy: lru
-prefetch_policy: none
+prefetch_policy: readahead
 
 log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv

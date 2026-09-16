@@ -18,6 +18,9 @@
 # Independent of YCSB_ENABLE; both datasets can be baked into the same
 # image at once (WORKLOAD_SCRIPT picks which one actually runs at boot).
 #
+# If THESIOS_ENABLE=1, also downloads one public Thesios CSV shard and writes
+# its metadata under /opt/workload for thesios_bench.py to replay at boot.
+#
 # All writes here go straight to ROOTFS_IMG on the host filesystem via
 # debootstrap/chroot -- a completely different path from nbd_server, which
 # discards every write a *running* guest makes to this same file (see
@@ -78,6 +81,14 @@ GUPS_TABLE_MB=${GUPS_TABLE_MB:-6144}
 GUPS_UPDATES=${GUPS_UPDATES:-2000000}
 GUPS_BLOCK_SIZE=${GUPS_BLOCK_SIZE:-4096}
 
+# Optional: bake one public Thesios CSV shard into /opt/workload. The trace
+# itself is downloaded on the host, not from inside the guest, so boot does
+# not depend on network access. See the Makefile's GUEST_THESIOS_* vars.
+THESIOS_ENABLE=${THESIOS_ENABLE:-0}
+THESIOS_TRACE_URL=${THESIOS_TRACE_URL:-https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100}
+THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-1000000}
+THESIOS_DEVICE=${THESIOS_DEVICE:-/dev/vda}
+
 if [[ $EUID -ne 0 ]]; then
     echo "build_image.sh must run as root (debootstrap/mount/chroot need it)" >&2
     exit 1
@@ -91,10 +102,17 @@ fi
 
 REQUIRED_TOOLS=(losetup chroot rsync)
 [[ "$SYNC_ONLY" == "1" ]] || REQUIRED_TOOLS+=(debootstrap mkfs.ext4)
+[[ "$THESIOS_ENABLE" == "1" ]] && REQUIRED_TOOLS+=(curl)
 for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 [[ -f "$WORKLOAD_SCRIPT" ]] || { echo "workload script not found: $WORKLOAD_SCRIPT" >&2; exit 1; }
+
+THESIOS_TMP=""
+if [[ "$THESIOS_ENABLE" == "1" ]]; then
+    THESIOS_TMP=$(mktemp)
+    curl -fsSL --retry 3 -o "$THESIOS_TMP" "$THESIOS_TRACE_URL"
+fi
 
 MNT=$(mktemp -d)
 LOOP=""
@@ -106,6 +124,7 @@ cleanup() {
     mountpoint -q "$MNT/sys" && umount "$MNT/sys"
     mountpoint -q "$MNT" && umount "$MNT"
     [[ -n "$LOOP" ]] && losetup -d "$LOOP"
+    [[ -n "$THESIOS_TMP" ]] && rm -f "$THESIOS_TMP"
     rmdir "$MNT"
 }
 trap cleanup EXIT
@@ -220,6 +239,18 @@ fi
 fi # SYNC_ONLY
 
 mkdir -p "$MNT/opt/workload"
+if [[ "$THESIOS_ENABLE" == "1" ]]; then
+        THESIOS_TRACE=/opt/workload/thesios_trace.csv
+        cp "$THESIOS_TMP" "$MNT${THESIOS_TRACE}"
+        cat > "$MNT/opt/workload/thesios_config.json" <<EOF
+{
+    "trace_path": "${THESIOS_TRACE}",
+    "device_path": "${THESIOS_DEVICE}",
+    "max_requests": ${THESIOS_MAX_REQUESTS},
+    "source_url": "${THESIOS_TRACE_URL}"
+}
+EOF
+fi
 rsync -a "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 
 # Powers the guest off once the workload exits (success or failure) so that
@@ -282,6 +313,14 @@ if [[ ! -f "$MNT/opt/workload/run.py" ]]; then
     echo "build_image.sh: FAILED -- /opt/workload/run.py (from WORKLOAD_SCRIPT=$WORKLOAD_SCRIPT) is missing" >&2
     exit 1
 fi
+if [[ "$THESIOS_ENABLE" == "1" && ! -f "$MNT/opt/workload/thesios_config.json" ]]; then
+    echo "build_image.sh: FAILED -- Thesios configuration is missing" >&2
+    exit 1
+fi
+if [[ "$THESIOS_ENABLE" == "1" && ! -s "$MNT/opt/workload/thesios_trace.csv" ]]; then
+    echo "build_image.sh: FAILED -- downloaded Thesios trace is empty" >&2
+    exit 1
+fi
 
 if [[ "$SYNC_ONLY" != "1" ]]; then
 
@@ -317,4 +356,7 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
 fi
 if [[ "$GUPS_ENABLE" == "1" ]]; then
     echo "gups: ${GUPS_TABLE_MB}MB table baked at /opt/workload/gups_table.bin, ${GUPS_UPDATES} random ${GUPS_BLOCK_SIZE}-byte reads at boot (see /opt/workload/gups_config.json)"
+fi
+if [[ "$THESIOS_ENABLE" == "1" ]]; then
+    echo "thesios: $(basename "$THESIOS_TRACE_URL") baked at /opt/workload/thesios_trace.csv, up to ${THESIOS_MAX_REQUESTS} requests at boot (see /opt/workload/thesios_config.json)"
 fi

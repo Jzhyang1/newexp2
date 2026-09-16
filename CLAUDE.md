@@ -69,6 +69,7 @@ asked to "run the tests," say there aren't any.
 | `kvm/vms.yaml`, `kvm/vms.example.yaml` | VM configs — `vms.yaml` is the real default, `.example` is a schema reference |
 | `kvm/guest/build_image.sh` | Bakes a real bootable Debian guest with a workload (`make guest-image`) |
 | `kvm/guest/workloads/faiss_bench.py` | Default baked-in workload (CPU-heavy FAISS benchmark) |
+| `kvm/guest/workloads/thesios_bench.py` | Replays a baked Thesios CSV shard as raw block-device reads |
 
 ## Naming conventions actually observed
 

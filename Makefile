@@ -97,14 +97,14 @@ GUEST_INITRD ?= disk/data/initrd.img
 # to land well above kvm/vms.yaml's guest `memory: 4G` -- otherwise the
 # guest's own page cache would absorb repeats after the first pass and
 # nbd_server's cache/prefetch policies would rarely see a real miss.
-GUEST_YCSB ?= 1
+GUEST_YCSB ?= 0
 GUEST_YCSB_VERSION ?= 0.17.0
 SQLITE_JDBC_VERSION ?= 3.46.1.3
 GUEST_YCSB_RECORDS ?= 10000000
 GUEST_YCSB_FIELD_COUNT ?= 10
 GUEST_YCSB_FIELD_LENGTH ?= 100
 GUEST_YCSB_WORKLOAD ?= workloadc
-GUEST_YCSB_OPERATIONS ?= 200000
+GUEST_YCSB_OPERATIONS ?= 2000000
 GUEST_YCSB_DISTRIBUTION ?= zipfian
 GUEST_YCSB_THREADS ?= 4
 
@@ -123,7 +123,16 @@ GUEST_YCSB_THREADS ?= 4
 GUEST_GUPS ?= 0
 GUEST_GUPS_TABLE_MB ?= 6144
 GUEST_GUPS_UPDATES ?= 2000000
-GUEST_GUPS_BLOCK_SIZE ?= 4096
+GUEST_GUPS_BLOCK_SIZE ?= 512
+
+# Bakes one public Thesios CSV shard into the image and replays its READ
+# requests against the guest's raw root block device. Thesios file offsets are
+# relative to the source file, so use a root image at least as large as the
+# selected cluster's disk (16T for the default shard).
+GUEST_THESIOS ?= 0
+GUEST_THESIOS_TRACE_URL ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100
+GUEST_THESIOS_MAX_REQUESTS ?= 1000000
+GUEST_THESIOS_DEVICE ?= /dev/vda
 
 # FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
 # already exists -- default (0) is the fast path in build_image.sh: if
@@ -146,6 +155,8 @@ guest-image:
 	  YCSB_DISTRIBUTION=$(GUEST_YCSB_DISTRIBUTION) YCSB_THREADS=$(GUEST_YCSB_THREADS) \
 	  GUPS_ENABLE=$(GUEST_GUPS) GUPS_TABLE_MB=$(GUEST_GUPS_TABLE_MB) \
 	  GUPS_UPDATES=$(GUEST_GUPS_UPDATES) GUPS_BLOCK_SIZE=$(GUEST_GUPS_BLOCK_SIZE) \
+	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URL=$(GUEST_THESIOS_TRACE_URL) \
+	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh
 
@@ -244,9 +255,11 @@ test-protocol: nbd
 # as a page-access-density-over-time heatmap PNG. Needs matplotlib
 # (pip install matplotlib). Override the default ./logs/nbd_access.csv by
 # passing a path directly to disk/heatmap.py instead.
+HEATMAP_MAX_ACCESSES ?= 5000000
+
 .PHONY: heatmap
 heatmap:
-	python3 disk/heatmap.py
+	python3 disk/heatmap.py --max-accesses $(HEATMAP_MAX_ACCESSES)
 
 # ---------------------------------------------------------------------------
 # Stage 3: the VMs. Wraps kvm/launch.py, which reads a YAML config (see
@@ -257,7 +270,7 @@ heatmap:
 # `nbd.host`/`nbd.port` entries need to differ from the defaults.
 #
 # Needs qemu-system-x86_64 on PATH -- `make install-qemu` if it isn't there
-# yet.
+# yet.Fopt
 VMS_CONFIG ?= kvm/vms.yaml
 
 # vms-wait progress/timeout: heartbeat prints "[Ns] still waiting for: ..."

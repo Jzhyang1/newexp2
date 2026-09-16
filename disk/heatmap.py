@@ -17,6 +17,7 @@ Usage:
     heatmap.py path/to/access_log.csv
     heatmap.py --out heatmap.png --time-bins 300 --page-bins 300
     heatmap.py --worker-id 1
+    heatmap.py --max-accesses 0              # include all accesses
 
 Requires matplotlib: pip install matplotlib
 """
@@ -36,11 +37,13 @@ SECTOR_SIZE = 512
 DEFAULT_ACCESS_LOG = "./logs/nbd_access.csv"
 
 
-def load_rows(path, worker_id):
+def load_rows(path, worker_id, max_accesses):
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
     if worker_id is not None:
         rows = [r for r in rows if r["worker_id"] == str(worker_id)]
+    if max_accesses:
+        rows = rows[:max_accesses]
     if not rows:
         sys.exit(f"{path}: no matching rows found")
     return rows
@@ -77,9 +80,11 @@ def main():
                      help="number of buckets along the page axis (default: 200)")
     ap.add_argument("--worker-id", type=int, default=None,
                      help="restrict to one worker_id (default: combine all workers)")
+    ap.add_argument("--max-accesses", type=int, default=50000,
+                     help="number of accesses to include (default: 50000; 0: all)")
     args = ap.parse_args()
 
-    rows = load_rows(args.access_log, args.worker_id)
+    rows = load_rows(args.access_log, args.worker_id, args.max_accesses)
     grid, min_page, max_page = build_heatmap(rows, args.time_bins, args.page_bins)
 
     fig, ax = plt.subplots(figsize=(10, 6))
