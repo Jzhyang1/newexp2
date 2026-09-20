@@ -272,6 +272,9 @@ heatmap:
 # Needs qemu-system-x86_64 on PATH -- `make install-qemu` if it isn't there
 # yet.Fopt
 VMS_CONFIG ?= kvm/vms.yaml
+# Maximum random delay in seconds between starting VMs. Set RANDOM=0 for
+# deterministic back-to-back startup, e.g. `make experiment RANDOM=0`.
+RANDOM ?= 1
 
 # vms-wait progress/timeout: heartbeat prints "[Ns] still waiting for: ..."
 # every VMS_WAIT_HEARTBEAT seconds so a long wait isn't indistinguishable
@@ -284,7 +287,7 @@ VMS_WAIT_HEARTBEAT ?= 60
 
 .PHONY: vms-up vms-down vms-wait
 vms-up:
-	python3 kvm/launch.py $(VMS_CONFIG)
+	python3 kvm/launch.py $(VMS_CONFIG) --random $(RANDOM)
 
 vms-down:
 	python3 kvm/launch.py $(VMS_CONFIG) --stop

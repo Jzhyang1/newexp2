@@ -28,6 +28,7 @@ this, qemu-system-{arch} with KVM available.
 import argparse
 import copy
 import os
+import random
 import re
 import shlex
 import shutil
@@ -71,6 +72,7 @@ DEFAULTS = {
     "kernel": None,
     "initrd": None,
     "append": None,
+    "workload_args": {},
     "extra_drives": [],
     "extra_args": [],
 }
@@ -220,7 +222,15 @@ def build_command(vm):
         if vm.get("initrd"):
             cmd += ["-initrd", vm["initrd"]]
         if vm.get("append"):
-            cmd += ["-append", vm["append"]]
+            kernel_args = [vm["append"]]
+            for key, value in vm.get("workload_args", {}).items():
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(key)):
+                    sys.exit(f"{vm['name']}: invalid workload_args key {key!r}")
+                value = str(value)
+                if any(char.isspace() for char in value):
+                    sys.exit(f"{vm['name']}: workload_args values cannot contain whitespace")
+                kernel_args.append(f"{key}={value}")
+            cmd += ["-append", " ".join(kernel_args)]
 
     display = vm.get("display", "none")
     if display == "none":
@@ -403,6 +413,8 @@ def main():
     parser.add_argument("config", help="path to a YAML config file describing the VMs to launch")
     parser.add_argument("--only", metavar="NAME", help="only act on the VM with this name")
     parser.add_argument("--dry-run", action="store_true", help="print qemu-system commands instead of running them")
+    parser.add_argument("--random", type=float, default=1.0, metavar="SECONDS",
+                        help="maximum random delay between starting VMs (default: 1)")
     parser.add_argument("--stop", action="store_true", help="stop VMs instead of starting them")
     parser.add_argument("--force", action="store_true", help="with --stop, SIGKILL instead of SIGTERM")
     parser.add_argument("--wait", action="store_true",
@@ -416,6 +428,8 @@ def main():
     parser.add_argument("--wait-heartbeat", type=float, default=30.0,
                          help="seconds between progress messages while waiting (default: 30)")
     args = parser.parse_args()
+    if args.random < 0:
+        parser.error("--random must be non-negative")
 
     vms = load_config(args.config)
     if args.only:
@@ -432,6 +446,7 @@ def main():
             stop_vm(vm, args.force)
         else:
             start_vm(vm, args.dry_run)
+            time.sleep(random.uniform(0, args.random))
 
 
 if __name__ == "__main__":
