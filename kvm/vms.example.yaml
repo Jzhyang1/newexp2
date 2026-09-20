@@ -11,6 +11,10 @@
 # To boot a real guest that runs a workload script on boot instead of a
 # blank disk, see kvm/vms.yaml's `kernel`/`initrd`/`append` and `make
 # guest-image` (kvm/guest/build_image.sh).
+# `workload_args` adds per-VM key=value parameters to the guest's
+# /proc/cmdline. Build with WORKLOAD_SCRIPT=kvm/guest/workloads/dispatch.py
+# to select one of the bundled benchmarks per VM or tune its parameters
+# without rebuilding the guest image.
 
 defaults:
   qemu_binary: qemu-system-x86_64
@@ -35,6 +39,9 @@ vms:
 
   - name: vm1
     memory: 4G
+    workload_args:
+      workload: gups
+      updates: 4000000
     disks:
       - nbd: {host: 10.0.0.5, port: 10810, export: vm1-root}   # -> /dev/vda
     network:
@@ -42,6 +49,9 @@ vms:
 
   - name: vm2
     vcpus: 4
+    workload_args:
+      workload: scan
+      scan_bytes: 12G
     disks:
       - nbd: {host: 10.0.0.6, port: 10809, export: vm2-root}   # -> /dev/vda
       - nbd: {host: 10.0.0.6, port: 10811, export: vm2-scratch} # -> /dev/vdb
