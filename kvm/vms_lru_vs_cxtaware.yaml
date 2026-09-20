@@ -29,7 +29,7 @@ defaults:
   qemu_binary: qemu-system-x86_64
   kvm: true          # set true on a host with /dev/kvm access -- the YCSB JVM (and faiss/numpy, if you switch back) is much slower under TCG emulation
   vcpus: 4
-  memory: 4G
+  memory: 2G
   run_dir: /tmp/kvm-launch
   log_dir: /tmp/kvm-launch
   daemonize: true

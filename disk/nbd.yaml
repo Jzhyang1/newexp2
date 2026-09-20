@@ -3,7 +3,7 @@ source: local
 file: disk/data/nbd_disk.img
 ports: [10809]
 
-capacity: 4096
+capacity: 1024
 hit_latency_ns: 30000
 miss_latency_ns: 300000
 warmup: 0
