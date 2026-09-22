@@ -80,6 +80,7 @@ GUPS_ENABLE=${GUPS_ENABLE:-0}
 GUPS_TABLE_MB=${GUPS_TABLE_MB:-6144}
 GUPS_UPDATES=${GUPS_UPDATES:-2000000}
 GUPS_BLOCK_SIZE=${GUPS_BLOCK_SIZE:-4096}
+GUPS_DIRECT_IO=${GUPS_DIRECT_IO:-0}
 
 # Optional: bake one public Thesios CSV shard into /opt/workload. The trace
 # itself is downloaded on the host, not from inside the guest, so boot does
@@ -225,20 +226,22 @@ if [[ "$GUPS_ENABLE" == "1" ]]; then
     # access at all -- same reasoning as YCSB's real SQLite rows above.
     GUPS_TABLE=/opt/workload/gups_table.bin
     chroot "$MNT" dd if=/dev/zero of="$GUPS_TABLE" bs=1M count="$GUPS_TABLE_MB" status=none
-
-    cat > "$MNT/opt/workload/gups_config.json" <<EOF
-{
-  "table_path": "${GUPS_TABLE}",
-  "table_size_bytes": $((GUPS_TABLE_MB * 1024 * 1024)),
-  "updates": ${GUPS_UPDATES},
-  "block_size": ${GUPS_BLOCK_SIZE}
-}
-EOF
 fi
 
 fi # SYNC_ONLY
 
 mkdir -p "$MNT/opt/workload"
+if [[ "$GUPS_ENABLE" == "1" ]]; then
+        cat > "$MNT/opt/workload/gups_config.json" <<EOF
+{
+    "table_path": "/opt/workload/gups_table.bin",
+    "table_size_bytes": $((GUPS_TABLE_MB * 1024 * 1024)),
+    "updates": ${GUPS_UPDATES},
+    "block_size": ${GUPS_BLOCK_SIZE},
+    "direct_io": ${GUPS_DIRECT_IO}
+}
+EOF
+fi
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
         THESIOS_TRACE=/opt/workload/thesios_trace.csv
         cp "$THESIOS_TMP" "$MNT${THESIOS_TRACE}"

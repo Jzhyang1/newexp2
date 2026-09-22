@@ -16,6 +16,8 @@ actually baked into the image, instead of duplicating those numbers in two
 places.
 """
 import json
+import mmap
+import os
 import random
 import time
 
@@ -26,6 +28,7 @@ table_path = cfg["table_path"]
 table_size = cfg["table_size_bytes"]
 block_size = cfg["block_size"]
 updates = cfg["updates"]
+direct_io = bool(cfg.get("direct_io", 0))
 
 # Last full block_size-aligned slot the table can serve a read from.
 last_slot = table_size // block_size - 1
@@ -37,11 +40,26 @@ print(
 )
 
 start = time.time()
-with open(table_path, "rb", buffering=0) as f:
-    for _ in range(updates):
-        slot = random.randint(0, last_slot)
-        f.seek(slot * block_size)
-        f.read(block_size)
+if direct_io:
+    # mmap allocations are page-aligned, satisfying O_DIRECT's user-buffer
+    # alignment requirement while keeping the existing random offsets.
+    fd = os.open(table_path, os.O_RDONLY | os.O_DIRECT)
+    buffer = mmap.mmap(-1, block_size)
+    try:
+        for _ in range(updates):
+            slot = random.randint(0, last_slot)
+            if os.preadv(fd, [buffer], slot * block_size) != block_size:
+                raise IOError("short O_DIRECT read")
+    finally:
+        buffer.close()
+        os.close(fd)
+else:
+    with open(table_path, "rb", buffering=0) as f:
+        for _ in range(updates):
+            slot = random.randint(0, last_slot)
+            f.seek(slot * block_size)
+            if len(f.read(block_size)) != block_size:
+                raise IOError("short read")
 elapsed = time.time() - start
 
 gups = updates / elapsed / 1e9
