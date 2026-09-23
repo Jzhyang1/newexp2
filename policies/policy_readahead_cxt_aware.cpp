@@ -8,11 +8,12 @@ ContextAwareReadaheadPolicy::ContextAwareReadaheadPolicy(Cache& cache, std::uint
                                                            std::size_t max_streams_per_context)
     : CachePolicy(cache), tracker_(attach_window, max_streams_per_context) {}
 
-void ContextAwareReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t page,
-                                                        PrefetchRequest& request) {
+void ContextAwareReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                                                        std::uint32_t block_length, PrefetchRequest& request) {
     request.fetch_count = 0;
 
-    detail::StreamTracker::TouchResult touch = tracker_.touch(context, page);
+    std::uint64_t block_end = static_cast<std::uint64_t>(block_offset) + block_length - 1;
+    detail::StreamTracker::TouchResult touch = tracker_.touch(context, block_end);
 
     // A brand-new stream has no established direction to extrapolate --
     // don't guess and prefetch on what may just be a one-off random access.
@@ -22,13 +23,13 @@ void ContextAwareReadaheadPolicy::on_prefetch_request(std::uint64_t context, std
     if (touch.direction >= 0) {
         // Ascending (or flat, e.g. a re-read at the head): continue forward.
         request.fetch_ranges[0] =
-            FetchRange{static_cast<std::uint32_t>(page + 1), MAX_PREFETCH_PAGES};
+            FetchRange{static_cast<std::uint32_t>(block_end + 1), MAX_PREFETCH_PAGES};
     } else {
         // Descending: continue backward, i.e. prefetch the range just below
-        // `page`, clamped so it doesn't wrap past address 0.
+        // the request's final block, clamped so it doesn't wrap past address 0.
         std::uint32_t length = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(MAX_PREFETCH_PAGES, page));
-        request.fetch_ranges[0] = FetchRange{static_cast<std::uint32_t>(page - length), length};
+            std::min<std::uint64_t>(MAX_PREFETCH_PAGES, block_end));
+        request.fetch_ranges[0] = FetchRange{static_cast<std::uint32_t>(block_end - length), length};
         if (length == 0) request.fetch_count = 0;
     }
 }

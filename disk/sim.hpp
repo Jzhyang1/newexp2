@@ -111,25 +111,22 @@ public:
         uint64_t hit_count = 0;
         uint64_t prefetch_ns = 0;  // Time skew from prefetching work
         uint64_t evict_ns = 0;  // Time skew from eviction work
-        for (int block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
+        policy::PrefetchRequest prefetch_req;
+        {
+            std::lock_guard _{mu};
+            if (prefetch_policy) {
+                prefetch_ns += charge_policy_ns([&]{
+                    prefetch_policy->on_prefetch_request(
+                        worker_id, block_offset, block_length, prefetch_req);
+                });
+            }
+        }
+        for (std::uint32_t block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
             std::lock_guard _{mu};
             bool hit = cache.present(block_offset + block_suboffset);
             total_count += 1;
             hit_count += hit;
 
-            // decide on who to prefetch
-            // (must run under `mu`: the prefetch policy keeps state)
-            policy::PrefetchRequest prefetch_req;
-            if (prefetch_policy) {
-                prefetch_ns += charge_policy_ns([&]{
-                    prefetch_policy->on_prefetch_request(worker_id, block_offset + block_suboffset, prefetch_req);
-                });
-            }
-
-            // admit the requested pages
-            for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
-                add_to_cache(worker_id, prefetch_req.fetch_ranges[i]);
-            }
             add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1});
 
             // acknowledge access
@@ -147,6 +144,13 @@ public:
             // TODO find the earliest worker
             // block if the worker_run_ns is more than MAX_SKEW_NS greater than
             // the earliest worker
+        }
+        {
+            // admit the prefetched pages last
+            std::lock_guard _{mu};
+            for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
+                add_to_cache(worker_id, prefetch_req.fetch_ranges[i]);
+            }
         }
         
         uint64_t total_elapsed_ns;

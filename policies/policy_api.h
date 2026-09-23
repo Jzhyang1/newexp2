@@ -17,8 +17,8 @@
 #include "assoc_miner.h"
 #include "stream_tracker.h"
 
-#define MAX_PREFETCH_PAGES 32
-#define MAX_EVICT_PAGES 128
+#define MAX_PREFETCH_PAGES 512
+#define MAX_EVICT_PAGES 512
 
 namespace policy {
 
@@ -51,9 +51,11 @@ public:
         (void)context;
         (void)page;
     };
-    virtual void on_prefetch_request(uint64_t context, uint64_t page, PrefetchRequest& request) {
+    virtual void on_prefetch_request(uint64_t context, uint32_t block_offset,
+                                     uint32_t block_length, PrefetchRequest& request) {
         (void)context;
-        (void)page;
+        (void)block_offset;
+        (void)block_length;
         (void)request;
     };
     virtual void on_evict_request(uint64_t context, uint64_t page, EvictRequest& request) {
@@ -133,7 +135,8 @@ class ReadaheadPolicy : public CachePolicy {
 public:
     ReadaheadPolicy(Cache& cache);
     void on_admit(std::uint64_t context, std::uint64_t page);
-    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
 };
 
 // Groups reads into per-context "streams" the way a hardware stride/stream
@@ -176,7 +179,8 @@ class ContextAwareReadaheadPolicy : public CachePolicy {
 public:
     explicit ContextAwareReadaheadPolicy(Cache& cache, std::uint64_t attach_window = 8,
                                           std::size_t max_streams_per_context = 8);
-    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
 };
 
 // Baseline: mines page-follows-page associations from a single trailing
@@ -188,7 +192,8 @@ class CMinerPolicy : public CachePolicy {
 public:
     explicit CMinerPolicy(Cache& cache, std::size_t window_size = 8,
                            std::uint32_t min_support = 2, std::uint64_t top_k = 4);
-    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
 };
 
 // Same windowed-association mining as CMinerPolicy, but partitioned per
@@ -200,7 +205,8 @@ class QuickMinePolicy : public CachePolicy {
 public:
     explicit QuickMinePolicy(Cache& cache, std::size_t window_size = 8,
                               std::uint32_t min_support = 2, std::uint64_t top_k = 4);
-    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
 };
 
 // Same global (context-free) windowed-association mining as CMinerPolicy,
@@ -216,7 +222,8 @@ public:
     explicit MithrilPolicy(Cache& cache, std::size_t window_size = 8,
                             std::uint32_t min_support = 2, std::uint64_t top_k = 4,
                             std::uint32_t hot_threshold = 20);
-    void on_prefetch_request(std::uint64_t context, std::uint64_t page, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
 };
 
 }  // namespace policy

@@ -3,4 +3,3 @@
 !kvm/
 !kvm/guest/
 !kvm/guest/workloads/
-!kvm/guest/workloads/thesios_bench.py
