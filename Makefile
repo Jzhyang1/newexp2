@@ -131,8 +131,8 @@ GUEST_GUPS_DIRECT_IO ?= 0
 # relative to the source file, so use a root image at least as large as the
 # selected cluster's disk (16T for the default shard).
 GUEST_THESIOS ?= 0
-GUEST_THESIOS_TRACE_URL ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100
-GUEST_THESIOS_MAX_REQUESTS ?= 1000000
+GUEST_THESIOS_TRACE_URLS ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00001-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00002-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00003-of-00100
+GUEST_THESIOS_MAX_REQUESTS ?= 0
 GUEST_THESIOS_DEVICE ?= /dev/vda
 
 # FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
@@ -157,7 +157,7 @@ guest-image:
 	  GUPS_ENABLE=$(GUEST_GUPS) GUPS_TABLE_MB=$(GUEST_GUPS_TABLE_MB) \
 	  GUPS_UPDATES=$(GUEST_GUPS_UPDATES) GUPS_BLOCK_SIZE=$(GUEST_GUPS_BLOCK_SIZE) \
 	  GUPS_DIRECT_IO=$(GUEST_GUPS_DIRECT_IO) \
-	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URL=$(GUEST_THESIOS_TRACE_URL) \
+	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URLS=$(GUEST_THESIOS_TRACE_URLS) \
 	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh

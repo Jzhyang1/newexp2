@@ -184,10 +184,14 @@ make guest-image WORKLOAD_SCRIPT=kvm/guest/workloads/gups_bench.py \
 Set `GUEST_THESIOS=1` and select
 [`kvm/guest/workloads/thesios_bench.py`](kvm/guest/workloads/thesios_bench.py)
 to download and bake one public Thesios CSV shard, then replay its `READ`
-requests against the guest's raw root block device. The default shard is
-`cluster1_16TB/20240115/data-00000-of-00100`; override
-`GUEST_THESIOS_TRACE_URL` for another shard and
-`GUEST_THESIOS_MAX_REQUESTS` to bound the run. Thesios `file_offset` values
+requests against the guest's raw root block device. By default, four shards
+(`data-00000` through `data-00003`) are downloaded. Override
+`GUEST_THESIOS_TRACE_URLS` with a comma-separated list of shard URLs to select
+others. The host-side
+[`prepare_thesios.py`](kvm/guest/prepare_thesios.py) deletes each full CSV
+after extracting only `offset,length` pairs into the image. Set
+`GUEST_THESIOS_MAX_REQUESTS` to a positive value to bound the replay; `0`
+replays the complete condensed file. Thesios `file_offset` values
 are file-relative, so this replay preserves the recorded offsets as provided
 and requires an image/device large enough for them. The default cluster is
 16 TB, so use a sparse 16-TB root image when replaying it:
@@ -195,8 +199,7 @@ and requires an image/device large enough for them. The default cluster is
 ```bash
 make guest-image \
    WORKLOAD_SCRIPT=kvm/guest/workloads/thesios_bench.py \
-   GUEST_YCSB=0 GUEST_THESIOS=1 GUEST_ROOTFS_SIZE=16T \
-   GUEST_THESIOS_MAX_REQUESTS=1000000
+   GUEST_YCSB=0 GUEST_THESIOS=1 GUEST_ROOTFS_SIZE=16T
 ```
 
 Writes and malformed rows are skipped. The selected shard is downloaded at

@@ -2,4 +2,5 @@
 *
 !kvm/
 !kvm/guest/
+!kvm/guest/prepare_thesios.py
 !kvm/guest/workloads/

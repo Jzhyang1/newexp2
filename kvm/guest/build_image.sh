@@ -86,8 +86,8 @@ GUPS_DIRECT_IO=${GUPS_DIRECT_IO:-0}
 # itself is downloaded on the host, not from inside the guest, so boot does
 # not depend on network access. See the Makefile's GUEST_THESIOS_* vars.
 THESIOS_ENABLE=${THESIOS_ENABLE:-0}
-THESIOS_TRACE_URL=${THESIOS_TRACE_URL:-https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100}
-THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-1000000}
+THESIOS_TRACE_URLS=${THESIOS_TRACE_URLS:-https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100}
+THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-0}
 THESIOS_DEVICE=${THESIOS_DEVICE:-/dev/vda}
 
 if [[ $EUID -ne 0 ]]; then
@@ -103,7 +103,6 @@ fi
 
 REQUIRED_TOOLS=(losetup chroot rsync)
 [[ "$SYNC_ONLY" == "1" ]] || REQUIRED_TOOLS+=(debootstrap mkfs.ext4)
-[[ "$THESIOS_ENABLE" == "1" ]] && REQUIRED_TOOLS+=(curl)
 for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
@@ -112,7 +111,12 @@ done
 THESIOS_TMP=""
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
     THESIOS_TMP=$(mktemp)
-    curl -fsSL --retry 3 -o "$THESIOS_TMP" "$THESIOS_TRACE_URL"
+    IFS=',' read -ra THESIOS_URLS <<< "$THESIOS_TRACE_URLS"
+    PREPARE_ARGS=()
+    for url in "${THESIOS_URLS[@]}"; do
+        PREPARE_ARGS+=(--url "$url")
+    done
+    python3 kvm/guest/prepare_thesios.py --output "$THESIOS_TMP" "${PREPARE_ARGS[@]}"
 fi
 
 MNT=$(mktemp -d)
@@ -249,8 +253,7 @@ if [[ "$THESIOS_ENABLE" == "1" ]]; then
 {
     "trace_path": "${THESIOS_TRACE}",
     "device_path": "${THESIOS_DEVICE}",
-    "max_requests": ${THESIOS_MAX_REQUESTS},
-    "source_url": "${THESIOS_TRACE_URL}"
+    "max_requests": ${THESIOS_MAX_REQUESTS}
 }
 EOF
 fi
@@ -361,5 +364,5 @@ if [[ "$GUPS_ENABLE" == "1" ]]; then
     echo "gups: ${GUPS_TABLE_MB}MB table baked at /opt/workload/gups_table.bin, ${GUPS_UPDATES} random ${GUPS_BLOCK_SIZE}-byte reads at boot (see /opt/workload/gups_config.json)"
 fi
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
-    echo "thesios: $(basename "$THESIOS_TRACE_URL") baked at /opt/workload/thesios_trace.csv, up to ${THESIOS_MAX_REQUESTS} requests at boot (see /opt/workload/thesios_config.json)"
+    echo "thesios: condensed ${#THESIOS_URLS[@]} shard(s) baked at /opt/workload/thesios_trace.csv, max_requests=${THESIOS_MAX_REQUESTS} (0=all)"
 fi

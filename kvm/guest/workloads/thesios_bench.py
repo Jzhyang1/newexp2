@@ -1,4 +1,4 @@
-"""Replay a Thesios CSV shard as raw block-device reads.
+"""Replay a condensed Thesios offset/length trace as raw reads.
 
 The image builder downloads one public Thesios shard and writes its metadata
 under /opt/workload/thesios_config.json. Thesios file_offset values are
@@ -33,14 +33,11 @@ with open(device_path, "rb", buffering=0) as device, open(
     trace_path, newline=""
 ) as trace:
     for row in csv.DictReader(trace):
-        if read_count + skipped_count >= max_requests:
+        if max_requests and read_count >= max_requests:
             break
-        if row.get("op_type", "").strip().upper() != "READ":
-            skipped_count += 1
-            continue
         try:
-            offset = int(row["file_offset"])
-            size = int(row["request_io_size_bytes"])
+            offset = int(row["offset"])
+            size = int(row["length"])
         except (KeyError, TypeError, ValueError):
             skipped_count += 1
             continue
