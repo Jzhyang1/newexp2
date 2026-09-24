@@ -134,6 +134,7 @@ GUEST_THESIOS ?= 0
 GUEST_THESIOS_TRACE_URLS ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00001-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00002-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00003-of-00100
 GUEST_THESIOS_MAX_REQUESTS ?= 0
 GUEST_THESIOS_DEVICE ?= /dev/vda
+GUEST_THESIOS_DIRECT_IO ?= 0
 
 # FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
 # already exists -- default (0) is the fast path in build_image.sh: if
@@ -159,6 +160,7 @@ guest-image:
 	  GUPS_DIRECT_IO=$(GUEST_GUPS_DIRECT_IO) \
 	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URLS=$(GUEST_THESIOS_TRACE_URLS) \
 	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
+	  THESIOS_DIRECT_IO=$(GUEST_THESIOS_DIRECT_IO) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh
 
@@ -356,9 +358,9 @@ experiment-down: vms-down nbd-stop
 # plain single-VM experiment -- this isn't a policy comparison (see
 # experiment-lru-readahead/experiment-cxt-aware below for that); it's for
 # exercising the cache/NBD path under concurrent guest traffic.
-.PHONY: experiment-2
-experiment-2:
-	$(MAKE) experiment NBD_CONFIG=disk/nbd_2vm.yaml VMS_CONFIG=kvm/vms_2vm.yaml
+.PHONY: experiment-%
+experiment-%:
+	$(MAKE) experiment NBD_CONFIG=disk/nbd_$*vm.yaml VMS_CONFIG=kvm/vms_$*vm.yaml
 
 # ---------------------------------------------------------------------------
 # lru+readahead vs. lru_cxt_aware+readahead_cxt_aware comparison: the same

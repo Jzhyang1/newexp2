@@ -3,7 +3,9 @@ source: local
 file: disk/data/nbd_disk.img
 ports: [10809]
 
-capacity: 1024
+# 2M of simulated disk cache -- online sources say up to 100GB is fair for disk cache,
+# but we don't have that many processes and they don't run for long so we can be smaller
+capacity: 4096
 hit_latency_ns: 30000
 miss_latency_ns: 300000
 warmup: 0

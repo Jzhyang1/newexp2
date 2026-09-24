@@ -196,6 +196,10 @@ are file-relative, so this replay preserves the recorded offsets as provided
 and requires an image/device large enough for them. The default cluster is
 16 TB, so use a sparse 16-TB root image when replaying it:
 
+Set `GUEST_THESIOS_DIRECT_IO=1` to open the workload device with `O_DIRECT`
+and bypass the guest page cache. The default `0` preserves ordinary cached
+reads.
+
 ```bash
 make guest-image \
    WORKLOAD_SCRIPT=kvm/guest/workloads/thesios_bench.py \

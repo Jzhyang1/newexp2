@@ -89,6 +89,12 @@ THESIOS_ENABLE=${THESIOS_ENABLE:-0}
 THESIOS_TRACE_URLS=${THESIOS_TRACE_URLS:-https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100}
 THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-0}
 THESIOS_DEVICE=${THESIOS_DEVICE:-/dev/vda}
+THESIOS_DIRECT_IO=${THESIOS_DIRECT_IO:-0}
+
+if [[ "$THESIOS_DIRECT_IO" != "0" && "$THESIOS_DIRECT_IO" != "1" ]]; then
+    echo "THESIOS_DIRECT_IO must be 0 or 1" >&2
+    exit 1
+fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "build_image.sh must run as root (debootstrap/mount/chroot need it)" >&2
@@ -109,7 +115,7 @@ done
 [[ -f "$WORKLOAD_SCRIPT" ]] || { echo "workload script not found: $WORKLOAD_SCRIPT" >&2; exit 1; }
 
 THESIOS_TMP=""
-if [[ "$THESIOS_ENABLE" == "1" ]]; then
+if [[ "$THESIOS_ENABLE" == "1" && "$SYNC_ONLY" != "1" ]]; then
     THESIOS_TMP=$(mktemp)
     IFS=',' read -ra THESIOS_URLS <<< "$THESIOS_TRACE_URLS"
     PREPARE_ARGS=()
@@ -207,19 +213,6 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
         -p recordcount=${YCSB_RECORDS} -p fieldcount=${YCSB_FIELD_COUNT} \
         -p fieldlength=${YCSB_FIELD_LENGTH} -threads 1"
 
-    cat > "$MNT/opt/workload/ycsb_config.json" <<EOF
-{
-  "ycsb_home": "/opt/ycsb",
-  "db_path": "${YCSB_DB}",
-  "workload": "${YCSB_WORKLOAD}",
-  "recordcount": ${YCSB_RECORDS},
-  "operationcount": ${YCSB_OPERATIONS},
-  "fieldcount": ${YCSB_FIELD_COUNT},
-  "fieldlength": ${YCSB_FIELD_LENGTH},
-  "requestdistribution": "${YCSB_DISTRIBUTION}",
-  "threads": ${YCSB_THREADS}
-}
-EOF
 fi
 
 if [[ "$GUPS_ENABLE" == "1" ]]; then
@@ -248,18 +241,36 @@ EOF
 fi
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
         THESIOS_TRACE=/opt/workload/thesios_trace.csv
+    if [[ "$SYNC_ONLY" != "1" ]]; then
         cp "$THESIOS_TMP" "$MNT${THESIOS_TRACE}"
+    fi
         cat > "$MNT/opt/workload/thesios_config.json" <<EOF
 {
     "trace_path": "${THESIOS_TRACE}",
     "device_path": "${THESIOS_DEVICE}",
-    "max_requests": ${THESIOS_MAX_REQUESTS}
+    "max_requests": ${THESIOS_MAX_REQUESTS},
+    "direct_io": ${THESIOS_DIRECT_IO}
 }
 EOF
 fi
 rsync -a "$WORKLOAD_SCRIPT" "$MNT/opt/workload/run.py"
 
 # Powers the guest off once the workload exits (success or failure) so that
+if [[ "$YCSB_ENABLE" == "1" ]]; then
+    cat > "$MNT/opt/workload/ycsb_config.json" <<EOF
+{
+  "ycsb_home": "/opt/ycsb",
+  "db_path": "/opt/workload/ycsb.db",
+  "workload": "${YCSB_WORKLOAD}",
+  "recordcount": ${YCSB_RECORDS},
+  "operationcount": ${YCSB_OPERATIONS},
+  "fieldcount": ${YCSB_FIELD_COUNT},
+  "fieldlength": ${YCSB_FIELD_LENGTH},
+  "requestdistribution": "${YCSB_DISTRIBUTION}",
+  "threads": ${YCSB_THREADS}
+}
+EOF
+fi
 # a host-side `kvm/launch.py --wait` can detect completion by watching for
 # the QEMU process to exit, rather than polling the serial log's output.
 # poweroff always runs regardless of the workload's exit status -- a guest
