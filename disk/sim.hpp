@@ -127,7 +127,7 @@ public:
             total_count += 1;
             hit_count += hit;
 
-            add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1});
+            add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1}, false);
 
             // acknowledge access
             if (evict_policy) {
@@ -149,7 +149,7 @@ public:
             // admit the prefetched pages last
             std::lock_guard _{mu};
             for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
-                add_to_cache(worker_id, prefetch_req.fetch_ranges[i]);
+                add_to_cache(worker_id, prefetch_req.fetch_ranges[i], true);
             }
         }
         
@@ -217,7 +217,7 @@ public:
     /*
      * Unsafe. Must be called in a protected block. Returns the latency
      */
-    uint64_t add_to_cache(uint64_t worker_id, policy::FetchRange range) {
+    uint64_t add_to_cache(uint64_t worker_id, policy::FetchRange range, bool is_prefetch) {
         uint64_t latency = 0;
         for (uint32_t block_suboffset = 0; block_suboffset < range.block_length; ++block_suboffset) {
             if (cache.present(range.block_offset + block_suboffset)) continue;
@@ -243,8 +243,8 @@ public:
             auto evict = cache.insert(range.block_offset + block_suboffset);
             if (evict.first && evict_policy) evict_policy->on_evict(worker_id, evict.second);
             if (evict.first && prefetch_policy) prefetch_policy->on_evict(worker_id, evict.second);
-            if (evict_policy) evict_policy->on_admit(worker_id, range.block_offset + block_suboffset);
-            if (prefetch_policy) prefetch_policy->on_admit(worker_id, range.block_offset + block_suboffset);
+            if (evict_policy) evict_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
+            if (prefetch_policy) prefetch_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
         }
         return latency;
     }

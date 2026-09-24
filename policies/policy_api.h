@@ -47,9 +47,10 @@ public:
         (void)context;
         (void)page;
     };
-    virtual void on_admit(uint64_t context, uint64_t page) {
+    virtual void on_admit(uint64_t context, uint64_t page, bool is_prefetch) {
         (void)context;
         (void)page;
+        (void)is_prefetch;
     };
     virtual void on_prefetch_request(uint64_t context, uint32_t block_offset,
                                      uint32_t block_length, PrefetchRequest& request) {
@@ -105,7 +106,7 @@ class FIFOPolicy : public CachePolicy {
     std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator> page_to_iterator;
 public:
     FIFOPolicy(Cache& cache);
-    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_evict(std::uint64_t context, std::uint64_t page);
     void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
 };
@@ -115,7 +116,7 @@ class LIFOPolicy : public CachePolicy {
     std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator> page_to_iterator;
 public:
     LIFOPolicy(Cache& cache);
-    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_evict(std::uint64_t context, std::uint64_t page);
     void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
 };
@@ -126,7 +127,31 @@ class LRUPolicy : public CachePolicy {
 public:
     LRUPolicy(Cache& cache);
     void on_access(std::uint64_t context, std::uint64_t page);
-    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
+    void on_evict(std::uint64_t context, std::uint64_t page);
+    void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
+};
+
+class MRUPolicy : public CachePolicy {
+    static constexpr std::size_t kKeepAroundPages = 4;
+
+    std::list<std::uint64_t> keep_around_list;
+    std::list<std::uint64_t> main_mru_list;
+    std::list<std::uint64_t> prefetch_fifo_list;
+    std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator>
+        keep_around_iterators;
+    std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator>
+        main_mru_iterators;
+    std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator>
+        prefetch_fifo_iterators;
+
+    std::size_t prefetch_capacity() const;
+    void move_keep_around_to_main();
+    void move_prefetch_to_main(std::uint64_t page);
+public:
+    MRUPolicy(Cache& cache);
+    void on_access(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_evict(std::uint64_t context, std::uint64_t page);
     void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
 };
@@ -134,7 +159,7 @@ public:
 class ReadaheadPolicy : public CachePolicy {
 public:
     ReadaheadPolicy(Cache& cache);
-    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
                              std::uint32_t block_length, PrefetchRequest& request);
 };
@@ -164,7 +189,7 @@ public:
     explicit ContextAwareLRUPolicy(Cache& cache, std::uint64_t attach_window = 8,
                                     std::size_t max_streams_per_context = 8);
     void on_access(std::uint64_t context, std::uint64_t page);
-    void on_admit(std::uint64_t context, std::uint64_t page);
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request);
     void on_evict(std::uint64_t context, std::uint64_t page);
 };

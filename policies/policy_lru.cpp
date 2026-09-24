@@ -25,8 +25,9 @@ void LRUPolicy::on_access(uint64_t context, uint64_t page) {
     );
 }
 
-void LRUPolicy::on_admit(uint64_t context, uint64_t page) {
+void LRUPolicy::on_admit(uint64_t context, uint64_t page, bool is_prefetch) {
     (void)context;
+    (void)is_prefetch;
     recency_list.push_front(page);
     page_to_iterator.emplace(page, recency_list.begin());
 }

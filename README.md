@@ -87,7 +87,7 @@ charges simulated latency accordingly — then serves the actual bytes via
 ### policies/
 
 Evict policies (`evict_policy:` in the config): `none`, `fifo`, `lifo`,
-`lru`.
+`lru`, `mru`.
 
 Prefetch policies (`prefetch_policy:`): `none`, `readahead` (fetches the
 next `MAX_PREFETCH_PAGES` pages), and three association-mining policies

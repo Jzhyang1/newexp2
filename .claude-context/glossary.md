@@ -40,7 +40,7 @@ from context alone.
 ## Cache/policy terms
 
 - **evict policy** — decides which cached page(s) to remove when the cache
-  is full (`none`, `fifo`, `lifo`, `lru`, `lru_cxt_aware`).
+  is full (`none`, `fifo`, `lifo`, `lru`, `mru`, `lru_cxt_aware`).
 - **prefetch policy** — decides which page(s) to speculatively load ahead
   of a request (`none`, `readahead`, `readahead_cxt_aware`, `cminer`,
   `quickmine`, `mithril`).

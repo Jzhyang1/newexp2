@@ -18,7 +18,8 @@ void ContextAwareLRUPolicy::on_access(std::uint64_t context, std::uint64_t page)
     streams_.splice(streams_.begin(), streams_, it->second.stream);
 }
 
-void ContextAwareLRUPolicy::on_admit(std::uint64_t context, std::uint64_t page) {
+void ContextAwareLRUPolicy::on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch) {
+    (void)is_prefetch;
     detail::StreamTracker::TouchResult touch = tracker_.touch(context, page);
 
     std::list<Stream>::iterator stream;

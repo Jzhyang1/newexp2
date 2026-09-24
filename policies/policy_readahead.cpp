@@ -9,10 +9,10 @@ namespace policy {
 
 ReadaheadPolicy::ReadaheadPolicy(Cache& cache) : CachePolicy(cache) {}
 
-void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page) {
-    (void)cache;
+void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch) {
     (void)context;
     (void)page;
+    (void)is_prefetch;
 }
 
 void ReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
