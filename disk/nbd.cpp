@@ -390,7 +390,8 @@ struct Config {
   uint64_t miss_latency_ns = 0;
   uint64_t warmup = 0;
   std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware | mru
-  std::string prefetch_policy = "none";   // none | readahead | cminer | quickmine | mithril | readahead_cxt_aware
+  std::string prefetch_policy = "none";   // none | readahead | oracle | cminer | quickmine | mithril | readahead_cxt_aware
+  std::string oracle_file = "./logs/oracle.csv";
   std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
   std::string access_log = "./logs/nbd_access.csv";  // per-request (worker_id,offset,length,hits,total)
                                  // event log, for verifying capture correctness; set to "" to disable
@@ -461,6 +462,8 @@ Config LoadConfig(const std::string& path) {
       cfg.evict_policy = value;
     } else if (key == "prefetch_policy") {
       cfg.prefetch_policy = value;
+    } else if (key == "oracle_file") {
+      cfg.oracle_file = value;
     } else if (key == "log") {
       cfg.log = value;
     } else if (key == "access_log") {
@@ -485,8 +488,10 @@ policy::CachePolicy* MakeEvictPolicy(const std::string& name, policy::Cache& cac
   throw std::runtime_error("Unsupported evict_policy: " + name);
 }
 
-policy::CachePolicy* MakePrefetchPolicy(const std::string& name, policy::Cache& cache) {
+policy::CachePolicy* MakePrefetchPolicy(const std::string& name, policy::Cache& cache,
+                                        const std::string& oracle_file) {
   if (name == "readahead") return new policy::ReadaheadPolicy(cache);
+  if (name == "oracle") return new policy::OraclePolicy(cache, oracle_file);
   if (name == "cminer") return new policy::CMinerPolicy(cache);
   if (name == "quickmine") return new policy::QuickMinePolicy(cache);
   if (name == "mithril") return new policy::MithrilPolicy(cache);
@@ -645,7 +650,8 @@ int main(int argc, char **argv) {
 
   static policy::Cache cache(cfg.capacity, cfg.hit_latency_ns, cfg.miss_latency_ns);
   policy::CachePolicy* evict_policy = nbd::MakeEvictPolicy(cfg.evict_policy, cache);
-  policy::CachePolicy* prefetch_policy = nbd::MakePrefetchPolicy(cfg.prefetch_policy, cache);
+  policy::CachePolicy* prefetch_policy = nbd::MakePrefetchPolicy(
+      cfg.prefetch_policy, cache, cfg.oracle_file);
 
   FILE* access_log = nullptr;
   if (!cfg.access_log.empty()) {

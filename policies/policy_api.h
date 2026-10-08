@@ -10,6 +10,8 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <vector>
 
 #include <cstdio>
 #include <iostream>
@@ -204,6 +206,23 @@ class ContextAwareReadaheadPolicy : public CachePolicy {
 public:
     explicit ContextAwareReadaheadPolicy(Cache& cache, std::uint64_t attach_window = 8,
                                           std::size_t max_streams_per_context = 8);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
+};
+
+// Replays the next request from an nbd_access.csv-shaped trace. The trace is
+// partitioned by worker_id so concurrent clients retain their own request order.
+class OraclePolicy : public CachePolicy {
+    struct Request {
+        std::uint32_t block_offset;
+        std::uint32_t block_length;
+    };
+
+    std::unordered_map<std::uint64_t, std::vector<Request>> requests_;
+    std::unordered_map<std::uint64_t, std::size_t> next_request_;
+
+public:
+    OraclePolicy(Cache& cache, const std::string& path);
     void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
                              std::uint32_t block_length, PrefetchRequest& request);
 };

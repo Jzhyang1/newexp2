@@ -39,6 +39,7 @@ cmd = [
     "-p", f"fieldcount={cfg['fieldcount']}",
     "-p", f"fieldlength={cfg['fieldlength']}",
     "-p", f"requestdistribution={cfg['requestdistribution']}",
+    "-p", f"seed={cfg['seed']}",
     "-threads", str(cfg["threads"]),
 ]
 print("YCSB_BENCH starting:", " ".join(cmd), flush=True)

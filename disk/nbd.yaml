@@ -5,13 +5,14 @@ ports: [10809]
 
 # 2M of simulated disk cache -- online sources say up to 100GB is fair for disk cache,
 # but we don't have that many processes and they don't run for long so we can be smaller
-capacity: 4096
+capacity: 8192
 hit_latency_ns: 30000
 miss_latency_ns: 300000
 warmup: 0
 
 evict_policy: lru
-prefetch_policy: readahead
+prefetch_policy: oracle
+oracle_file: ./logs/oracle.csv
 
 log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv

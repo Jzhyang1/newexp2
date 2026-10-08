@@ -4,3 +4,6 @@
 !kvm/guest/
 !kvm/guest/prepare_thesios.py
 !kvm/guest/workloads/
+!policies/
+policies/*
+!policies/policy_oracle.cpp

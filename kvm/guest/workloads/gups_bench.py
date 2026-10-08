@@ -29,6 +29,7 @@ table_size = cfg["table_size_bytes"]
 block_size = cfg["block_size"]
 updates = cfg["updates"]
 direct_io = bool(cfg.get("direct_io", 0))
+rng = random.Random(cfg["seed"])
 
 # Last full block_size-aligned slot the table can serve a read from.
 last_slot = table_size // block_size - 1
@@ -47,7 +48,7 @@ if direct_io:
     buffer = mmap.mmap(-1, block_size)
     try:
         for _ in range(updates):
-            slot = random.randint(0, last_slot)
+            slot = rng.randint(0, last_slot)
             if os.preadv(fd, [buffer], slot * block_size) != block_size:
                 raise IOError("short O_DIRECT read")
     finally:
@@ -56,7 +57,7 @@ if direct_io:
 else:
     with open(table_path, "rb", buffering=0) as f:
         for _ in range(updates):
-            slot = random.randint(0, last_slot)
+            slot = rng.randint(0, last_slot)
             f.seek(slot * block_size)
             if len(f.read(block_size)) != block_size:
                 raise IOError("short read")

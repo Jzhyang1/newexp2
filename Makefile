@@ -106,7 +106,10 @@ GUEST_YCSB_FIELD_LENGTH ?= 100
 GUEST_YCSB_WORKLOAD ?= workloadc
 GUEST_YCSB_OPERATIONS ?= 2000000
 GUEST_YCSB_DISTRIBUTION ?= zipfian
-GUEST_YCSB_THREADS ?= 4
+# One thread is required for reproducible request ordering. Override with a
+# larger value when measuring concurrent YCSB behavior rather than replayability.
+GUEST_YCSB_THREADS ?= 1
+GUEST_YCSB_SEED ?= 20261007
 
 # Bakes a disk-based analogue of the HPC Challenge "GUPS" (Giant Updates
 # Per Second) RandomAccess benchmark: a zero-filled table written for real
@@ -125,6 +128,7 @@ GUEST_GUPS_TABLE_MB ?= 6144
 GUEST_GUPS_UPDATES ?= 2000000
 GUEST_GUPS_BLOCK_SIZE ?= 512
 GUEST_GUPS_DIRECT_IO ?= 0
+GUEST_GUPS_SEED ?= 20261007
 
 # Bakes one public Thesios CSV shard into the image and replays its READ
 # requests against the guest's raw root block device. Thesios file offsets are
@@ -155,9 +159,10 @@ guest-image:
 	  YCSB_FIELD_COUNT=$(GUEST_YCSB_FIELD_COUNT) YCSB_FIELD_LENGTH=$(GUEST_YCSB_FIELD_LENGTH) \
 	  YCSB_WORKLOAD=$(GUEST_YCSB_WORKLOAD) YCSB_OPERATIONS=$(GUEST_YCSB_OPERATIONS) \
 	  YCSB_DISTRIBUTION=$(GUEST_YCSB_DISTRIBUTION) YCSB_THREADS=$(GUEST_YCSB_THREADS) \
+	  YCSB_SEED=$(GUEST_YCSB_SEED) \
 	  GUPS_ENABLE=$(GUEST_GUPS) GUPS_TABLE_MB=$(GUEST_GUPS_TABLE_MB) \
 	  GUPS_UPDATES=$(GUEST_GUPS_UPDATES) GUPS_BLOCK_SIZE=$(GUEST_GUPS_BLOCK_SIZE) \
-	  GUPS_DIRECT_IO=$(GUEST_GUPS_DIRECT_IO) \
+	  GUPS_DIRECT_IO=$(GUEST_GUPS_DIRECT_IO) GUPS_SEED=$(GUEST_GUPS_SEED) \
 	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URLS=$(GUEST_THESIOS_TRACE_URLS) \
 	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
 	  THESIOS_DIRECT_IO=$(GUEST_THESIOS_DIRECT_IO) \
@@ -358,9 +363,12 @@ experiment-down: vms-down nbd-stop
 # plain single-VM experiment -- this isn't a policy comparison (see
 # experiment-lru-readahead/experiment-cxt-aware below for that); it's for
 # exercising the cache/NBD path under concurrent guest traffic.
-.PHONY: experiment-%
+.PHONY: experiment-% experiment_%
 experiment-%:
 	$(MAKE) experiment NBD_CONFIG=disk/nbd_$*vm.yaml VMS_CONFIG=kvm/vms_$*vm.yaml
+
+experiment_%:
+	$(MAKE) experiment NBD_CONFIG=disk/nbd_$*.yaml VMS_CONFIG=kvm/vms_$*.yaml
 
 # ---------------------------------------------------------------------------
 # lru+readahead vs. lru_cxt_aware+readahead_cxt_aware comparison: the same

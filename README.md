@@ -98,6 +98,14 @@ each other's associations), and `mithril` (like `cminer`, but skips pages
 that have already gone "hot," reserving mining budget for
 sporadically-recurring pages).
 
+`oracle` reads an `nbd_access.csv`-shaped trace from `oracle_file` (default
+`./logs/oracle.csv`) and prefetches the range following the closest request
+in each worker's bounded trace lookahead window. This provides an approximate
+headroom bound even when boot or workload behavior diverges between runs. The
+trace header must be
+`worker_id,offset,length,hits,total`; `hits` and `total` are accepted for
+compatibility but are not used.
+
 `policy_lru_cxt_aware.cpp` is a context-aware LRU variant, partitioned by
 client identity while keeping total cache capacity fixed.
 

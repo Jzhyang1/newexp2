@@ -67,7 +67,9 @@ YCSB_FIELD_LENGTH=${YCSB_FIELD_LENGTH:-100}
 YCSB_WORKLOAD=${YCSB_WORKLOAD:-workloadc}
 YCSB_OPERATIONS=${YCSB_OPERATIONS:-200000}
 YCSB_DISTRIBUTION=${YCSB_DISTRIBUTION:-zipfian}
-YCSB_THREADS=${YCSB_THREADS:-4}
+# Single-threaded by default so a fixed seed produces a reproducible I/O trace.
+YCSB_THREADS=${YCSB_THREADS:-1}
+YCSB_SEED=${YCSB_SEED:-20261007}
 
 # Optional: bake a disk-based GUPS RandomAccess table under /opt, so
 # kvm/guest/workloads/gups_bench.py has something real to issue random
@@ -81,6 +83,7 @@ GUPS_TABLE_MB=${GUPS_TABLE_MB:-6144}
 GUPS_UPDATES=${GUPS_UPDATES:-2000000}
 GUPS_BLOCK_SIZE=${GUPS_BLOCK_SIZE:-4096}
 GUPS_DIRECT_IO=${GUPS_DIRECT_IO:-0}
+GUPS_SEED=${GUPS_SEED:-20261007}
 
 # Optional: bake one public Thesios CSV shard into /opt/workload. The trace
 # itself is downloaded on the host, not from inside the guest, so boot does
@@ -211,7 +214,7 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
         -P workloads/${YCSB_WORKLOAD} \
         -p db.driver=org.sqlite.JDBC -p db.url=jdbc:sqlite:${YCSB_DB} \
         -p recordcount=${YCSB_RECORDS} -p fieldcount=${YCSB_FIELD_COUNT} \
-        -p fieldlength=${YCSB_FIELD_LENGTH} -threads 1"
+        -p fieldlength=${YCSB_FIELD_LENGTH} -p seed=${YCSB_SEED} -threads 1"
 
 fi
 
@@ -235,7 +238,8 @@ if [[ "$GUPS_ENABLE" == "1" ]]; then
     "table_size_bytes": $((GUPS_TABLE_MB * 1024 * 1024)),
     "updates": ${GUPS_UPDATES},
     "block_size": ${GUPS_BLOCK_SIZE},
-    "direct_io": ${GUPS_DIRECT_IO}
+    "direct_io": ${GUPS_DIRECT_IO},
+    "seed": ${GUPS_SEED}
 }
 EOF
 fi
@@ -267,7 +271,8 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
   "fieldcount": ${YCSB_FIELD_COUNT},
   "fieldlength": ${YCSB_FIELD_LENGTH},
   "requestdistribution": "${YCSB_DISTRIBUTION}",
-  "threads": ${YCSB_THREADS}
+    "threads": ${YCSB_THREADS},
+    "seed": ${YCSB_SEED}
 }
 EOF
 fi
