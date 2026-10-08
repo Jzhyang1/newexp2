@@ -7,3 +7,7 @@
 !policies/
 policies/*
 !policies/policy_oracle.cpp
+!tools/
+tools/*
+!tools/experiment_ui.py
+!tools/experiment_ui.html

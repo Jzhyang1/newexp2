@@ -221,6 +221,20 @@ dataset is published under CC-BY by the
 
 ## Build and Run
 
+### Control room
+
+Start the local control panel with:
+
+```bash
+make ui
+```
+
+Open `http://127.0.0.1:8765`. It provides allowlisted controls for compiling,
+building the guest image, launching a selected existing scenario, normal or
+forced teardown, recent result rows, live server/action logs, and read-only
+inspection of the ext4 backing image through `debugfs`. The panel binds only
+to localhost and does not execute arbitrary commands.
+
 Everything below is Linux-only (`disk/nbd.cpp` needs `<endian.h>`;
 `kvm/launch.py` needs `qemu-system` and `/dev/kvm`) — run it on the Linux
 host/VM that will actually host the disk server and the guests.

@@ -38,6 +38,10 @@ dirs:
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
 
+.PHONY: ui
+ui:
+	python3 tools/experiment_ui.py
+
 # ---------------------------------------------------------------------------
 # Stage 1: the disk. A backing file that disk/nbd.cpp will serve over the
 # NBD wire protocol -- created once as a sparse, zero-filled file of
