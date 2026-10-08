@@ -68,6 +68,21 @@ def build_heatmap(rows, time_bins, page_bins):
     return grid, min_page, max_page
 
 
+def build_length_heatmap(rows, time_bins, length_bins):
+    lengths = [int(r["length"]) for r in rows]
+    min_length = min(lengths)
+    max_length = max(lengths)
+    length_span = max(1, max_length - min_length)
+    n = len(rows)
+
+    grid = np.zeros((length_bins, time_bins), dtype=np.int64)
+    for i, length in enumerate(lengths):
+        t_bin = min(time_bins - 1, i * time_bins // n)
+        l_bin = min(length_bins - 1, (length - min_length) * length_bins // length_span)
+        grid[l_bin, t_bin] += 1
+    return grid, min_length, max_length
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("access_log", nargs="?", default=DEFAULT_ACCESS_LOG,
@@ -86,6 +101,7 @@ def main():
 
     rows = load_rows(args.access_log, args.worker_id, args.max_accesses)
     grid, min_page, max_page = build_heatmap(rows, args.time_bins, args.page_bins)
+    length_grid, min_length, max_length = build_length_heatmap(rows, args.time_bins, args.page_bins)
 
     fig, ax = plt.subplots(figsize=(10, 6))
     im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis",
@@ -100,6 +116,21 @@ def main():
     fig.tight_layout()
     fig.savefig(args.out, dpi=150)
     print(f"wrote {args.out} ({len(rows)} rows, page range [{min_page}, {max_page}))")
+
+    length_out = f"{args.out.rsplit('.', 1)[0]}_length.{args.out.rsplit('.', 1)[1]}" if "." in args.out else f"{args.out}_length"
+    length_fig, length_ax = plt.subplots(figsize=(10, 6))
+    length_im = length_ax.imshow(length_grid, aspect="auto", origin="lower", cmap="viridis",
+                                 extent=[0, len(rows), min_length, max_length])
+    length_ax.set_xlabel("request sequence (time)")
+    length_ax.set_ylabel("request length (bytes)")
+    length_title = f"Request length heatmap -- {args.access_log}"
+    if args.worker_id is not None:
+        length_title += f" (worker_id={args.worker_id})"
+    length_ax.set_title(length_title)
+    length_fig.colorbar(length_im, ax=length_ax, label="accesses per cell")
+    length_fig.tight_layout()
+    length_fig.savefig(length_out, dpi=150)
+    print(f"wrote {length_out} ({len(rows)} rows, length range [{min_length}, {max_length}])")
 
 
 if __name__ == "__main__":
