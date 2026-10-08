@@ -80,6 +80,16 @@ def state():
     disk = ROOT / "disk/data/nbd_disk.img"
     stats = load_csv_tail(ROOT / "logs/nbd_results.csv", 8)
     access = ROOT / "logs/nbd_access.csv"
+    vm_logs = []
+    log_dir = Path("/tmp/kvm-launch")
+    if log_dir.exists():
+        for serial_path in sorted(log_dir.glob("*.serial.log")):
+            vm_logs.append({
+                "name": serial_path.name.removesuffix(".serial.log"),
+                "running": pid_alive(log_dir / f"{serial_path.name.removesuffix('.serial.log')}.pid"),
+                "serial": tail_text(serial_path, 160),
+                "qemu": tail_text(log_dir / f"{serial_path.name.removesuffix('.serial.log')}.qemu.log", 80),
+            })
     return {
         "processes": process_snapshot(),
         "disk": {"path": rel(disk), "exists": disk.exists(), "bytes": disk.stat().st_size if disk.exists() else 0},
@@ -87,6 +97,7 @@ def state():
         "access": {"path": rel(access), "rows": max(0, sum(1 for _ in access.open(errors="ignore")) - 1) if access.exists() else 0},
         "server_log": tail_text(ROOT / "disk/nbd_server.log", 80),
         "action_log": tail_text(LOG_DIR / "latest.log", 120),
+        "vm_logs": vm_logs,
     }
 
 
@@ -198,7 +209,7 @@ def image_ls(raw):
     except FileNotFoundError:
         return {"ok": False, "error": "debugfs is not installed; install e2fsprogs to inspect ext4 images."}
     output = result.stdout + result.stderr
-    if result.returncode == 0 and Path(path).suffix in {".json", ".txt", ".csv", ".py", ".yaml", ".log"}:
+    if result.returncode == 0 and Path(path).suffix in {".json", ".txt", ".csv", ".py", ".yaml", ".log", ".sh"}:
         preview = subprocess.run(["debugfs", "-R", f"cat {path}", str(image)],
                                  cwd=ROOT, capture_output=True, text=True, timeout=8)
         output += "\n\n--- file preview ---\n" + preview.stdout + preview.stderr
