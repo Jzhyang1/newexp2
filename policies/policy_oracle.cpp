@@ -89,11 +89,16 @@ void OraclePolicy::on_prefetch_request(std::uint64_t context, std::uint32_t bloc
         }
     }
 
-    if (best + 1 >= trace->second.size()) return;
+    constexpr std::size_t kPrefetchRequests = 16;
+    const std::size_t first = best + 1;
+    if (first >= trace->second.size()) return;
 
-    const Request& next = trace->second[best + 1];
-    request.fetch_count = 1;
-    request.fetch_ranges[0] = FetchRange{next.block_offset, next.block_length};
+    const std::size_t prefetch_end =
+        std::min(first + kPrefetchRequests, trace->second.size());
+    for (std::size_t next = first; next < prefetch_end; ++next) {
+        request.fetch_ranges[request.fetch_count++] =
+            FetchRange{trace->second[next].block_offset, trace->second[next].block_length};
+    }
 
     if (best_distance == 0) {
         // only advance on confirmed match
