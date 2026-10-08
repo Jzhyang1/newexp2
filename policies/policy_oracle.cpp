@@ -72,7 +72,7 @@ void OraclePolicy::on_prefetch_request(std::uint64_t context, std::uint32_t bloc
     // The live workload can diverge from the captured trace during boot or
     // across runs. Align to the closest request in a bounded lookahead window
     // instead of requiring byte-for-byte replay of the capture.
-    constexpr std::size_t kLookahead = 64;
+    constexpr std::size_t kLookahead = (1 << 12);
     const std::size_t end = std::min(cursor + kLookahead, trace->second.size());
     std::size_t best = cursor;
     std::uint64_t best_distance = UINT64_MAX;
@@ -89,12 +89,16 @@ void OraclePolicy::on_prefetch_request(std::uint64_t context, std::uint32_t bloc
         }
     }
 
-    cursor = best + 1;
-    if (cursor >= trace->second.size()) return;
+    if (best + 1 >= trace->second.size()) return;
 
-    const Request& next = trace->second[cursor];
+    const Request& next = trace->second[best + 1];
     request.fetch_count = 1;
     request.fetch_ranges[0] = FetchRange{next.block_offset, next.block_length};
+
+    if (best_distance == 0) {
+        // only advance on confirmed match
+        cursor = best + 1;
+    }
 }
 
 }  // namespace policy
