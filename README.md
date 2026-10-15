@@ -106,6 +106,13 @@ trace header must be
 `worker_id,offset,length,hits,total`; `hits` and `total` are accepted for
 compatibility but are not used.
 
+`model-prefetcher` launches `python3 -m <prefetcher_path>` before opening the NBD
+listeners. It requires `prefetcher_path`, `prefetcher_type`,
+`prefetcher_min_len`, and `prefetcher_training`; the latter three are passed
+as the offline model's `--type`, `--min-len`, and `--training` arguments.
+The model is queried over its JSON-lines `get`/`put` API with one history per
+NBD worker.
+
 `policy_lru_cxt_aware.cpp` is a context-aware LRU variant, partitioned by
 client identity while keeping total cache capacity fixed.
 

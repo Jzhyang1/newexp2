@@ -21,8 +21,14 @@ miss_latency_ns: 300000
 warmup: 0                   # requests to skip before counting stats
 
 evict_policy: lru           # none | fifo | lifo | lru
-prefetch_policy: none       # none | readahead | oracle | cminer | quickmine | mithril
+prefetch_policy: none       # none | readahead | oracle | model-prefetcher | cminer | quickmine | mithril
 oracle_file: ./logs/oracle.csv  # nbd_access.csv-shaped approximate oracle trace
+# Required when prefetch_policy is `model-prefetcher`; launched as `python3 -m <path>`
+# before the NBD server starts accepting block clients.
+prefetcher_path: offline.ts_mlr
+prefetcher_type: predict_mean
+prefetcher_min_len: 8
+prefetcher_training: ./logs/oracle.csv
 
 # CSV stats log, appended to (header written once) on a clean shutdown
 # (SIGINT/SIGTERM) -- see disk/nbd.cpp's AppendLog.

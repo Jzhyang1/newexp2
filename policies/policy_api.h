@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <unordered_map>
@@ -223,6 +224,23 @@ class OraclePolicy : public CachePolicy {
 
 public:
     OraclePolicy(Cache& cache, const std::string& path);
+    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
+                             std::uint32_t block_length, PrefetchRequest& request);
+};
+
+// Queries an offline Python predictor over its JSON-lines stdin/stdout API.
+class ModelPolicy : public CachePolicy {
+    struct ModelProcess;
+    std::unique_ptr<ModelProcess> model_;
+    std::size_t min_len_;
+    std::mutex mutex_;
+    std::unordered_map<std::uint64_t, std::deque<std::pair<std::uint32_t, std::uint32_t>>> history_;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> pending_;
+public:
+    ModelPolicy(Cache& cache, const std::string& module, const std::string& type,
+                std::size_t min_len, const std::string& training);
+    ~ModelPolicy() override;
+    void on_access(std::uint64_t context, std::uint64_t page);
     void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
                              std::uint32_t block_length, PrefetchRequest& request);
 };
