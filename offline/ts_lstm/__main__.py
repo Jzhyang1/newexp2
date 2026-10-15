@@ -184,13 +184,13 @@ def main() -> None:
     training_loss_offset, training_loss_length = prediction_loss(
         model.predict, training[:split], args.min_len, args.niceness
     )
-    print(f"offset training loss: {training_loss_offset:.2f}", file=sys.stderr, flush=True)
-    print(f"length training loss: {training_loss_length:.2f}", file=sys.stderr, flush=True)
+    print(f"offset training loss: {training_loss_offset:.0f}", file=sys.stderr, flush=True)
+    print(f"length training loss: {training_loss_length:.0f}", file=sys.stderr, flush=True)
     test_loss_offset, test_loss_length = prediction_loss(
         model.predict, training[split:], args.min_len, args.niceness
     )
-    print(f"offset training loss: {test_loss_offset:.2f}", file=sys.stderr, flush=True)
-    print(f"length training loss: {test_loss_length:.2f}", file=sys.stderr, flush=True)
+    print(f"offset training loss: {test_loss_offset:.0f}", file=sys.stderr, flush=True)
+    print(f"length training loss: {test_loss_length:.0f}", file=sys.stderr, flush=True)
     if not args.dry_run:
         serve(model)
 
