@@ -4,26 +4,16 @@ from __future__ import annotations
 
 import argparse
 import math
-import pandas as pd
 import numpy as np
 import sys
 from typing import Sequence
 from sklearn import linear_model
+from offline.data import load_training
 from offline.loss import prediction_loss
 
 Pair = tuple[int, int]
 Vector = list[float]
 SIN_PERIODS = (2.0, 4.0, 8.0, 16.0)
-
-
-def load_training(path: str) -> list[Pair]:
-    """Read offset,length pairs from CSV"""
-    df = pd.read_csv(path)
-    pairs: list[Pair] = []
-    for row in df.itertuples():
-        offset, length = row.offset, row.length
-        pairs.append((offset, length))
-    return pairs
 
 
 class SVMModel:
@@ -84,6 +74,7 @@ def main() -> None:
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"), default="predict_mean")
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1)
+    parser.add_argument("--predict-deltas", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--training", required=True)
     args = parser.parse_args()
@@ -91,7 +82,7 @@ def main() -> None:
         parser.error("--min-len must be at least 1")
     if args.niceness < 1:
         parser.error("--niceness must be at least 1")
-    training = load_training(args.training)
+    training = load_training(args.training, args.predict_deltas)
     model = SVMModel(args.min_len, args.type, training)
     split = max(args.min_len + 1, round(len(training) * 0.8))
     training_loss_offset, training_loss_length = prediction_loss(
