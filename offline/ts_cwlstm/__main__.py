@@ -161,6 +161,8 @@ class CWLSTMModel:
         ).clamp_min(1e-6)
         features = (features - self.feature_mean) / self.feature_scale
         target_values = (target_values - self.target_mean) / self.target_scale
+        test_features = (test_features - self.feature_mean) / self.feature_scale
+        test_target_values = (test_target_values - self.target_mean) / self.target_scale
         torch.manual_seed(0)
         self.network = ConvSequenceRegressor(
             self.horizon,
