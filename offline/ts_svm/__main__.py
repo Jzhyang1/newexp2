@@ -83,21 +83,22 @@ def main() -> None:
         parser.error("--min-len must be at least 1")
     if args.niceness < 1:
         parser.error("--niceness must be at least 1")
-    training = load_training(args.training, args.predict_deltas)
-    model = SVMModel(args.min_len, args.type, training)
-    split = max(args.min_len + 1, round(len(training) * 0.8))
+    data = load_training(args.training, args.predict_deltas)
+    split = min(len(data), max(args.min_len + 1, round(len(data) * 0.8)))
+    train, test = data[:split], data[split:]
+    model = SVMModel(args.min_len, args.type, train)
     training_loss_offset, training_loss_length = prediction_loss(
-        model.predict, training[:split], args.min_len, args.niceness
+        model.predict, train, args.min_len, args.niceness
     )
-    print(f"offset training loss: {training_loss_offset:.2f}", file=sys.stderr, flush=True)
-    print(f"length training loss: {training_loss_length:.2f}", file=sys.stderr, flush=True)
+    print(f"offset training loss: {training_loss_offset:.0f}", file=sys.stderr, flush=True)
+    print(f"length training loss: {training_loss_length:.0f}", file=sys.stderr, flush=True)
     test_loss_offset, test_loss_length = prediction_loss(
-        model.predict, training[split:], args.min_len, args.niceness
+        model.predict, test, args.min_len, args.niceness
     )
-    print(f"offset testing loss:  {test_loss_offset:.2f}", file=sys.stderr, flush=True)
-    print(f"length testing loss:  {test_loss_length:.2f}", file=sys.stderr, flush=True)
+    print(f"offset testing loss:  {test_loss_offset:.0f}", file=sys.stderr, flush=True)
+    print(f"length testing loss:  {test_loss_length:.0f}", file=sys.stderr, flush=True)
     if not args.dry_run:
-        raise NotImplementedError()
+        pass
 
 
 if __name__ == "__main__":

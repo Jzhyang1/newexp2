@@ -229,7 +229,7 @@ def main() -> None:
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1)
     parser.add_argument("--predict-deltas", action="store_true")
-    parser.add_argument("--epochs", type=int, default=800)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--conv-channels", type=int, default=16)
     parser.add_argument("--hidden-size", type=int, default=32)
