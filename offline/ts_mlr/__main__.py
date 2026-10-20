@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import numpy as np
 import sys
-from typing import Sequence
+from typing import Any, Sequence
 from sklearn import linear_model
 from offline.data import load_training
 from offline.loss import prediction_loss
@@ -16,7 +17,7 @@ Vector = list[float]
 SIN_PERIODS = (2.0, 4.0, 8.0, 16.0)
 
 
-class SVMModel:
+class MLRModel:
     def __init__(self, history: int, mode: str, training: Sequence[Pair]):
         self.history = history
         self.mode = mode
@@ -69,6 +70,39 @@ class SVMModel:
             history.append(prediction)
         return predictions
 
+def serve(model: MLRModel) -> None:
+    """Serve the line-oriented JSON protocol used by ModelPolicy."""
+    test_offset_errors: list[float] = []
+    test_length_errors: list[float] = []
+    for line in sys.stdin:
+        request: dict[str, Any] = json.loads(line)
+        request_type = request.get("type")
+        if request_type == "get":
+            previous = [tuple(pair) for pair in request["prev_accesses"]]
+            print(json.dumps(model.predict(previous, int(request["next_n"]))), flush=True)
+        elif request_type == "put":
+            predicted = request.get("predicted_accesses", [])
+            actual = tuple(request["actual_accesses"])
+            if predicted:
+                test_offset_errors.append((int(predicted[0][0]) - actual[0]) ** 2)
+                test_length_errors.append((int(predicted[0][1]) - actual[1]) ** 2)
+            print("[]", flush=True)
+        elif request_type == "kill":
+            if test_offset_errors:
+                print(
+                    f"offset test loss: {math.sqrt(sum(test_offset_errors) / len(test_offset_errors)):.2f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"length test loss: {math.sqrt(sum(test_length_errors) / len(test_length_errors)):.2f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            break
+        else:
+            raise ValueError(f"unknown request type: {request_type!r}")
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"), default="predict_mean")
@@ -85,7 +119,7 @@ def main() -> None:
     data = load_training(args.training, args.predict_deltas)
     split = min(len(data), max(args.min_len + 1, round(len(data) * 0.8)))
     train, test = data[:split], data[split:]
-    model = SVMModel(args.min_len, args.type, train)
+    model = MLRModel(args.min_len, args.type, train)
     training_loss_offset, training_loss_length = prediction_loss(
         model.predict, train, args.min_len, args.niceness
     )

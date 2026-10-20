@@ -25,6 +25,11 @@ CXX := g++
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread
 LDFLAGS ?=
 
+# Helpers for pattern substitution
+NULL  :=
+SPACE := $(NULL) $(NULL)
+COMMA := ,
+
 # Output directories
 BUILD_DIR := build
 BIN_DIR := bin
@@ -139,10 +144,50 @@ GUEST_GUPS_SEED ?= 20261007
 # relative to the source file, so use a root image at least as large as the
 # selected cluster's disk (16T for the default shard).
 GUEST_THESIOS ?= 0
-GUEST_THESIOS_TRACE_URLS ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00000-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00001-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00002-of-00100,https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115/data-00003-of-00100
+GUEST_THESIOS_TRACE_NUM ?= 100
+GUEST_THESIOS_BASE_URL ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115
+GUEST_THESIOS_TRACE_SEQ_NUM := $(shell seq -f "%05g" 0 $(GUEST_THESIOS_TRACE_NUM))
+GUEST_THESIOS_TRACE_NAMES := $(addsuffix -of-00100,$(addprefix data-,$(GUEST_THESIOS_TRACE_SEQ_NUM)))
+GUEST_THESIOS_TRACE_SEQ_URL := $(addprefix $(GUEST_THESIOS_BASE_URL)/,$(GUEST_THESIOS_TRACE_NAMES))
+GUEST_THESIOS_TRACE_URLS := $(subst $(SPACE),$(COMMA),$(GUEST_THESIOS_TRACE_SEQ_URL))
 GUEST_THESIOS_MAX_REQUESTS ?= 0
 GUEST_THESIOS_DEVICE ?= /dev/vda
 GUEST_THESIOS_DIRECT_IO ?= 0
+
+# Host-side asset directories, filled by thesios-download / ycsb-download
+# below and read by build_image.sh (which picks only what the enabled
+# datasets need). Downloads are per-file make targets, so reruns only fetch
+# what is missing. GUPS needs no download (its table is generated locally);
+# apt/pip packages are still fetched inside the chroot.
+GUEST_ASSETS_DIR ?= disk/data/assets
+THESIOS_DIR ?= $(GUEST_ASSETS_DIR)/thesios
+YCSB_ASSETS_DIR ?= $(GUEST_ASSETS_DIR)/ycsb
+THESIOS_FILES := $(addprefix $(THESIOS_DIR)/,$(GUEST_THESIOS_TRACE_NAMES))
+YCSB_FILES := $(YCSB_ASSETS_DIR)/ycsb-$(GUEST_YCSB_VERSION).tar.gz \
+              $(YCSB_ASSETS_DIR)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar
+
+.PHONY: guest-assets thesios-download ycsb-download assets-clean
+guest-assets: thesios-download ycsb-download
+thesios-download: $(THESIOS_FILES)
+ycsb-download: $(YCSB_FILES)
+
+$(THESIOS_DIR)/data-%:
+	@mkdir -p $(THESIOS_DIR)
+	curl -fL --retry 3 -o $@.part $(GUEST_THESIOS_BASE_URL)/$(@F)
+	mv $@.part $@
+
+$(YCSB_ASSETS_DIR)/ycsb-$(GUEST_YCSB_VERSION).tar.gz:
+	@mkdir -p $(YCSB_ASSETS_DIR)
+	curl -fL --retry 3 -o $@.part https://github.com/brianfrankcooper/YCSB/releases/download/$(GUEST_YCSB_VERSION)/ycsb-$(GUEST_YCSB_VERSION).tar.gz
+	mv $@.part $@
+
+$(YCSB_ASSETS_DIR)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar:
+	@mkdir -p $(YCSB_ASSETS_DIR)
+	curl -fL --retry 3 -o $@.part https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/$(SQLITE_JDBC_VERSION)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar
+	mv $@.part $@
+
+assets-clean:
+	rm -rf $(GUEST_ASSETS_DIR)
 
 # FORCE_REBUILD=1 forces a full debootstrap rebuild even if $(DISK_IMG)
 # already exists -- default (0) is the fast path in build_image.sh: if
@@ -152,8 +197,10 @@ GUEST_THESIOS_DIRECT_IO ?= 0
 # actually needed, so the fast path doesn't touch the package manager at all.
 FORCE_REBUILD ?= 0
 
+# Only the downloads for datasets that are enabled are prerequisites (the
+# Thesios set is large); `make guest-assets` fetches everything regardless.
 .PHONY: guest-image
-guest-image:
+guest-image: $(if $(filter 1,$(GUEST_THESIOS)),thesios-download) $(if $(filter 1,$(GUEST_YCSB)),ycsb-download)
 	@if [ "$(FORCE_REBUILD)" = "1" ] || [ ! -f "$(DISK_IMG)" ]; then $(SUDO) apt-get install -y debootstrap; fi
 	$(SUDO) env ROOTFS_IMG=$(DISK_IMG) ROOTFS_SIZE=$(GUEST_ROOTFS_SIZE) DISTRO=$(GUEST_DISTRO) \
 	  ARCH=$(GUEST_ARCH) MIRROR=$(GUEST_MIRROR) WORKLOAD_SCRIPT=$(WORKLOAD_SCRIPT) \
@@ -169,7 +216,8 @@ guest-image:
 	  GUPS_DIRECT_IO=$(GUEST_GUPS_DIRECT_IO) GUPS_SEED=$(GUEST_GUPS_SEED) \
 	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URLS=$(GUEST_THESIOS_TRACE_URLS) \
 	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
-	  THESIOS_DIRECT_IO=$(GUEST_THESIOS_DIRECT_IO) \
+	  THESIOS_DIRECT_IO=$(GUEST_THESIOS_DIRECT_IO) THESIOS_DIR=$(THESIOS_DIR) \
+	  YCSB_ASSETS_DIR=$(YCSB_ASSETS_DIR) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh
 

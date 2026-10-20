@@ -29,6 +29,13 @@
 # tmpfs overlay) -- NOT systemd.volatile=yes, which would tmpfs everything
 # outside /usr and wipe /opt/workload on every boot.
 #
+# Datasets are downloaded ahead of time by the Makefile (`make thesios-download`,
+# `make ycsb-download`) into THESIOS_DIR / YCSB_ASSETS_DIR; this script only
+# picks the pieces it needs from those directories (the shards named by
+# THESIOS_TRACE_URLS, the YCSB tarball + JDBC driver for the given versions)
+# and bakes them in. Thesios shards missing from THESIOS_DIR fall back to a
+# direct download; a missing YCSB asset is an error.
+#
 # Must run as root (debootstrap/mount/chroot need it) on a Debian/Ubuntu
 # Linux host with debootstrap installed.
 #
@@ -43,7 +50,7 @@
 set -euo pipefail
 
 ROOTFS_IMG=${ROOTFS_IMG:?ROOTFS_IMG not set}
-ROOTFS_SIZE=${ROOTFS_SIZE:-3G}
+ROOTFS_SIZE=${ROOTFS_SIZE:-12G}
 DISTRO=${DISTRO:-bookworm}
 ARCH=${ARCH:-amd64}
 MIRROR=${MIRROR:-http://deb.debian.org/debian}
@@ -70,6 +77,9 @@ YCSB_DISTRIBUTION=${YCSB_DISTRIBUTION:-zipfian}
 # Single-threaded by default so a fixed seed produces a reproducible I/O trace.
 YCSB_THREADS=${YCSB_THREADS:-1}
 YCSB_SEED=${YCSB_SEED:-20261007}
+# Directory holding ycsb-<ver>.tar.gz and sqlite-jdbc-<ver>.jar (from
+# `make ycsb-download`).
+YCSB_ASSETS_DIR=${YCSB_ASSETS_DIR:-$(dirname "$ROOTFS_IMG")/assets/ycsb}
 
 # Optional: bake a disk-based GUPS RandomAccess table under /opt, so
 # kvm/guest/workloads/gups_bench.py has something real to issue random
@@ -93,6 +103,13 @@ THESIOS_TRACE_URLS=${THESIOS_TRACE_URLS:-https://storage.googleapis.com/thesios-
 THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-0}
 THESIOS_DEVICE=${THESIOS_DEVICE:-/dev/vda}
 THESIOS_DIRECT_IO=${THESIOS_DIRECT_IO:-0}
+# Directory of raw shards named like the URL basenames (`make thesios-download`).
+THESIOS_DIR=${THESIOS_DIR:-$(dirname "$ROOTFS_IMG")/assets/thesios}
+IFS=',' read -ra THESIOS_URLS <<< "$THESIOS_TRACE_URLS"
+THESIOS_TMP=$(mktemp)
+# Host-side cache of condensed shards, so changing/adding shards (or
+# rebuilding the image) never re-downloads ones already fetched.
+THESIOS_CACHE=${THESIOS_CACHE:-$(dirname "$ROOTFS_IMG")/thesios_cache}
 
 if [[ "$THESIOS_DIRECT_IO" != "0" && "$THESIOS_DIRECT_IO" != "1" ]]; then
     echo "THESIOS_DIRECT_IO must be 0 or 1" >&2
@@ -104,29 +121,24 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ -f "$ROOTFS_IMG" && "$FORCE_REBUILD" != "1" ]]; then
-    SYNC_ONLY=1
-else
-    SYNC_ONLY=0
+REBUILD_ROOTFS=0
+if [[ "$FORCE_REBUILD" == "1" || ! -f "$ROOTFS_IMG" ]]; then
+    REBUILD_ROOTFS=1
 fi
 
-REQUIRED_TOOLS=(losetup chroot rsync)
-[[ "$SYNC_ONLY" == "1" ]] || REQUIRED_TOOLS+=(debootstrap mkfs.ext4)
+REQUIRED_TOOLS=(losetup chroot rsync mount mkfs.ext4)
+[[ "$REBUILD_ROOTFS" == "1" ]] && REQUIRED_TOOLS+=(debootstrap)
 for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
-[[ -f "$WORKLOAD_SCRIPT" ]] || { echo "workload script not found: $WORKLOAD_SCRIPT" >&2; exit 1; }
-
-THESIOS_TMP=""
-if [[ "$THESIOS_ENABLE" == "1" && "$SYNC_ONLY" != "1" ]]; then
-    THESIOS_TMP=$(mktemp)
-    IFS=',' read -ra THESIOS_URLS <<< "$THESIOS_TRACE_URLS"
-    PREPARE_ARGS=()
-    for url in "${THESIOS_URLS[@]}"; do
-        PREPARE_ARGS+=(--url "$url")
+YCSB_TARBALL="$YCSB_ASSETS_DIR/ycsb-${YCSB_VERSION}.tar.gz"
+SQLITE_JDBC_JAR="$YCSB_ASSETS_DIR/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar"
+if [[ "$YCSB_ENABLE" == "1" ]]; then
+    for f in "$YCSB_TARBALL" "$SQLITE_JDBC_JAR"; do
+        [[ -s "$f" ]] || { echo "missing YCSB asset: $f (run make ycsb-download)" >&2; exit 1; }
     done
-    python3 kvm/guest/prepare_thesios.py --output "$THESIOS_TMP" "${PREPARE_ARGS[@]}"
 fi
+[[ -f "$WORKLOAD_SCRIPT" ]] || { echo "workload script not found: $WORKLOAD_SCRIPT" >&2; exit 1; }
 
 MNT=$(mktemp -d)
 LOOP=""
@@ -145,24 +157,70 @@ trap cleanup EXIT
 
 mkdir -p "$(dirname "$ROOTFS_IMG")" "$(dirname "$KERNEL_OUT")" "$(dirname "$INITRD_OUT")"
 
-if [[ "$SYNC_ONLY" == "1" ]]; then
-    echo "build_image.sh: $ROOTFS_IMG already exists -- syncing $WORKLOAD_SCRIPT onto it instead of rebuilding (set FORCE_REBUILD=1 for a full rebuild)"
-else
+# 3. Heavy-duty work: initialize the rootfs and provision missing datasets.
+if [[ "$REBUILD_ROOTFS" == "1" ]]; then
+    echo "build_image.sh: building a fresh rootfs at $ROOTFS_IMG"
     truncate -s "$ROOTFS_SIZE" "$ROOTFS_IMG"
     mkfs.ext4 -F -q "$ROOTFS_IMG"
+else
+    echo "build_image.sh: reusing existing rootfs $ROOTFS_IMG"
 fi
 
 LOOP=$(losetup -f --show "$ROOTFS_IMG")
 mount "$LOOP" "$MNT"
 
-if [[ "$SYNC_ONLY" != "1" ]]; then
+BASE_MISSING=0
+[[ -x "$MNT/usr/bin/python3" && -x "$MNT/usr/bin/systemctl" ]] || BASE_MISSING=1
+[[ "$REBUILD_ROOTFS" == "1" ]] && BASE_MISSING=1
 
-debootstrap --arch="$ARCH" "$DISTRO" "$MNT" "$MIRROR"
+# Each dataset records the parameters it was built with in a stamp file, so a
+# changed parameter (record count, table size, shard list...) regenerates just
+# that dataset while an unchanged one is reused as-is.
+STAMP_DIR="$MNT/opt/workload/.stamps"
+write_stamp() { mkdir -p "$STAMP_DIR"; printf '%s' "$2" > "$STAMP_DIR/$1"; }
+# An image built before stamps existed has data but no stamp: adopt it under
+# the current parameters rather than regenerating GBs of data.
+stamp_ok() {
+    [[ -f "$STAMP_DIR/$1" ]] || { write_stamp "$1" "$2"; return 0; }
+    [[ "$(cat "$STAMP_DIR/$1")" == "$2" ]]
+}
 
-cp /etc/resolv.conf "$MNT/etc/resolv.conf"
-mount --bind /dev "$MNT/dev"
-mount -t proc proc "$MNT/proc"
-mount -t sysfs sysfs "$MNT/sys"
+YCSB_STAMP="$YCSB_VERSION $SQLITE_JDBC_VERSION $YCSB_RECORDS $YCSB_FIELD_COUNT $YCSB_FIELD_LENGTH $YCSB_WORKLOAD $YCSB_SEED"
+GUPS_STAMP="$GUPS_TABLE_MB"
+THESIOS_STAMP=$(printf '%s\n' "${THESIOS_URLS[@]}" | sha256sum | cut -d' ' -f1)
+
+YCSB_MISSING=0
+if [[ "$YCSB_ENABLE" == "1" ]]; then
+    [[ -x "$MNT/usr/bin/java" && -x "$MNT/usr/bin/sqlite3" && -d "$MNT/opt/ycsb/lib" && -s "$MNT/opt/workload/ycsb.db" ]] \
+        && stamp_ok ycsb "$YCSB_STAMP" || YCSB_MISSING=1
+fi
+
+GUPS_MISSING=0
+if [[ "$GUPS_ENABLE" == "1" ]]; then
+    [[ -f "$MNT/opt/workload/gups_table.bin" ]] \
+        && [[ "$(stat -c %s "$MNT/opt/workload/gups_table.bin")" == "$((GUPS_TABLE_MB * 1024 * 1024))" ]] \
+        && stamp_ok gups "$GUPS_STAMP" || GUPS_MISSING=1
+fi
+
+THESIOS_MISSING=0
+if [[ "$THESIOS_ENABLE" == "1" ]]; then
+    [[ -s "$MNT/opt/workload/thesios_trace.csv" ]] && stamp_ok thesios "$THESIOS_STAMP" || THESIOS_MISSING=1
+fi
+
+# Anything that runs inside the chroot (apt, curl, java, dd if=/dev/zero)
+# needs DNS and /dev,/proc,/sys -- set up once here instead of only in the
+# base-install branch, which a reused image skips.
+if [[ "$BASE_MISSING" == "1" || "$YCSB_MISSING" == "1" || "$GUPS_MISSING" == "1" ]]; then
+    if [[ "$REBUILD_ROOTFS" == "1" ]]; then
+        debootstrap --arch="$ARCH" "$DISTRO" "$MNT" "$MIRROR"
+    fi
+    cp /etc/resolv.conf "$MNT/etc/resolv.conf"
+    mount --bind /dev "$MNT/dev"
+    mount -t proc proc "$MNT/proc"
+    mount -t sysfs sysfs "$MNT/sys"
+fi
+
+if [[ "$BASE_MISSING" == "1" ]]; then
 
 chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get update
 chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -171,24 +229,23 @@ chroot "$MNT" pip3 install --break-system-packages --no-cache-dir faiss-cpu
 
 mkdir -p "$MNT/opt/workload"
 
-if [[ "$YCSB_ENABLE" == "1" ]]; then
-    chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless sqlite3 curl
+fi
 
+YCSB_DB=/opt/workload/ycsb.db
+if [[ "$YCSB_MISSING" == "1" ]]; then
+    chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get update
+    chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        openjdk-17-jre-headless sqlite3
+
+    chroot "$MNT" rm -rf /opt/ycsb "$YCSB_DB"
     chroot "$MNT" mkdir -p /opt/ycsb
-    chroot "$MNT" curl -fsSL -o /tmp/ycsb.tar.gz \
-        "https://github.com/brianfrankcooper/YCSB/releases/download/${YCSB_VERSION}/ycsb-${YCSB_VERSION}.tar.gz"
-    chroot "$MNT" tar -xzf /tmp/ycsb.tar.gz -C /opt/ycsb --strip-components=1
-    chroot "$MNT" rm /tmp/ycsb.tar.gz
+    tar -xzf "$YCSB_TARBALL" -C "$MNT/opt/ycsb" --strip-components=1
 
     # Generic JDBC binding + SQLite driver -- YCSB has no bundled sqlite
     # binding, but `db=jdbc` works against any JDBC driver on its classpath.
-    chroot "$MNT" mkdir -p /opt/ycsb/jdbc-binding/lib
-    chroot "$MNT" curl -fsSL \
-        -o "/opt/ycsb/jdbc-binding/lib/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar" \
-        "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/${SQLITE_JDBC_VERSION}/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar"
+    mkdir -p "$MNT/opt/ycsb/jdbc-binding/lib"
+    cp "$SQLITE_JDBC_JAR" "$MNT/opt/ycsb/jdbc-binding/lib/"
 
-    YCSB_DB=/opt/workload/ycsb.db
     cols=""
     for ((i = 0; i < YCSB_FIELD_COUNT; i++)); do
         cols+="FIELD${i} TEXT, "
@@ -212,24 +269,38 @@ if [[ "$YCSB_ENABLE" == "1" ]]; then
     chroot "$MNT" bash -c "cd /opt/ycsb && java -cp '$YCSB_CP' site.ycsb.Client -load \
         -db site.ycsb.db.JdbcDBClient \
         -P workloads/${YCSB_WORKLOAD} \
-        -p db.driver=org.sqlite.JDBC -p db.url=jdbc:sqlite:${YCSB_DB} \
+        -p db.driver=org.sqlite.JDBC \
+        -p 'db.url=jdbc:sqlite:${YCSB_DB}?journal_mode=OFF&synchronous=OFF' \
+        -p jdbc.autocommit=false -p jdbc.batchupdateapi=true -p db.batchsize=1000 \
         -p recordcount=${YCSB_RECORDS} -p fieldcount=${YCSB_FIELD_COUNT} \
         -p fieldlength=${YCSB_FIELD_LENGTH} -p seed=${YCSB_SEED} -threads 1"
-
+    write_stamp ycsb "$YCSB_STAMP"
 fi
 
-if [[ "$GUPS_ENABLE" == "1" ]]; then
+if [[ "$GUPS_MISSING" == "1" ]]; then
     # Written with real zero bytes rather than left as a sparse hole: a
     # hole would let the *guest's own* ext4 resolve reads as all-zero
     # in-kernel without ever issuing a block I/O request, so nbd_server
     # (and the cache/prefetch policy under test) would never see the
     # access at all -- same reasoning as YCSB's real SQLite rows above.
     GUPS_TABLE=/opt/workload/gups_table.bin
+    chroot "$MNT" rm -f "$GUPS_TABLE"
     chroot "$MNT" dd if=/dev/zero of="$GUPS_TABLE" bs=1M count="$GUPS_TABLE_MB" status=none
+    write_stamp gups "$GUPS_STAMP"
 fi
 
-fi # SYNC_ONLY
+if [[ "$THESIOS_MISSING" == "1" ]]; then
+    PREPARE_ARGS=()
+    for url in "${THESIOS_URLS[@]}"; do
+        PREPARE_ARGS+=(--url "$url")
+    done
+    python3 kvm/guest/prepare_thesios.py --cache-dir "$THESIOS_CACHE" --trace-dir "$THESIOS_DIR" \
+        --output "$THESIOS_TMP" "${PREPARE_ARGS[@]}"
+    cp "$THESIOS_TMP" "$MNT/opt/workload/thesios_trace.csv"
+    write_stamp thesios "$THESIOS_STAMP"
+fi
 
+# 2. Per-run synchronization: workload code, config files, and service wiring.
 mkdir -p "$MNT/opt/workload"
 if [[ "$GUPS_ENABLE" == "1" ]]; then
         cat > "$MNT/opt/workload/gups_config.json" <<EOF
@@ -244,11 +315,8 @@ if [[ "$GUPS_ENABLE" == "1" ]]; then
 EOF
 fi
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
-        THESIOS_TRACE=/opt/workload/thesios_trace.csv
-    if [[ "$SYNC_ONLY" != "1" ]]; then
-        cp "$THESIOS_TMP" "$MNT${THESIOS_TRACE}"
-    fi
-        cat > "$MNT/opt/workload/thesios_config.json" <<EOF
+    THESIOS_TRACE=/opt/workload/thesios_trace.csv
+    cat > "$MNT/opt/workload/thesios_config.json" <<EOF
 {
     "trace_path": "${THESIOS_TRACE}",
     "device_path": "${THESIOS_DEVICE}",
@@ -344,7 +412,10 @@ if [[ "$THESIOS_ENABLE" == "1" && ! -s "$MNT/opt/workload/thesios_trace.csv" ]];
     exit 1
 fi
 
-if [[ "$SYNC_ONLY" != "1" ]]; then
+# There are currently no tasks exclusive to FORCE_REBUILD. Recreating the
+# rootfs above naturally reruns all heavy provisioning; these boot artifacts
+# are needed whenever the base image was newly provisioned or repaired.
+if [[ "$BASE_MISSING" == "1" ]]; then
 
 # Autologin on the serial console so kvm/launch.py's display:none serial log
 # (<log_dir>/<name>.serial.log) shows the workload's output with no ssh/network
@@ -358,15 +429,19 @@ ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %I $TERM
 EOF
 chroot "$MNT" passwd -d root
 
+fi
+
+if [[ "$BASE_MISSING" == "1" || ! -s "$KERNEL_OUT" || ! -s "$INITRD_OUT" ]]; then
+
 KVER=$(chroot "$MNT" bash -c "ls /boot | grep '^vmlinuz-' | sort -V | tail -1")
 INITRD_NAME=$(chroot "$MNT" bash -c "ls /boot | grep '^initrd.img-' | sort -V | tail -1")
 cp "$MNT/boot/$KVER" "$KERNEL_OUT"
 cp "$MNT/boot/$INITRD_NAME" "$INITRD_OUT"
 
-fi # SYNC_ONLY
+fi
 
-if [[ "$SYNC_ONLY" == "1" ]]; then
-    echo "guest image synced: $ROOTFS_IMG (workload only -- kernel/initrd/packages/YCSB dataset untouched; set FORCE_REBUILD=1 for a full rebuild)"
+if [[ "$REBUILD_ROOTFS" == "0" ]]; then
+    echo "guest image updated: $ROOTFS_IMG (workload/configs synced; missing datasets repaired as needed)"
 else
     echo "guest image built: $ROOTFS_IMG"
 fi

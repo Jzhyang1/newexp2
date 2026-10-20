@@ -11,8 +11,13 @@ miss_latency_ns: 300000
 warmup: 0
 
 evict_policy: lru
-prefetch_policy: oracle
+prefetch_policy: model-prefetcher       # none | readahead | oracle | model-prefetcher | cminer | quickmine | mithril
 oracle_file: ./logs/oracle.csv
+# Required when prefetch_policy is `model-prefetcher`
+prefetcher_path: offline.ts_mlr
+prefetcher_type: predict_mean
+prefetcher_min_len: 32
+prefetcher_training: ./logs/oracle.csv
 
 log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv
