@@ -19,20 +19,32 @@ WEB = ROOT / "tools" / "experiment_ui.html"
 LOG_DIR = ROOT / "logs" / "ui"
 PID_FILE = LOG_DIR / "action.pid"
 DEFAULT_WORKLOAD = "kvm/guest/workloads/ycsb_bench.py"
+
 WORKLOADS = {
-    "ycsb": "kvm/guest/workloads/ycsb_bench.py",
-    "gups": "kvm/guest/workloads/gups_bench.py",
-    "scan": "kvm/guest/workloads/large_scan.py",
+    path.name.removesuffix('.py'): f"kvm/guest/workloads/{path.name}"
+    for path in Path("kvm/guest/workloads").iterdir()
 }
 
+yaml_files = [path.name for path in Path("disk").iterdir() if path.is_file() and path.name.casefold().endswith('.yaml')]
+
+
+def vm_config_name(nbd_name):
+    if nbd_name == "nbd.yaml":
+        return "vms.yaml"
+    if nbd_name == "nbd_cxt_aware.yaml":
+        return "vms_lru_vs_cxtaware.yaml"
+    return nbd_name.replace("nbd_", "vms_", 1)
+
+
 CONFIGS = [
-    {"id": "default", "label": "Default / oracle", "nbd": "disk/nbd.yaml", "vms": "kvm/vms.yaml"},
-    {"id": "2vm", "label": "Two VMs", "nbd": "disk/nbd_2vm.yaml", "vms": "kvm/vms_2vm.yaml"},
-    {"id": "4vm", "label": "Four VMs", "nbd": "disk/nbd_4vm.yaml", "vms": "kvm/vms_4vm.yaml"},
-    {"id": "moremem", "label": "More memory", "nbd": "disk/nbd_moremem.yaml", "vms": "kvm/vms_moremem.yaml"},
-    {"id": "mix4vm", "label": "Mixed four VM", "nbd": "disk/nbd_mix4vm.yaml", "vms": "kvm/vms_mix4vm.yaml"},
-    {"id": "lru-readahead", "label": "LRU + readahead", "nbd": "disk/nbd_lru_readahead.yaml", "vms": "kvm/vms_lru_vs_cxtaware.yaml"},
-    {"id": "cxt-aware", "label": "Context-aware", "nbd": "disk/nbd_cxt_aware.yaml", "vms": "kvm/vms_lru_vs_cxtaware.yaml"},
+    {
+        "id": name.removesuffix('.yaml'),
+        "label": name.removesuffix('.yaml').removeprefix('nbd').replace('_', ' ').strip() or 'default',
+        "nbd": f'disk/{name}',
+        'vms': f'kvm/{vm_config_name(name)}'
+    }
+    for name in yaml_files
+    if (Path("kvm") / vm_config_name(name)).exists()
 ]
 
 
@@ -165,24 +177,21 @@ def action_worker(action, payload):
             args += ["GUEST_GUPS=1", "GUEST_YCSB=0"]
         else:
             args += ["GUEST_YCSB=0", "GUEST_GUPS=0"]
-        if payload.get("force"):
-            args.append("FORCE_REBUILD=1")
         return run_action(action, args)
-    if action == "compile":
-        return run_action(action, ["make", "nbd"])
     if action == "launch":
+        if not (ROOT / "disk/data/nbd_disk.img").exists():
+            raise ValueError("Build the guest image before launching; Launch experiment will not create a disk image.")
         return run_action(action, ["make", "experiment", f"NBD_CONFIG={config['nbd']}", f"VMS_CONFIG={config['vms']}", "RANDOM=0"])
     if action == "teardown":
         return run_action(action, ["make", "experiment-down"])
-    if action == "force-teardown":
-        run_action(action, ["python3", "kvm/launch.py", config["vms"], "--stop", "--force"])
-        return run_action(action, ["make", "nbd-stop"])
     raise ValueError(f"unknown action: {action}")
 
 
 def start_action(action, payload):
     if pid_alive(PID_FILE):
         return {"ok": False, "error": "Another action is already running."}
+    if action == "launch" and not (ROOT / "disk/data/nbd_disk.img").exists():
+        return {"ok": False, "error": "Build the guest image before launching; Launch experiment will not create a disk image."}
     thread = threading.Thread(target=action_worker, args=(action, payload), daemon=True)
     thread.start()
     return {"ok": True, "started": action}
@@ -259,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             action = payload.get("action")
-            if action not in {"build", "compile", "launch", "teardown", "force-teardown"}:
+            if action not in {"build", "launch", "teardown"}:
                 raise ValueError("unsupported action")
             self.send_json(start_action(action, payload))
         except (ValueError, json.JSONDecodeError) as error:
@@ -267,6 +276,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("EXPERIMENT_UI_PORT", "8765"))
+    port = int(os.environ.get("EXPERIMENT_UI_PORT", "7765"))
     print(f"Experiment UI: http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
