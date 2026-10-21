@@ -144,7 +144,7 @@ GUEST_GUPS_SEED ?= 20261007
 # relative to the source file, so use a root image at least as large as the
 # selected cluster's disk (16T for the default shard).
 GUEST_THESIOS ?= 0
-GUEST_THESIOS_TRACE_NUM ?= 100
+GUEST_THESIOS_TRACE_NUM ?= 99
 GUEST_THESIOS_BASE_URL ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115
 GUEST_THESIOS_TRACE_SEQ_NUM := $(shell seq -f "%05g" 0 $(GUEST_THESIOS_TRACE_NUM))
 GUEST_THESIOS_TRACE_NAMES := $(addsuffix -of-00100,$(addprefix data-,$(GUEST_THESIOS_TRACE_SEQ_NUM)))
