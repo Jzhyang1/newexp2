@@ -331,6 +331,8 @@ first if the file is new or empty. Columns:
   breakdown (total simulated latency charged per request; time attributed
   to client think-time vs. evict/prefetch policy hook compute, respectively)
 - `runtime_seconds` — wall-clock time the server was up
+- `simulated_time_seconds` — the simulator's virtual-clock end time (guest think time + policy compute + flat `miss_latency_ns` per request with a miss); equal to `runtime_seconds` when `latency_mode: physical`
+- `latency_mode` — `simulated` or `physical`, as configured for the run
 
 Independently, every request is also logged as it happens (not just on
 shutdown) to the config's `access_log:` path (default

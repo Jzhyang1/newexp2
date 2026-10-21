@@ -618,7 +618,7 @@ void AppendLog(const Config& cfg, const Stats& stats) {
     out << "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
            "warmup,evict_policy,prefetch_policy,request_count,hits,misses,hit_ratio,evictions,"
            "bytes_read,bytes_written,avg_latency_ns,worker_latency_ns,policy_latency_ns,"
-           "runtime_seconds\n";
+           "runtime_seconds,simulated_time_seconds,latency_mode\n";
   }
 
   const uint64_t measured = stats.hits + stats.misses;
@@ -648,7 +648,12 @@ void AppendLog(const Config& cfg, const Stats& stats) {
       << avg_latency_ns << ','
       << stats.worker_latency_ns << ','
       << stats.policy_latency_ns << ','
-      << static_cast<double>(stats.real_time_elapsed_ns) / 1e9
+      << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ','
+      // Physical mode already pays miss latency in real time, so the simulated
+      // clock is just the measured runtime there.
+      << static_cast<double>(cfg.latency_mode == "physical" ? stats.real_time_elapsed_ns
+                                                              : stats.sim_time_elapsed_ns) / 1e9 << ','
+      << cfg.latency_mode
       << '\n';
 
   std::fprintf(stderr, "nbd: appended stats to %s\n", cfg.log.c_str());

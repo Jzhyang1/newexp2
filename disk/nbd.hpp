@@ -19,6 +19,7 @@ struct Stats {
     uint64_t bytes_written{0};
     uint64_t total_latencies{0};
     uint64_t real_time_elapsed_ns{0};
+    uint64_t sim_time_elapsed_ns{0};  // virtual-clock end of the slowest worker (includes modeled miss latency)
     uint64_t worker_latency_ns{0};  // real time apps spent between handoff and their next request
     uint64_t policy_latency_ns{0};  // real compute time spent inside evict/prefetch policy hooks
 };

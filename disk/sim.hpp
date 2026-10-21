@@ -159,6 +159,9 @@ public:
             std::lock_guard _{mu};
             // Make sure all read requests are charged
             total_elapsed_ns = worker_run_ns + prefetch_ns + evict_ns;
+            // Modeled miss latency: flat per request with >=1 miss, matching
+            // the physical delay applied in nbd.cpp's ServeTransmission.
+            if (hit_count < total_count) total_elapsed_ns += cache.miss_latency_ns;
             worker_virt_end_ns = worker_virt_start_ns + total_elapsed_ns;
             if (worker_virt_end_ns > steady_max_virt_ns) steady_max_virt_ns = worker_virt_end_ns;
             worker_virtual_time[worker_id] = worker_virt_end_ns;
@@ -214,6 +217,7 @@ public:
         // `mu`, so it needs the same lock.
         std::lock_guard _{mu};
         stats.real_time_elapsed_ns = steady_ns() - sim_start;
+        stats.sim_time_elapsed_ns = steady_max_virt_ns;
         return stats;
     }
 
