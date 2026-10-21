@@ -248,7 +248,14 @@ bool SendReply(int fd, uint32_t error, uint64_t handle) {
 }
 
 // Transmission phase: serve requests until the client disconnects.
-void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id) {
+//
+// `physical_miss_ns` is 0 in "simulated" latency mode (the simulator just
+// accumulates latency in its stats). In "physical" mode it is miss_latency_ns:
+// a read request containing at least one cache miss is delayed by that flat
+// amount of real time before its data is sent, so the guest's measured run
+// time reflects cache performance. (Flat per request, not per missed sector.)
+void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
+                       uint64_t physical_miss_ns) {
   static thread_local std::vector<uint8_t> buf(1 << 20, 0);
 
   for (;;) {
@@ -278,7 +285,11 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id) {
         uint64_t remaining = length;
         while (remaining > 0) {
           size_t chunk = static_cast<size_t>(std::min<uint64_t>(remaining, buf.size()));
-          reader->read(worker_id, offset, chunk, buf.data());
+          uint64_t miss_blocks = 0;
+          reader->read(worker_id, offset, chunk, buf.data(), &miss_blocks);
+          if (physical_miss_ns > 0 && miss_blocks > 0) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(physical_miss_ns));
+          }
           if (!WriteFull(fd, buf.data(), chunk)) return;
           offset += chunk;
           remaining -= chunk;
@@ -305,7 +316,8 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id) {
   }
 }
 
-void HandleClient(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker_id) {
+void HandleClient(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker_id,
+                  uint64_t physical_miss_ns) {
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   // Every connection runs on its own detached thread (see AcceptLoop below);
@@ -315,7 +327,7 @@ void HandleClient(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker
   // flush the CSV stats log. Contain it to this one connection instead.
   try {
     if (DoHandshake(fd, size, worker_id)) {
-      ServeTransmission(fd, reader, worker_id);
+      ServeTransmission(fd, reader, worker_id, physical_miss_ns);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "nbd: worker %llu connection crashed: %s\n",
@@ -359,7 +371,7 @@ int Listen(uint16_t port) {
 // `ports:` list), so the simulator can tell clients apart by which port they
 // dialed. Each connection is handled on its own detached thread.
 void AcceptLoop(int listen_fd, uint16_t port, BlockReadClass* reader, uint64_t size,
-                 uint64_t worker_id) {
+                 uint64_t worker_id, uint64_t physical_miss_ns) {
   for (;;) {
     int fd = accept(listen_fd, nullptr, nullptr);
     if (fd < 0) {
@@ -371,7 +383,7 @@ void AcceptLoop(int listen_fd, uint16_t port, BlockReadClass* reader, uint64_t s
                  port, static_cast<unsigned long long>(worker_id));
     // HandleClient owns fd for the lifetime of the connection and closes it
     // itself.
-    std::thread(HandleClient, fd, reader, size, worker_id).detach();
+    std::thread(HandleClient, fd, reader, size, worker_id, physical_miss_ns).detach();
   }
 }
 
@@ -388,6 +400,7 @@ struct Config {
   std::size_t capacity = 4096;        // cache capacity, in SECTOR_SIZE-sized pages
   uint64_t hit_latency_ns = 0;
   uint64_t miss_latency_ns = 0;
+  std::string latency_mode = "simulated"; // simulated | physical (sleep miss_latency_ns per missing read)
   uint64_t warmup = 0;
   std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware | mru
   std::string prefetch_policy = "none";   // none | readahead | oracle | cminer | quickmine | mithril | readahead_cxt_aware
@@ -460,6 +473,11 @@ Config LoadConfig(const std::string& path) {
       cfg.hit_latency_ns = std::stoull(value);
     } else if (key == "miss_latency_ns") {
       cfg.miss_latency_ns = std::stoull(value);
+    } else if (key == "latency_mode") {
+      if (value != "simulated" && value != "physical") {
+        throw std::runtime_error("latency_mode must be 'simulated' or 'physical'");
+      }
+      cfg.latency_mode = value;
     } else if (key == "warmup") {
       cfg.warmup = std::stoull(value);
     } else if (key == "evict_policy") {
@@ -719,9 +737,11 @@ int main(int argc, char **argv) {
   std::fprintf(stderr, "nbd server: exporting %llu bytes from %s over %zu port(s)\n",
                static_cast<unsigned long long>(size), cfg.file.c_str(), cfg.ports.size());
 
+  const uint64_t physical_miss_ns =
+      cfg.latency_mode == "physical" ? cfg.miss_latency_ns : 0;
   for (size_t i = 0; i < cfg.ports.size(); ++i) {
     std::thread(nbd::AcceptLoop, listen_fds[i], cfg.ports[i], reader, size,
-                static_cast<uint64_t>(i)).detach();
+                static_cast<uint64_t>(i), physical_miss_ns).detach();
   }
 
   int sig = 0;

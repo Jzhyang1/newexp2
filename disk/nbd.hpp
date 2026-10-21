@@ -26,7 +26,10 @@ struct Stats {
 class BlockReadClass {
 public:
     // returns the amount actually read; length == buf_sz
-    virtual uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf) = 0;
+    // If non-null, *miss_blocks is set to the number of sectors in this read
+    // that were not already cached (before this request's own admissions).
+    virtual uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf,
+                          uint64_t* miss_blocks = nullptr) = 0;
     // the simulator needs to be drained before we get its stats
     virtual void drain() = 0;
     virtual const Stats& get_stats() = 0;

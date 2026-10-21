@@ -69,7 +69,8 @@ public:
                 sim_start = steady_ns();
             }
 
-    uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf) override {
+    uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf,
+                  uint64_t* miss_blocks = nullptr) override {
         // manage warmup period
         bool count_stats = global_idx.fetch_add(1) >= warmup;
 
@@ -175,6 +176,8 @@ public:
                 std::fflush(access_log);
             }
         }
+
+        if (miss_blocks) *miss_blocks = total_count - hit_count;
 
         // perform the actual response. pread (rather than fseek+fread) is
         // used because `f` is shared by every client thread: fseek would

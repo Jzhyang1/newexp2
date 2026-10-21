@@ -18,6 +18,11 @@ ports: [10809, 10810, 10811]
 capacity: 4096              # cache capacity, in SECTOR_SIZE (512B) pages
 hit_latency_ns: 30000
 miss_latency_ns: 300000
+# simulated: the simulator accumulates latency in its stats (default).
+# physical:  a read containing at least one cache miss is physically delayed
+#            by a flat miss_latency_ns before the reply, so guest run time
+#            becomes the metric.
+latency_mode: simulated     # simulated | physical
 warmup: 0                   # requests to skip before counting stats
 
 evict_policy: lru           # none | fifo | lifo | lru
