@@ -18,12 +18,13 @@ SIN_PERIODS = (2.0, 4.0, 8.0, 16.0)
 
 
 class MLRModel:
-    def __init__(self, history: int, mode: str, training: Sequence[Pair]):
+    def __init__(self, history: int, mode: str, training: Sequence[Pair], offset_length_covar: bool):
         self.history = history
         self.mode = mode
         self.fallback = self._summary(training)
+        self.offset_length_covar = offset_length_covar
         x = [
-            self._features(training[index - history : index])
+            training[index - history : index]
             for index in range(history, len(training))
         ]
         y_offset = [training[index][0] for index in range(history, len(training))]
@@ -45,15 +46,23 @@ class MLRModel:
 
     def _features(self, history: Sequence[Pair]) -> Vector:
         features: Vector = []
-        for index, pair in enumerate(history):
-            age = float(len(history) - index)
-            features.extend((float(pair[0]), float(pair[1]), age))
-            features.extend(math.sin(math.tau * age / period) for period in SIN_PERIODS)
+        for pair in history:
+            # empirically, extending the features with sine/age has not been helpful
+            features.extend((float(pair[0]), float(pair[1])))
         return features
+    
+    def _features_offset(self, history: Sequence[Pair]) -> Vector:
+        if self.offset_length_covar: return self._features(history)
+        return [float(pair[0]) for pair in history]
+    
 
-    def _fit(self, x: Sequence[Vector], y_offset: Sequence[float], y_length: Sequence[float]) -> None:
-        self.fit_offset = linear_model.LinearRegression().fit(x, y_offset)
-        self.fit_length = linear_model.LinearRegression().fit(x, y_length)
+    def _features_length(self, history: Sequence[Pair]) -> Vector:
+        if self.offset_length_covar: return self._features(history)
+        return [float(pair[1]) for pair in history]
+
+    def _fit(self, x: Sequence[Vector[Pair]], y_offset: Sequence[float], y_length: Sequence[float]) -> None:
+        self.fit_offset = linear_model.LinearRegression().fit([self._features_offset(x_item) for x_item in x], y_offset)
+        self.fit_length = linear_model.LinearRegression().fit([self._features_length(x_item) for x_item in x], y_length)
 
     def predict(self, previous: Sequence[Pair], count: int) -> list[Pair]:
         if count < 0:
@@ -63,8 +72,9 @@ class MLRModel:
             return [self.fallback] * count
         predictions: list[Pair] = []
         for _ in range(count):
-            features = [self._features(history[-self.history :])]
-            offset, span = self.fit_offset.predict(features)[0], self.fit_length.predict(features)[0]
+            h = history[-self.history:]
+            offset_feat, length_feat = [self._features_offset(h)], [self._features_length(h)]
+            offset, span = self.fit_offset.predict(offset_feat)[0], self.fit_length.predict(length_feat)[0]
             prediction = (offset, round(span))
             predictions.append(prediction)
             history.append(prediction)
@@ -110,6 +120,7 @@ def main() -> None:
     parser.add_argument("--niceness", type=int, default=1)
     parser.add_argument("--predict-deltas", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--covar-o-l", action="store_true", help="Whether offsets should see previous sequences of lengths and vice versa")
     parser.add_argument("--training", required=True)
     args = parser.parse_args()
     if args.min_len < 1:
@@ -119,7 +130,7 @@ def main() -> None:
     data = load_training(args.training, args.predict_deltas)
     split = min(len(data), max(args.min_len + 1, round(len(data) * 0.8)))
     train, test = data[:split], data[split:]
-    model = MLRModel(args.min_len, args.type, train)
+    model = MLRModel(args.min_len, args.type, train, args.covar_o_l)
     training_loss_offset, training_loss_length = prediction_loss(
         model.predict, train, args.min_len, args.niceness
     )
