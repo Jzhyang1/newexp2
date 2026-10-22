@@ -178,12 +178,12 @@ $(THESIOS_DIR)/data-%:
 
 $(YCSB_ASSETS_DIR)/ycsb-$(GUEST_YCSB_VERSION).tar.gz:
 	@mkdir -p $(YCSB_ASSETS_DIR)
-	curl -fL --retry 3 -o $@.part https://github.com/brianfrankcooper/YCSB/releases/download/$(GUEST_YCSB_VERSION)/ycsb-$(GUEST_YCSB_VERSION).tar.gz
+	curl -fL -C - --retry 10 --retry-all-errors --retry-delay 2 -o $@.part https://github.com/brianfrankcooper/YCSB/releases/download/$(GUEST_YCSB_VERSION)/ycsb-$(GUEST_YCSB_VERSION).tar.gz
 	mv $@.part $@
 
 $(YCSB_ASSETS_DIR)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar:
 	@mkdir -p $(YCSB_ASSETS_DIR)
-	curl -fL --retry 3 -o $@.part https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/$(SQLITE_JDBC_VERSION)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar
+	curl -fL -C - --retry 10 --retry-all-errors --retry-delay 2 -o $@.part https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/$(SQLITE_JDBC_VERSION)/sqlite-jdbc-$(SQLITE_JDBC_VERSION).jar
 	mv $@.part $@
 
 assets-clean:
