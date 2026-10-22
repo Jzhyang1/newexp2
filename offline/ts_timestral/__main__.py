@@ -59,7 +59,7 @@ class TimestralModel:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"), default="predict_mean")
+    parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"), default="predict_min")
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1)
     parser.add_argument("--predict-deltas", action="store_true")
