@@ -73,6 +73,9 @@ DEFAULTS = {
     "initrd": None,
     "append": None,
     "workload_args": {},
+    # Per-VM directory shared with the guest over 9p (tag "results"); the
+    # guest's run.sh writes workload.info there for nbd_server to pick up.
+    "share": True,
     "extra_drives": [],
     "extra_args": [],
 }
@@ -122,6 +125,10 @@ def log_path(vm):
 
 def serial_log_path(vm):
     return os.path.join(vm["log_dir"], f"{vm['name']}.serial.log")
+
+
+def share_dir_path(vm):
+    return os.path.join(vm["log_dir"], f"{vm['name']}.share")
 
 
 def qemu_log_path(vm):
@@ -217,6 +224,12 @@ def build_command(vm):
 
     cmd += build_network_args(vm)
 
+    if vm.get("share", True):
+        # security_model=none: files land on the host as the qemu user, no
+        # xattr bookkeeping -- fine for a tiny results directory.
+        cmd += ["-virtfs", f"local,id=results,path={share_dir_path(vm)},"
+                           "mount_tag=results,security_model=none"]
+
     if vm.get("kernel"):
         cmd += ["-kernel", vm["kernel"]]
         if vm.get("initrd"):
@@ -259,10 +272,18 @@ def build_command(vm):
 def ensure_dirs(vm):
     os.makedirs(vm["run_dir"], exist_ok=True)
     os.makedirs(vm["log_dir"], exist_ok=True)
+    if vm.get("share", True):
+        os.makedirs(share_dir_path(vm), exist_ok=True)
 
 
 def start_vm(vm, dry_run):
     ensure_dirs(vm)
+    if vm.get("share", True) and not dry_run:
+        # Drop last run's result so a VM that never finishes can't report it.
+        try:
+            os.remove(os.path.join(share_dir_path(vm), "workload.info"))
+        except FileNotFoundError:
+            pass
     cmd = build_command(vm)
 
     if dry_run:

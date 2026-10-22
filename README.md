@@ -333,6 +333,14 @@ first if the file is new or empty. Columns:
 - `runtime_seconds` — wall-clock time the server was up
 - `simulated_time_seconds` — the simulator's virtual-clock end time (guest think time + policy compute + flat `miss_latency_ns` per request with a miss); equal to `runtime_seconds` when `latency_mode: physical`
 - `latency_mode` — `simulated` or `physical`, as configured for the run
+- `workload`, `workload_runtime_seconds` — the guest workload's name and the
+  wall time of just the workload process, read at shutdown from the
+  `<vm_log_dir>/<vm>.share/workload.info` file the guest's `run.sh` writes
+  into the 9p directory `kvm/launch.py` shares with each VM (only files
+  modified since the server started).
+  `runtime_seconds` minus this approximates kernel/boot-incurred time. Multiple
+  VMs are `;`-joined; empty if unavailable (e.g. a guest not built by
+  `make guest-image`, or the VM still running).
 
 Independently, every request is also logged as it happens (not just on
 shutdown) to the config's `access_log:` path (default

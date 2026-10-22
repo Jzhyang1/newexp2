@@ -352,14 +352,36 @@ fi
 # it to the serial console for free) lets the host tell a crashed run from a
 # successful one after the fact, since QEMU exiting looks identical either
 # way (see kvm/launch.py's check_workload_result()).
+#
+# The workload.info file is a coarse approximation of workload-vs-kernel
+# time: it's the wall time of run.py alone, so boot/shutdown time
+# (kernel-incurred) is whatever the host sees beyond it. It's written into the
+# 9p directory kvm/launch.py shares with each VM (mount_tag=results) and read
+# by nbd_server into nbd_results.csv (see ReadWorkloadInfo in disk/nbd.cpp).
+# /run is used as the mount point because root is read-only. If the mount
+# fails (no share configured) the line still goes to the console, and
+# nothing else depends on it.
+basename "$WORKLOAD_SCRIPT" .py > "$MNT/opt/workload/workload_name"
 cat > "$MNT/opt/workload/run.sh" <<'EOF'
 #!/bin/sh
+start=$(date +%s.%N)
 python3 /opt/workload/run.py
 status=$?
+end=$(date +%s.%N)
 if [ "$status" -eq 0 ]; then
     echo "WORKLOAD_RESULT: PASS"
 else
     echo "WORKLOAD_RESULT: FAIL exit=$status"
+fi
+runtime=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.3f", e - s }')
+info="name=$(cat /opt/workload/workload_name) runtime_seconds=$runtime"
+echo "WORKLOAD_INFO: $info"
+mkdir -p /run/results
+modprobe 9pnet_virtio 2>/dev/null; modprobe 9p 2>/dev/null
+if mount -t 9p -o trans=virtio results /run/results 2>/dev/null; then
+    echo "$info" > /run/results/workload.info
+    sync
+    umount /run/results
 fi
 poweroff
 EOF

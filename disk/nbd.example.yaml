@@ -48,3 +48,9 @@ log: ./logs/nbd_results.csv
 # parser skips lines with an empty value, so the only way to disable it is
 # to point it at a different path or change the default in disk/nbd.cpp.
 access_log: ./logs/nbd_access.csv
+
+# kvm/launch.py's log_dir. At shutdown, each <vm>.share/workload.info under it
+# (written by the guest over 9p, if modified since the server started) fills
+# the workload / workload_runtime_seconds columns of `log`. Missing files ->
+# those columns are left empty.
+vm_log_dir: /tmp/kvm-launch

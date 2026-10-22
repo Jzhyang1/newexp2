@@ -410,6 +410,8 @@ struct Config {
   std::size_t prefetcher_min_len = 1;
   std::string prefetcher_training;
   std::string log = "./logs/nbd_results.csv";  // stats CSV, appended to on shutdown
+  std::string vm_log_dir = "/tmp/kvm-launch";  // kvm/launch.py's log_dir; its <name>.share/workload.info
+                                 // files (guest-written over 9p) are read at shutdown
   std::string access_log = "./logs/nbd_access.csv";  // per-request (worker_id,offset,length,hits,total)
                                  // event log, for verifying capture correctness; set to "" to disable
 };
@@ -496,6 +498,8 @@ Config LoadConfig(const std::string& path) {
       cfg.prefetcher_training = value;
     } else if (key == "log") {
       cfg.log = value;
+    } else if (key == "vm_log_dir") {
+      cfg.vm_log_dir = value;
     } else if (key == "access_log") {
       cfg.access_log = value;
     } else {
@@ -594,9 +598,44 @@ void PrintStatsLine(const Stats& stats) {
             << "\n";
 }
 
+// Reads <vm_log_dir>/<vm>.share/workload.info ("name=<n> runtime_seconds=<s>"),
+// which the guest's run.sh (kvm/guest/build_image.sh) writes into the 9p
+// directory kvm/launch.py shares with each VM. Only files written since this
+// server started count (older ones are leftovers from a previous run). One
+// entry per VM, joined with ';' so the CSV stays one row; both strings are
+// empty if nothing was found.
+void ReadWorkloadInfo(const std::string& dir, std::filesystem::file_time_type since,
+                      std::string* names, std::string* runtimes) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::vector<fs::path> infos;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const fs::path info = it->path() / "workload.info";
+    std::error_code tec;
+    if (it->path().extension() != ".share") continue;
+    auto mtime = fs::last_write_time(info, tec);
+    if (tec || mtime < since) continue;
+    infos.push_back(info);
+  }
+  std::sort(infos.begin(), infos.end());
+  for (const auto& p : infos) {
+    std::ifstream in(p);
+    std::string name, runtime, tok;
+    while (in >> tok) {
+      if (tok.rfind("name=", 0) == 0) name = tok.substr(5);
+      else if (tok.rfind("runtime_seconds=", 0) == 0) runtime = tok.substr(16);
+    }
+    if (name.empty() && runtime.empty()) continue;
+    if (!names->empty()) { *names += ';'; *runtimes += ';'; }
+    *names += name;
+    *runtimes += runtime;
+  }
+}
+
 // Appends one CSV row to cfg.log, writing a header first if the file is new
 // or empty -- same convention runner.cpp used for its results log.
-void AppendLog(const Config& cfg, const Stats& stats) {
+void AppendLog(const Config& cfg, const Stats& stats,
+               std::filesystem::file_time_type server_start) {
   std::filesystem::path log_path(cfg.log);
   if (!log_path.parent_path().empty()) {
     std::filesystem::create_directories(log_path.parent_path());
@@ -618,7 +657,7 @@ void AppendLog(const Config& cfg, const Stats& stats) {
     out << "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
            "warmup,evict_policy,prefetch_policy,request_count,hits,misses,hit_ratio,evictions,"
            "bytes_read,bytes_written,avg_latency_ns,worker_latency_ns,policy_latency_ns,"
-           "runtime_seconds,simulated_time_seconds,latency_mode\n";
+           "runtime_seconds,simulated_time_seconds,latency_mode,workload,workload_runtime_seconds\n";
   }
 
   const uint64_t measured = stats.hits + stats.misses;
@@ -626,6 +665,9 @@ void AppendLog(const Config& cfg, const Stats& stats) {
       ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(stats.request_count);
   const auto now = std::chrono::system_clock::now();
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+
+  std::string workload, workload_runtime;
+  ReadWorkloadInfo(cfg.vm_log_dir, server_start, &workload, &workload_runtime);
 
   out << ts << ','
       << GetHostname() << ','
@@ -653,7 +695,9 @@ void AppendLog(const Config& cfg, const Stats& stats) {
       // clock is just the measured runtime there.
       << static_cast<double>(cfg.latency_mode == "physical" ? stats.real_time_elapsed_ns
                                                               : stats.sim_time_elapsed_ns) / 1e9 << ','
-      << cfg.latency_mode
+      << cfg.latency_mode << ','
+      << workload << ','
+      << workload_runtime
       << '\n';
 
   std::fprintf(stderr, "nbd: appended stats to %s\n", cfg.log.c_str());
@@ -749,6 +793,7 @@ int main(int argc, char **argv) {
                 static_cast<uint64_t>(i), physical_miss_ns).detach();
   }
 
+  const auto server_start = std::filesystem::file_time_type::clock::now();
   int sig = 0;
   for (;;) {
     sigwait(&wait_set, &sig);
@@ -764,7 +809,7 @@ int main(int argc, char **argv) {
 
   const nbd::Stats& stats = reader->get_stats();
   nbd::PrintStatsLine(stats);
-  nbd::AppendLog(cfg, stats);
+  nbd::AppendLog(cfg, stats, server_start);
   delete prefetch_policy;
   delete evict_policy;
   if (access_log) std::fclose(access_log);
