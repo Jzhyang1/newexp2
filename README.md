@@ -320,19 +320,33 @@ invocation; see the Makefile for the full list and their defaults.
 On a clean shutdown (`SIGINT`/`SIGTERM`), `nbd_server` prints one
 `STATS key=value ...` summary line to stdout and appends one CSV row to the
 config's `log:` path (default `./logs/nbd_results.csv`), writing a header
-first if the file is new or empty. Columns:
+first if the file is new or empty. If an existing log has an older column
+layout it is renamed to `<log>.old-<unix time>` and a fresh file is started. Columns:
 
 - `timestamp`, `machine`, `commit_hash` — when/where/which commit ran
 - `file`, `ports`, `capacity`, `hit_latency_ns`, `miss_latency_ns`,
   `warmup`, `evict_policy`, `prefetch_policy` — the run's config
-- `request_count`, `hits`, `misses`, `hit_ratio`, `evictions`, `bytes_read`,
-  `bytes_written` — cache outcomes
-- `avg_latency_ns`, `worker_latency_ns`, `policy_latency_ns` — timing
-  breakdown (total simulated latency charged per request; time attributed
-  to client think-time vs. evict/prefetch policy hook compute, respectively)
-- `runtime_seconds` — wall-clock time the server was up
-- `simulated_time_seconds` — the simulator's virtual-clock end time (guest think time + policy compute + flat `miss_latency_ns` per request with a miss); equal to `runtime_seconds` when `latency_mode: physical`
-- `latency_mode` — `simulated` or `physical`, as configured for the run
+- `request_count`, `miss_requests`, `hits`, `misses`, `hit_ratio`,
+  `evictions`, `bytes_read`, `bytes_written` — cache outcomes, post-warmup
+  only. `request_count` counts NBD read requests; `miss_requests` is the
+  subset with at least one missing sector; `hits`/`misses`/`hit_ratio` count
+  sectors; `evictions` includes both policy-requested and capacity evictions
+- Latency, in ns, summed over post-warmup requests. The three parts add up
+  exactly: `total_latency_ns = worker_latency_ns + policy_latency_ns +
+  miss_delay_ns`, and `avg_latency_ns = total_latency_ns / request_count`
+  - `worker_latency_ns` — the guest's own think time between a response
+    being fully sent and its next request (no disk-side time, no miss delay)
+  - `policy_latency_ns` — real compute time of every evict/prefetch policy
+    hook (not `pread` or cache bookkeeping)
+  - `miss_delay_ns` — the modeled miss penalty: `miss_requests *
+    miss_latency_ns` (one charge per request with a miss, not per sector)
+- Clocks, in seconds:
+  - `runtime_seconds` — wall-clock time the server was up (includes boot and warmup)
+  - `measured_runtime_seconds` — wall clock since the last warmup request
+  - `simulated_time_seconds` — virtual clock since the last warmup request
+    (think time + policy compute + miss delay)
+- `latency_mode` — `simulated` (miss delay is only accounted) or `physical`
+  (also slept for real), as configured for the run
 - `workload`, `workload_runtime_seconds` — the guest workload's name and the
   wall time of just the workload process, read at shutdown from the
   `<vm_log_dir>/<vm>.share/workload.info` file the guest's `run.sh` writes

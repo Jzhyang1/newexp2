@@ -49,6 +49,8 @@ class SimReadClass : public BlockReadClass {
     std::atomic<uint64_t> global_idx;
 
     volatile uint64_t steady_max_virt_ns;   // equivalent to total virt time elapsed
+    uint64_t warmup_end_real_ns{0};         // steady_ns() at the last warmup request (0 = no warmup seen)
+    uint64_t warmup_end_virt_ns{0};         // steady_max_virt_ns as of the last warmup request
     std::unordered_map<uint64_t, uint64_t> worker_virtual_time;
     std::unordered_map<uint64_t, uint64_t> worker_real_time_start;
     // std::vector<AccessTime> disk_access_times;   // tracks all prior disk accesses to coalesce
@@ -97,9 +99,10 @@ public:
                 worker_virt_start_ns = steady_max_virt_ns;
             }
 
-            // Real (wall-clock) time this app spent between receiving its
-            // previous response and issuing this request -- i.e. the VM's
-            // own think/compute time.
+            // Real (wall-clock) time this app spent between its previous
+            // response being fully sent (see response_sent) and issuing this
+            // request -- i.e. the VM's own think/compute time, excluding any
+            // disk-side delay.
             auto worker_start = worker_real_time_start.find(worker_id);
             if (worker_start != worker_real_time_start.end()) {
                 worker_run_ns += now_ns - worker_start->second;
@@ -110,13 +113,12 @@ public:
         // manage cache
         uint64_t total_count = 0;
         uint64_t hit_count = 0;
-        uint64_t prefetch_ns = 0;  // Time skew from prefetching work
-        uint64_t evict_ns = 0;  // Time skew from eviction work
+        uint64_t policy_ns = 0;  // Real compute time of every evict/prefetch policy hook this request
         policy::PrefetchRequest prefetch_req;
         {
             std::lock_guard _{mu};
             if (prefetch_policy) {
-                prefetch_ns += charge_policy_ns([&]{
+                policy_ns += charge_policy_ns([&]{
                     prefetch_policy->on_prefetch_request(
                         worker_id, block_offset, block_length, prefetch_req);
                 });
@@ -128,16 +130,16 @@ public:
             total_count += 1;
             hit_count += hit;
 
-            add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1}, false);
+            policy_ns += add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1}, false, count_stats);
 
             // acknowledge access
             if (evict_policy) {
-                evict_ns += charge_policy_ns([&]{
+                policy_ns += charge_policy_ns([&]{
                     evict_policy->on_access(worker_id, block_offset + block_suboffset);
                 });
             }
             if (prefetch_policy) {
-                prefetch_ns += charge_policy_ns([&]{
+                policy_ns += charge_policy_ns([&]{
                     prefetch_policy->on_access(worker_id, block_offset + block_suboffset);
                 });
             }
@@ -150,21 +152,29 @@ public:
             // admit the prefetched pages last
             std::lock_guard _{mu};
             for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
-                add_to_cache(worker_id, prefetch_req.fetch_ranges[i], true);
+                policy_ns += add_to_cache(worker_id, prefetch_req.fetch_ranges[i], true, count_stats);
             }
         }
         
         uint64_t total_elapsed_ns;
+        uint64_t miss_ns = 0;  // modeled miss delay charged to this request
         {
             std::lock_guard _{mu};
             // Make sure all read requests are charged
-            total_elapsed_ns = worker_run_ns + prefetch_ns + evict_ns;
+            total_elapsed_ns = worker_run_ns + policy_ns;
             // Modeled miss latency: flat per request with >=1 miss, matching
             // the physical delay applied in nbd.cpp's ServeTransmission.
-            if (hit_count < total_count) total_elapsed_ns += cache.miss_latency_ns;
+            if (hit_count < total_count) miss_ns = cache.miss_latency_ns;
+            total_elapsed_ns += miss_ns;
             worker_virt_end_ns = worker_virt_start_ns + total_elapsed_ns;
             if (worker_virt_end_ns > steady_max_virt_ns) steady_max_virt_ns = worker_virt_end_ns;
             worker_virtual_time[worker_id] = worker_virt_end_ns;
+            // Everything up to the last warmup request is excluded from the
+            // reported simulated time.
+            if (!count_stats) {
+                warmup_end_virt_ns = steady_max_virt_ns;
+                warmup_end_real_ns = steady_ns();
+            }
             // disk_access_times.emplace_back(worker_virt_start_ns + worker_run_ns, worker_virt_end_ns);
 
             // Logged unconditionally (unlike Stats, which skips warmup) so
@@ -192,17 +202,27 @@ public:
         // final metric - tracking
         if (count_stats) {
             std::lock_guard _{mu};
-            worker_real_time_start[worker_id] = steady_ns();
 
             stats.request_count++;
             stats.bytes_read += length;
             stats.hits += hit_count;
             stats.misses += total_count - hit_count;
+            stats.miss_requests += hit_count < total_count;
+            stats.miss_delay_ns += miss_ns;
             stats.total_latencies += total_elapsed_ns;
             stats.worker_latency_ns += worker_run_ns;
-            stats.policy_latency_ns += prefetch_ns + evict_ns;
+            stats.policy_latency_ns += policy_ns;
         }
         return bytes_got;
+    }
+
+    // Start the worker's think-time clock. Done here (after the physical miss
+    // delay and the socket write) rather than at the end of read(), so
+    // neither counts as worker time. Runs during warmup too, so the first
+    // post-warmup request measures a real gap rather than 0.
+    void response_sent(uint64_t worker_id) override {
+        std::lock_guard _{mu};
+        worker_real_time_start[worker_id] = steady_ns();
     }
 
     void drain() override {
@@ -217,14 +237,17 @@ public:
         // `mu`, so it needs the same lock.
         std::lock_guard _{mu};
         stats.real_time_elapsed_ns = steady_ns() - sim_start;
-        stats.sim_time_elapsed_ns = steady_max_virt_ns;
+        stats.real_time_measured_ns = steady_ns() - (warmup_end_real_ns ? warmup_end_real_ns : sim_start);
+        stats.sim_time_elapsed_ns = steady_max_virt_ns - warmup_end_virt_ns;
         return stats;
     }
 
     /*
-     * Unsafe. Must be called in a protected block. Returns the latency
+     * Unsafe. Must be called in a protected block. Returns the real time (ns)
+     * spent inside policy hooks (not cache bookkeeping).
      */
-    uint64_t add_to_cache(uint64_t worker_id, policy::FetchRange range, bool is_prefetch) {
+    uint64_t add_to_cache(uint64_t worker_id, policy::FetchRange range, bool is_prefetch,
+                          bool count_stats) {
         uint64_t latency = 0;
         for (uint32_t block_suboffset = 0; block_suboffset < range.block_length; ++block_suboffset) {
             if (cache.present(range.block_offset + block_suboffset)) continue;
@@ -243,15 +266,20 @@ public:
 
             for (uint64_t i = 0; i < evictions.n_pages; ++i) {
                 cache.evict(evictions.pages[i]);
-                if (evict_policy) evict_policy->on_evict(worker_id, evictions.pages[i]);
-                if (prefetch_policy) prefetch_policy->on_evict(worker_id, evictions.pages[i]);
+                latency += charge_policy_ns([&]{
+                    if (evict_policy) evict_policy->on_evict(worker_id, evictions.pages[i]);
+                    if (prefetch_policy) prefetch_policy->on_evict(worker_id, evictions.pages[i]);
+                });
             }
-            stats.evictions += evictions.n_pages;
+            if (count_stats) stats.evictions += evictions.n_pages;
             auto evict = cache.insert(range.block_offset + block_suboffset);
-            if (evict.first && evict_policy) evict_policy->on_evict(worker_id, evict.second);
-            if (evict.first && prefetch_policy) prefetch_policy->on_evict(worker_id, evict.second);
-            if (evict_policy) evict_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
-            if (prefetch_policy) prefetch_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
+            if (count_stats && evict.first) stats.evictions++;
+            latency += charge_policy_ns([&]{
+                if (evict.first && evict_policy) evict_policy->on_evict(worker_id, evict.second);
+                if (evict.first && prefetch_policy) prefetch_policy->on_evict(worker_id, evict.second);
+                if (evict_policy) evict_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
+                if (prefetch_policy) prefetch_policy->on_admit(worker_id, range.block_offset + block_suboffset, is_prefetch);
+            });
         }
         return latency;
     }
@@ -261,7 +289,8 @@ public:
     // cost as simulated delay, added onto `sink` -- so a computationally
     // expensive policy shows up as real added latency in the simulation
     // instead of being free. Also folds the same measurement into
-    // stats.policy_latency_ns for visibility, unless still in warmup.
+    // stats.policy_latency_ns (via the caller's per-request total) for
+    // visibility, unless still in warmup.
     // Returns the measured ns in case the caller needs it too (e.g. to also
     // advance stats.sim_time_elapsed).
     template <typename Fn>

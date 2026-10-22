@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -291,6 +292,7 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
             std::this_thread::sleep_for(std::chrono::nanoseconds(physical_miss_ns));
           }
           if (!WriteFull(fd, buf.data(), chunk)) return;
+          reader->response_sent(worker_id);
           offset += chunk;
           remaining -= chunk;
         }
@@ -590,10 +592,15 @@ void PrintStatsLine(const Stats& stats) {
             << "evictions=" << stats.evictions << ' '
             << "bytes_read=" << stats.bytes_read << ' '
             << "bytes_written=" << stats.bytes_written << ' '
+            << "miss_requests=" << stats.miss_requests << ' '
             << "avg_latency_ns=" << avg_latency_ns << ' '
+            << "total_latency_ns=" << stats.total_latencies << ' '
             << "worker_latency_ns=" << stats.worker_latency_ns << ' '
             << "policy_latency_ns=" << stats.policy_latency_ns << ' '
+            << "miss_delay_ns=" << stats.miss_delay_ns << ' '
             << "runtime_seconds=" << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ' '
+            << "measured_runtime_seconds=" << static_cast<double>(stats.real_time_measured_ns) / 1e9 << ' '
+            << "simulated_time_seconds=" << static_cast<double>(stats.sim_time_elapsed_ns) / 1e9 << ' '
             << "hit_ratio=" << (measured == 0 ? 0.0 : static_cast<double>(stats.hits) / measured)
             << "\n";
 }
@@ -641,6 +648,27 @@ void AppendLog(const Config& cfg, const Stats& stats,
     std::filesystem::create_directories(log_path.parent_path());
   }
 
+  static const std::string kHeader =
+      "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
+      "warmup,evict_policy,prefetch_policy,request_count,miss_requests,hits,misses,hit_ratio,"
+      "evictions,bytes_read,bytes_written,avg_latency_ns,total_latency_ns,worker_latency_ns,"
+      "policy_latency_ns,miss_delay_ns,runtime_seconds,measured_runtime_seconds,"
+      "simulated_time_seconds,latency_mode,workload,workload_runtime_seconds";
+
+  // A log written under an older column layout can't be appended to without
+  // misaligning columns, so move it aside and start a fresh one.
+  {
+    std::ifstream in(cfg.log);
+    std::string first;
+    if (in.good() && std::getline(in, first) && !first.empty() && first != kHeader) {
+      in.close();
+      const std::string old = cfg.log + ".old-" + std::to_string(std::time(nullptr));
+      std::filesystem::rename(cfg.log, old);
+      std::fprintf(stderr, "nbd: %s has an older column layout; moved to %s\n",
+                   cfg.log.c_str(), old.c_str());
+    }
+  }
+
   bool need_header = true;
   {
     std::ifstream in(cfg.log);
@@ -654,10 +682,7 @@ void AppendLog(const Config& cfg, const Stats& stats,
   }
 
   if (need_header) {
-    out << "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
-           "warmup,evict_policy,prefetch_policy,request_count,hits,misses,hit_ratio,evictions,"
-           "bytes_read,bytes_written,avg_latency_ns,worker_latency_ns,policy_latency_ns,"
-           "runtime_seconds,simulated_time_seconds,latency_mode,workload,workload_runtime_seconds\n";
+    out << kHeader << '\n';
   }
 
   const uint64_t measured = stats.hits + stats.misses;
@@ -681,6 +706,7 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << cfg.evict_policy << ','
       << cfg.prefetch_policy << ','
       << stats.request_count << ','
+      << stats.miss_requests << ','
       << stats.hits << ','
       << stats.misses << ','
       << (measured == 0 ? 0.0 : static_cast<double>(stats.hits) / measured) << ','
@@ -688,13 +714,14 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << stats.bytes_read << ','
       << stats.bytes_written << ','
       << avg_latency_ns << ','
+      << stats.total_latencies << ','
       << stats.worker_latency_ns << ','
       << stats.policy_latency_ns << ','
+      << stats.miss_delay_ns << ','
       << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ','
-      // Physical mode already pays miss latency in real time, so the simulated
-      // clock is just the measured runtime there.
-      << static_cast<double>(cfg.latency_mode == "physical" ? stats.real_time_elapsed_ns
-                                                              : stats.sim_time_elapsed_ns) / 1e9 << ','
+      << static_cast<double>(stats.real_time_measured_ns) / 1e9 << ','
+      // Virtual clock; excludes warmup, and includes miss delay.
+      << static_cast<double>(stats.sim_time_elapsed_ns) / 1e9 << ','
       << cfg.latency_mode << ','
       << workload << ','
       << workload_runtime
