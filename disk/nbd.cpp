@@ -650,10 +650,11 @@ void AppendLog(const Config& cfg, const Stats& stats,
 
   static const std::string kHeader =
       "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
-      "warmup,evict_policy,prefetch_policy,request_count,miss_requests,hits,misses,hit_ratio,"
-      "evictions,bytes_read,bytes_written,avg_latency_ns,total_latency_ns,worker_latency_ns,"
-      "policy_latency_ns,miss_delay_ns,runtime_seconds,measured_runtime_seconds,"
-      "simulated_time_seconds,latency_mode,workload,workload_runtime_seconds";
+      "warmup,evict_policy,prefetch_policy,latency_mode,workload,"
+      "requests,miss_requests,blk_hits,blk_misses,hit_ratio,"
+      "evictions,bytes_read,bytes_written,"
+      "total_s,worker_s,policy_s,miss_s,physical_s,simulated_s,"
+      "experiment_s,workload_s";
 
   // A log written under an older column layout can't be appended to without
   // misaligning columns, so move it aside and start a fresh one.
@@ -686,11 +687,10 @@ void AppendLog(const Config& cfg, const Stats& stats,
   }
 
   const uint64_t measured = stats.hits + stats.misses;
-  const double avg_latency_ns = stats.request_count == 0
-      ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(stats.request_count);
   const auto now = std::chrono::system_clock::now();
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
+  std::string prefetch_policy = cfg.prefetch_policy == "model-prefetcher" ? cfg.prefetcher_path : cfg.prefetch_policy;
   std::string workload, workload_runtime;
   ReadWorkloadInfo(cfg.vm_log_dir, server_start, &workload, &workload_runtime);
 
@@ -704,7 +704,9 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << cfg.miss_latency_ns << ','
       << cfg.warmup << ','
       << cfg.evict_policy << ','
-      << cfg.prefetch_policy << ','
+      << prefetch_policy << ','
+      << cfg.latency_mode << ','
+      << workload << ','
       << stats.request_count << ','
       << stats.miss_requests << ','
       << stats.hits << ','
@@ -713,17 +715,14 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << stats.evictions << ','
       << stats.bytes_read << ','
       << stats.bytes_written << ','
-      << avg_latency_ns << ','
-      << stats.total_latencies << ','
-      << stats.worker_latency_ns << ','
-      << stats.policy_latency_ns << ','
-      << stats.miss_delay_ns << ','
-      << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ','
+      << static_cast<double>(stats.total_latencies) / 1e9 << ','
+      << static_cast<double>(stats.worker_latency_ns) / 1e9 << ','
+      << static_cast<double>(stats.policy_latency_ns) / 1e9 << ','
+      << static_cast<double>(stats.miss_delay_ns) / 1e9 << ','
       << static_cast<double>(stats.real_time_measured_ns) / 1e9 << ','
       // Virtual clock; excludes warmup, and includes miss delay.
       << static_cast<double>(stats.sim_time_elapsed_ns) / 1e9 << ','
-      << cfg.latency_mode << ','
-      << workload << ','
+      << static_cast<double>(stats.real_time_elapsed_ns) / 1e9 << ','
       << workload_runtime
       << '\n';
 
