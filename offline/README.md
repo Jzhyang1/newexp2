@@ -3,6 +3,51 @@ A python server is provided. It will behave as follows:
 
 run via `python -m <path>`
 
+`offline.tsc_brute` is a full-disk LRCN baseline: two temporal convolutions,
+the four-layer, 32-unit LSTM used by `ts_lstm`, and a dense output with
+1,048,576 logits. It models a 4 GiB disk as 512 B blocks grouped into 4 KiB
+pages. Sigmoid outputs give independent probabilities that each page is
+accessed by the next request. Every page touched by that request is a positive
+label; training minimizes mean binary cross entropy over all pages. CSV
+`offset,length` values are bytes and must fit within the disk.
+
+Example (using the repository virtual environment):
+
+```sh
+source ./bin/activate
+python -m offline.tsc_brute --training logs/oracle.csv --min-len 32 \
+    --epochs 70 --batch-size 8 --niceness 4 --alpha 0.5 --k 8 \
+    --hide-loss-curve --dry-run
+```
+
+Training and held-out testing each report classification BCE and regression
+RMSE in bytes. The regression prediction is the starting byte offset of the
+most probable page. `--niceness N` lets that prediction match the closest of
+the next N actual request offsets; it affects regression scoring only.
+The chronological split is 80/20 and each split supplies its own history.
+A split without enough history reports `nan`; insufficient training data or
+out-of-disk requests are rejected. `--loss-curve PATH` saves both metric curves;
+otherwise curves are displayed unless `--hide-loss-curve` is given.
+
+The last parsed arguments, trained weights, and loss history are cached in
+`offline/tsc_brute/training_cache.pt`. Runs with matching arguments reuse that
+model without loading the CSV or retraining; changing any argument replaces
+the cache after training. Delete the cache to retrain after changing the CSV
+contents or model code while keeping the same arguments.
+
+Omit `--dry-run` to serve the existing line-oriented JSON protocol. In this
+server, `prev_accesses` and returned ranges use **512 B block units**, matching
+the C++ `ModelPolicy`; the model converts them to/from byte units. For a
+positive `next_n`, it returns at most one range for the next request. Around
+the most probable page x, it chooses the widest inclusive interval
+`[x-i, x+j]` with `0 <= i,j < k` and average page probability strictly greater
+than `alpha`. Ties prefer higher average probability, then the lower start.
+Intervals stay inside the disk. It returns `[]` when no interval qualifies,
+history is too short, or `next_n` is zero. `put` acknowledges with `[]` and
+`kill` exits; evaluation losses are reported after offline training.
+`--type` is accepted for launcher compatibility and has no effect;
+`--predict-deltas` is rejected because classes are absolute pages.
+
 `ts_*` folders are timeseries regression models -- they take in the last n offset,span pairs and predict the next offset,span pairs. The interface for these are: 
 boot parameters: 
     - `--type`: `predict_mean`, `predict_min`, or `predict_max`

@@ -19,3 +19,5 @@ kvm/*.yaml
 logs/
 *.log
 *.png
+*.pt
+*.pid
