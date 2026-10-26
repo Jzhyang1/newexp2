@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -26,22 +28,41 @@ std::string JsonPair(Pair pair) {
 std::vector<Pair> ParsePairs(const std::string& response) {
     std::vector<Pair> pairs;
     std::size_t cursor = 0;
-    while ((cursor = response.find('[', cursor)) != std::string::npos) {
-        const std::size_t comma = response.find(',', cursor + 1);
-        const std::size_t end = response.find(']', comma + 1);
-        if (comma == std::string::npos || end == std::string::npos) break;
-        try {
-            const auto offset = std::stoull(response.substr(cursor + 1, comma - cursor - 1));
-            const auto length = std::stoull(response.substr(comma + 1, end - comma - 1));
-            if (offset <= UINT32_MAX && length > 0 && length <= UINT32_MAX) {
-                pairs.push_back(Pair{static_cast<std::uint32_t>(offset),
-                                     static_cast<std::uint32_t>(length)});
-            }
-        } catch (const std::exception&) {
-            break;
-        }
-        cursor = end + 1;
+    const auto skip_space = [&] {
+        while (cursor < response.size() &&
+               std::isspace(static_cast<unsigned char>(response[cursor]))) ++cursor;
+    };
+    const auto take = [&](char token) {
+        skip_space();
+        if (cursor == response.size() || response[cursor] != token) return false;
+        ++cursor;
+        return true;
+    };
+    const auto number = [&](std::uint32_t& value) {
+        skip_space();
+        const char* begin = response.data() + cursor;
+        const auto result = std::from_chars(begin, response.data() + response.size(), value);
+        if (result.ec != std::errc{}) return false;
+        cursor += result.ptr - begin;
+        return true;
+    };
+    const auto invalid = [] {
+        std::fprintf(stderr, "model prefetcher: invalid prediction response; expected [[offset,length],...] with uint32 offsets and positive uint32 lengths\n");
+        return std::vector<Pair>{};
+    };
+
+    if (!take('[')) return invalid();
+    if (!take(']')) {
+        do {
+            Pair pair{};
+            if (!take('[') || !number(pair.offset) || !take(',') ||
+                !number(pair.length) || pair.length == 0 || !take(']')) return invalid();
+            pairs.push_back(pair);
+        } while (take(','));
+        if (!take(']')) return invalid();
     }
+    skip_space();
+    if (cursor != response.size()) return invalid();
     return pairs;
 }
 
