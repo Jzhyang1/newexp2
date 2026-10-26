@@ -416,6 +416,8 @@ struct Config {
                                  // files (guest-written over 9p) are read at shutdown
   std::string access_log = "./logs/nbd_access.csv";  // per-request (worker_id,offset,length,hits,total)
                                  // event log, for verifying capture correctness; set to "" to disable
+  std::string prefetch_log = "./logs/nbd_prefetch.csv";  // per-prefetched-range (worker_id,offset,length,hits,total,req)
+                                 // log, same shape as access_log (for heatmap comparison); "" to disable
 };
 
 std::string Trim(const std::string& s) {
@@ -504,6 +506,8 @@ Config LoadConfig(const std::string& path) {
       cfg.vm_log_dir = value;
     } else if (key == "access_log") {
       cfg.access_log = value;
+    } else if (key == "prefetch_log") {
+      cfg.prefetch_log = value;
     } else {
       throw std::runtime_error("unknown config key: " + key);
     }
@@ -783,8 +787,23 @@ int main(int argc, char **argv) {
     std::fflush(access_log);
   }
 
+  FILE* prefetch_log = nullptr;
+  if (!cfg.prefetch_log.empty()) {
+    std::filesystem::path prefetch_log_path(cfg.prefetch_log);
+    if (!prefetch_log_path.parent_path().empty()) {
+      std::filesystem::create_directories(prefetch_log_path.parent_path());
+    }
+    prefetch_log = fopen(cfg.prefetch_log.c_str(), "w");
+    if (!prefetch_log) {
+      perror(("failed to open prefetch_log " + cfg.prefetch_log).c_str());
+      return 1;
+    }
+    std::fprintf(prefetch_log, "worker_id,offset,length,hits,total,req\n");
+    std::fflush(prefetch_log);
+  }
+
   nbd::BlockReadClass* reader = new nbd::SimReadClass(
-      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log);
+      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log);
 
   signal(SIGPIPE, SIG_IGN);
 
@@ -839,6 +858,7 @@ int main(int argc, char **argv) {
   delete prefetch_policy;
   delete evict_policy;
   if (access_log) std::fclose(access_log);
+  if (prefetch_log) std::fclose(prefetch_log);
   std::fclose(f);
   return 0;
 }

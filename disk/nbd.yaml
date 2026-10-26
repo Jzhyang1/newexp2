@@ -12,6 +12,7 @@ warmup: 0
 
 evict_policy: lru
 prefetch_policy: model-prefetcher       # none | readahead | oracle | model-prefetcher | cminer | quickmine | mithril
+latency_mode: simulated     # simulated | physical
 oracle_file: ./logs/oracle.csv
 # Required when prefetch_policy is `model-prefetcher`
 prefetcher_path: offline.ts_mlr
@@ -21,3 +22,5 @@ prefetcher_training: ./logs/oracle.csv
 
 log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv
+vm_log_dir: /tmp/kvm-launch
+prefetch_log: ./logs/nbd_prefetch.csv

@@ -142,7 +142,7 @@ def main() -> None:
     print(f"offset testing loss:  {test_loss_offset:.0f}", file=sys.stderr, flush=True)
     print(f"length testing loss:  {test_loss_length:.0f}", file=sys.stderr, flush=True)
     if not args.dry_run:
-        pass
+        serve(model)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,14 @@ log: ./logs/nbd_results.csv
 # to point it at a different path or change the default in disk/nbd.cpp.
 access_log: ./logs/nbd_access.csv
 
+# Per-prefetched-range log (worker_id,offset,length,hits,total,req), same
+# shape as access_log so `python3 disk/heatmap.py logs/nbd_prefetch.csv
+# --out prefetch_heatmap.png` renders what the prefetcher fetched next to
+# the access heatmap. `hits`/`total` = pages already cached vs. in the range;
+# `req` = index of the triggering read. Empty value disables (parser skips
+# empty lines, so change the path/default to turn off).
+prefetch_log: ./logs/nbd_prefetch.csv
+
 # kvm/launch.py's log_dir. At shutdown, each <vm>.share/workload.info under it
 # (written by the guest over 9p, if modified since the server started) fills
 # the workload / workload_runtime_seconds columns of `log`. Missing files ->

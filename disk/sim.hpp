@@ -45,6 +45,11 @@ class SimReadClass : public BlockReadClass {
     // NBD read requests this class saw against what a client/guest actually
     // issued. Null (the common case) disables it entirely.
     FILE* access_log;
+    // Optional per-prefetch-range log (worker_id,offset,length,hits,total,req),
+    // same shape as access_log so disk/heatmap.py renders it unchanged. One row
+    // per range the prefetch policy asked for; `hits` = pages already cached
+    // (wasted prefetch), `req` = index of the read request that triggered it.
+    FILE* prefetch_log;
     uint64_t sim_start;
     std::atomic<uint64_t> global_idx;
 
@@ -64,17 +69,19 @@ public:
             policy::Cache& cache,
             policy::CachePolicy* evict_policy,
             policy::CachePolicy* prefetch_policy,
-            FILE* access_log = nullptr
+            FILE* access_log = nullptr,
+            FILE* prefetch_log = nullptr
         ):  f(f), warmup(warmup), cache(cache),
             evict_policy(evict_policy), prefetch_policy(prefetch_policy),
-            access_log(access_log) {
+            access_log(access_log), prefetch_log(prefetch_log) {
                 sim_start = steady_ns();
             }
 
     uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf,
                   uint64_t* miss_blocks = nullptr) override {
         // manage warmup period
-        bool count_stats = global_idx.fetch_add(1) >= warmup;
+        uint64_t req_idx = global_idx.fetch_add(1);
+        bool count_stats = req_idx >= warmup;
 
         // bytes to disk units
         if (offset % SECTOR_SIZE || length % SECTOR_SIZE) {
@@ -152,6 +159,19 @@ public:
             // admit the prefetched pages last
             std::lock_guard _{mu};
             for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
+                if (prefetch_log) {
+                    const auto& r = prefetch_req.fetch_ranges[i];
+                    uint64_t cached = 0;
+                    for (uint32_t b = 0; b < r.block_length; ++b) cached += cache.present(r.block_offset + b);
+                    std::fprintf(prefetch_log, "%llu,%llu,%llu,%llu,%llu,%llu\n",
+                        static_cast<unsigned long long>(worker_id),
+                        static_cast<unsigned long long>(r.block_offset) * SECTOR_SIZE,
+                        static_cast<unsigned long long>(r.block_length) * SECTOR_SIZE,
+                        static_cast<unsigned long long>(cached),
+                        static_cast<unsigned long long>(r.block_length),
+                        static_cast<unsigned long long>(req_idx));
+                    std::fflush(prefetch_log);
+                }
                 policy_ns += add_to_cache(worker_id, prefetch_req.fetch_ranges[i], true, count_stats);
             }
         }

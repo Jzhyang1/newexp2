@@ -369,6 +369,13 @@ against known request patterns.
 heatmap (`make heatmap`, or `python3 disk/heatmap.py [access_log]`);
 requires matplotlib (`pip install matplotlib`).
 
+Likewise `prefetch_log:` (default `./logs/nbd_prefetch.csv`) gets one row per
+range the prefetch policy fetched: `worker_id`, `offset`, `length` (bytes),
+`hits`/`total` (pages already cached vs. in the range — i.e. wasted
+prefetch), and `req` (index of the read that triggered it). Same shape as the
+access log, so `python3 disk/heatmap.py logs/nbd_prefetch.csv --out
+prefetch_heatmap.png` renders it for side-by-side comparison.
+
 ## Commenting and Code Style Guidance
 
 To keep implementation readable while performance-tuning:
