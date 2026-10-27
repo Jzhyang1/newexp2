@@ -15,6 +15,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from offline.serve import serve
 from offline.data import load_training
 from offline.ts_lstm.__main__ import FEATURES_PER_ACCESS, SIN_PERIODS
 
@@ -22,10 +23,10 @@ Pair = tuple[int, int]
 DISK_GB = 20
 DISK_BYTES = DISK_GB * (1 << 30)
 BLOCK_BYTES = 512
-BLOCKS_PER_PAGE = 8
+BLOCKS_PER_PAGE = 4096
 PAGE_BYTES = BLOCK_BYTES * BLOCKS_PER_PAGE
 NUM_PAGES = DISK_BYTES // PAGE_BYTES
-CACHE_PATH = Path(__file__).resolve().parent / "training_cache.pt"
+CACHE_PATH = Path(__file__).resolve().parent / "training_cache_coarse_peek.pt"
 
 
 def page_bounds(pair: Pair) -> tuple[int, int]:
@@ -67,11 +68,26 @@ class SequenceClassifier(nn.Module):
         return self.output(hidden[-1])  # logits; sigmoid gives page probabilities
 
 
-def classification_loss(logits: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
-    """BCE over all pages; every page overlapping the next request is positive."""
+def classification_loss(
+    logits: torch.Tensor, bounds: torch.Tensor, peek_alpha: float = 0.0,
+) -> torch.Tensor:
+    """BCE over all pages; every page overlapping the next request is positive.
+
+    `bounds` rows are (first, last) page of the next request, optionally
+    followed by the (first, last) page of the request after it. Requests can
+    be reordered, so a page that is hit one request late is still a good
+    prefetch: the loss is BCE(next) + peek_alpha * BCE(request after next).
+    """
     pages = torch.arange(logits.shape[-1], device=logits.device)
-    labels = (pages >= bounds[:, :1]) & (pages <= bounds[:, 1:])
-    return nn.functional.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+
+    def bce(first: torch.Tensor, last: torch.Tensor) -> torch.Tensor:
+        labels = (pages >= first[:, None]) & (pages <= last[:, None])
+        return nn.functional.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+
+    loss = bce(bounds[:, 0], bounds[:, 1])
+    if peek_alpha and bounds.shape[1] >= 4:
+        loss = loss + peek_alpha * bce(bounds[:, 2], bounds[:, 3])
+    return loss
 
 
 def prefetch_range(probabilities: torch.Tensor, alpha: float, k: int) -> list[Pair]:
@@ -82,26 +98,29 @@ def prefetch_range(probabilities: torch.Tensor, alpha: float, k: int) -> list[Pa
     """
     if not math.isfinite(alpha) or not 0 <= alpha <= 1 or k < 1:
         raise ValueError("alpha must be in [0, 1] and k must be positive")
-    # TODO
-    return [int(probabilities.argmax()) * PAGE_BYTES]
+    # TODO -- not to be implemented until other parts of the program prove to be reliable
+    return [(int(probabilities.argmax()) * PAGE_BYTES, PAGE_BYTES)]
 
 
 class BruteModel:
     def __init__(
         self, history: int, niceness: int, train: Sequence[Pair],
         test: Sequence[Pair], epochs: int, batch_size: int = 8,
-        alpha: float = 0.5, k: int = 8,
+        alpha: float = 0.5, k: int = 8, peek_alpha: float = 0.5,
     ) -> None:
         if min(history, niceness, epochs, batch_size, k) < 1:
             raise ValueError("history, niceness, epochs, batch size and k must be positive")
         if not math.isfinite(alpha) or not 0 <= alpha <= 1:
             raise ValueError("alpha must be in [0, 1]")
+        if not math.isfinite(peek_alpha) or peek_alpha < 0:
+            raise ValueError("peek alpha must be non-negative")
         for pair in (*train, *test):
             page_bounds(pair)
         if len(train) <= history:
             raise ValueError("training split needs at least min-len + 1 requests")
         self.history, self.niceness = history, niceness
         self.batch_size, self.alpha, self.k = batch_size, alpha, k
+        self.peek_alpha = peek_alpha
         torch.manual_seed(0)
         self.network = SequenceClassifier()
         self.train_losses: list[float] = []
@@ -110,32 +129,48 @@ class BruteModel:
         self.test_regression_losses: list[float] = []
         train_data, test_data = self._dataset(train), self._dataset(test)
         optimizer = torch.optim.Adam(self.network.parameters(), lr=0.01)
-        for _ in range(epochs):
+        num_batches = math.ceil(len(train_data) / batch_size)
+        print(f"Training on {len(train_data)} examples; testing on {len(test_data)} examples; "
+              f"{epochs} epochs, {num_batches} batches per epoch",
+              file=sys.stderr, flush=True)
+        for epoch in range(1, epochs + 1):
             self.network.train()
-            for values, bounds, _ in DataLoader(train_data, batch_size=batch_size, shuffle=True):
+            for batch, (values, bounds, _) in enumerate(
+                DataLoader(train_data, batch_size=batch_size, shuffle=True), start=1,
+            ):
                 optimizer.zero_grad(set_to_none=True)
-                loss = classification_loss(self.network(values), bounds)
+                loss = classification_loss(self.network(values), bounds, self.peek_alpha)
                 loss.backward()
                 optimizer.step()
+                if batch == 1 or batch % 100 == 0 or batch == num_batches:
+                    print(f"Epoch {epoch}/{epochs}, batch {batch}/{num_batches}: "
+                          f"BCE={loss.item():.6f}", file=sys.stderr, flush=True)
+            print(f"Epoch {epoch}/{epochs}: evaluating train and test losses",
+                  file=sys.stderr, flush=True)
             training = self._evaluate(train_data)
             testing = self._evaluate(test_data)
             self.train_losses.append(training[0])
             self.train_regression_losses.append(training[1])
             self.test_losses.append(testing[0])
             self.test_regression_losses.append(testing[1])
+            print(f"Epoch {epoch}/{epochs}: train BCE={training[0]:.6f}, "
+                  f"test BCE={testing[0]:.6f}, train RMSE={training[1]:.2f} bytes, "
+                  f"test RMSE={testing[1]:.2f} bytes", file=sys.stderr, flush=True)
 
     def _dataset(self, pairs: Sequence[Pair]) -> TensorDataset:
         values, bounds, future = [], [], []
         for index in range(self.history, len(pairs)):
             values.append(features(pairs[index - self.history:index]))
-            bounds.append(page_bounds(pairs[index]))
+            # The last request has no successor; repeat its own bounds for the peek.
+            following = pairs[index + 1] if index + 1 < len(pairs) else pairs[index]
+            bounds.append((*page_bounds(pairs[index]), *page_bounds(following)))
             offsets = [pair[0] for pair in pairs[index:index + self.niceness]]
             # Repeating the last offset preserves the minimum for short tails.
             future.append(offsets + [offsets[-1]] * (self.niceness - len(offsets)))
         if not values:
             return TensorDataset(
                 torch.empty((0, self.history, FEATURES_PER_ACCESS)),
-                torch.empty((0, 2), dtype=torch.long),
+                torch.empty((0, 4), dtype=torch.long),
                 torch.empty((0, self.niceness), dtype=torch.float64),
             )
         return TensorDataset(torch.stack(values), torch.tensor(bounds),
@@ -149,7 +184,7 @@ class BruteModel:
         total_loss = total_error = 0.0
         for values, bounds, future in DataLoader(dataset, batch_size=self.batch_size):
             logits = self.network(values)
-            total_loss += classification_loss(logits, bounds).item() * len(values)
+            total_loss += classification_loss(logits, bounds, self.peek_alpha).item() * len(values)
             predicted = logits.argmax(-1).double() * PAGE_BYTES
             error = (predicted[:, None] - future).square().min(dim=1).values
             total_error += error.sum().item()
@@ -175,26 +210,6 @@ class BruteModel:
         if probabilities is None:
             return []
         return prefetch_range(probabilities, self.alpha, self.k)
-
-
-def serve(model: BruteModel) -> None:
-    """ModelPolicy's JSON protocol uses 512 B blocks; CSV and model use bytes."""
-    for line in sys.stdin:
-        request = json.loads(line)
-        kind = request.get("type")
-        if kind == "get":
-            previous = [(int(o) * BLOCK_BYTES, int(n) * BLOCK_BYTES)
-                        for o, n in request["prev_accesses"]]
-            predictions = model.predict(previous, int(request["next_n"]))
-            result = [(o // BLOCK_BYTES, n // BLOCK_BYTES) for o, n in predictions]
-            print(json.dumps(result), flush=True)
-        elif kind == "put":
-            # Offline baseline: held-out losses are reported after training.
-            print("[]", flush=True)
-        elif kind == "kill":
-            break
-        else:
-            raise ValueError(f"unknown request type: {kind!r}")
 
 
 def show_losses(model: BruteModel, output_path: str | None) -> None:
@@ -245,7 +260,7 @@ def load_or_train(args: argparse.Namespace) -> BruteModel:
     data = load_training(args.training)
     split = min(len(data), max(args.min_len + 1, round(len(data) * 0.8)))
     model = BruteModel(args.min_len, args.niceness, data[:split], data[split:],
-                       args.epochs, args.batch_size, args.alpha, args.k)
+                       args.epochs, args.batch_size, args.alpha, args.k, args.peek_alpha)
     checkpoint = {
         "args": cache_args,
         "model": {key: value for key, value in vars(model).items() if key != "network"},
@@ -268,9 +283,11 @@ def main() -> None:
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1,
                         help="future request window for regression scoring only")
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=0.3)
+    parser.add_argument("--peek-alpha", type=float, default=0.5,
+                        help="weight of the classification loss on the request after the next one")
     parser.add_argument("--k", type=int, default=8, help="exclusive limit on pages on each side")
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"),
                         default="predict_min", help="accepted for ModelPolicy compatibility; unused")
@@ -285,6 +302,8 @@ def main() -> None:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
     if not math.isfinite(args.alpha) or not 0 <= args.alpha <= 1:
         parser.error("--alpha must be in [0, 1]")
+    if not math.isfinite(args.peek_alpha) or args.peek_alpha < 0:
+        parser.error("--peek-alpha must be non-negative")
     if args.predict_deltas:
         parser.error("--predict-deltas is not supported: classes are absolute pages")
     try:
@@ -295,12 +314,12 @@ def main() -> None:
         ("training", model.train_losses[-1], model.train_regression_losses[-1]),
         ("testing", model.test_losses[-1], model.test_regression_losses[-1]),
     ):
-        print(f"classification {label} loss: {classification:.0f}", file=sys.stderr, flush=True)
-        print(f"regression {label} loss (RMSE bytes): {regression:.0f}", file=sys.stderr, flush=True)
+        print(f"classification {label} loss: {classification:.6f}", file=sys.stderr, flush=True)
+        print(f"regression {label} loss (RMSE bytes): {regression:.2f}", file=sys.stderr, flush=True)
     if not args.hide_loss_curve:
         show_losses(model, args.loss_curve)
     if not args.dry_run:
-        serve(model)
+        serve(model.predict)
 
 
 if __name__ == "__main__":

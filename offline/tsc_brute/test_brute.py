@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 
+from offline.serve import serve
 from offline.tsc_brute import __main__ as brute
 
 
@@ -77,6 +78,21 @@ class BruteTests(unittest.TestCase):
             logits, torch.tensor([[0., 1., 1., 0.], [1., 0., 0., 0.]]))
         self.assertTrue(torch.allclose(brute.classification_loss(logits, bounds), expected))
 
+    def test_peek_adds_weighted_loss_on_request_after_next(self):
+        logits = torch.tensor([[1., -2., 3., 4.], [-1., 2., -3., 0.]])
+        bounds = torch.tensor([[1, 2, 0, 0], [0, 0, 3, 3]])
+        bce = torch.nn.functional.binary_cross_entropy_with_logits
+        current = bce(logits, torch.tensor([[0., 1., 1., 0.], [1., 0., 0., 0.]]))
+        peek = bce(logits, torch.tensor([[1., 0., 0., 0.], [0., 0., 0., 1.]]))
+        self.assertTrue(torch.allclose(brute.classification_loss(logits, bounds), current))
+        self.assertTrue(torch.allclose(brute.classification_loss(logits, bounds, 0.5), current + 0.5 * peek))
+
+    def test_dataset_peeks_at_following_request_and_repeats_at_the_tail(self):
+        model = brute.BruteModel.__new__(brute.BruteModel)
+        model.history, model.niceness = 1, 1
+        pairs = [(0, 512), (brute.PAGE_BYTES, 512), (2 * brute.PAGE_BYTES, 512)]
+        self.assertEqual(model._dataset(pairs).tensors[1].tolist(), [[1, 1, 2, 2], [2, 2, 2, 2]])
+
     def test_niceness_changes_only_regression_scoring(self):
         class FixedNetwork(torch.nn.Module):
             def forward(self, values):
@@ -88,7 +104,7 @@ class BruteTests(unittest.TestCase):
         model = brute.BruteModel.__new__(brute.BruteModel)
         model.history, model.batch_size = 1, 2
         model.network = FixedNetwork()
-        model.niceness = 1
+        model.niceness, model.peek_alpha = 1, 0.5
         strict = model._evaluate(model._dataset(pairs))
         model.niceness = 2
         nice = model._evaluate(model._dataset(pairs))
@@ -127,7 +143,7 @@ class BruteTests(unittest.TestCase):
         output = io.StringIO()
         with patch("sys.stdin", io.StringIO("\n".join(map(json.dumps, requests)))), \
                 contextlib.redirect_stdout(output):
-            brute.serve(model)
+            serve(model.predict)
         self.assertEqual(model.previous, [(4096, 512)])
         self.assertEqual(model.count, 16)
         self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
