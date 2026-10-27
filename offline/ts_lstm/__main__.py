@@ -16,8 +16,7 @@ from offline.loss_curve import show_loss_curve
 
 Pair = tuple[int, int]
 FeatureSequence = list[list[float]]
-SIN_PERIODS = (2.0, 4.0, 8.0, 16.0)
-FEATURES_PER_ACCESS = 3 + len(SIN_PERIODS)
+FEATURES_PER_ACCESS = 2
 
 
 class SequenceRegressor(nn.Module):
@@ -89,13 +88,7 @@ class LSTMModel:
 
     def _features(self, history: Sequence[Pair]) -> FeatureSequence:
         """Build one feature vector per timestep, preserving sequence order."""
-        features: FeatureSequence = []
-        for index, pair in enumerate(history):
-            age = float(len(history) - index)
-            vector = [float(pair[0]), float(pair[1]), age]
-            vector.extend(math.sin(math.tau * age / period) for period in SIN_PERIODS)
-            features.append(vector)
-        return features
+        return history
 
     def _fit(
         self,

@@ -1,4 +1,4 @@
-"""Train and serve a convolutional LSTM with one probability per 4 KiB page."""
+"""Train and serve a convolutional LSTM with one probability per 2 MiB page."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from offline.serve import serve
 from offline.data import load_training
-from offline.ts_lstm.__main__ import FEATURES_PER_ACCESS, SIN_PERIODS
+# We ignore the span for now -- only predict offsets
+FEATURES_PER_ACCESS = 1
 
 Pair = tuple[int, int]
 DISK_GB = 20
@@ -29,23 +30,8 @@ NUM_PAGES = DISK_BYTES // PAGE_BYTES
 CACHE_PATH = Path(__file__).resolve().parent / "training_cache_coarse_peek.pt"
 
 
-def page_bounds(pair: Pair) -> tuple[int, int]:
-    """Inclusive page bounds of a byte-addressed request."""
-    offset, length = pair
-    if offset < 0 or length < 1 or offset + length > DISK_BYTES:
-        raise ValueError(f"request {pair!r} is outside the {DISK_GB} GiB disk")
-    return offset // PAGE_BYTES, (offset + length - 1) // PAGE_BYTES
-
-
 def features(pairs: Sequence[Pair]) -> torch.Tensor:
-    rows = []
-    for index, (offset, length) in enumerate(pairs):
-        age = float(len(pairs) - index)
-        rows.append([
-            offset / DISK_BYTES, length / PAGE_BYTES, age,
-            *(math.sin(math.tau * age / period) for period in SIN_PERIODS),
-        ])
-    return torch.tensor(rows, dtype=torch.float32)
+    return torch.tensor([[offset / DISK_BYTES] for (offset, length) in pairs], dtype=torch.float32)
 
 
 class SequenceClassifier(nn.Module):
@@ -54,51 +40,36 @@ class SequenceClassifier(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.convolution = nn.Sequential(
-            nn.Conv1d(FEATURES_PER_ACCESS, 32, 3, padding=1),
+            nn.Conv1d(FEATURES_PER_ACCESS, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Conv1d(32, 32, 3, padding=1),
+            nn.Conv1d(64, 64, 3, padding=1),
             nn.ReLU(),
         )
-        self.lstm = nn.LSTM(32, 32, 4, batch_first=True)
-        self.output = nn.Linear(32, NUM_PAGES)
+        self.lstm = nn.LSTM(64, 64, 4, batch_first=True)
+        self.output = nn.Linear(64, NUM_PAGES)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         encoded = self.convolution(values.transpose(1, 2)).transpose(1, 2)
         _, (hidden, _) = self.lstm(encoded)
-        return self.output(hidden[-1])  # logits; sigmoid gives page probabilities
+        return self.output(hidden[-1])  # logits; softmax gives page probabilities
 
 
 def classification_loss(
-    logits: torch.Tensor, bounds: torch.Tensor, peek_alpha: float = 0.0,
+    logits: torch.Tensor, target_page: torch.Tensor, radius: int = 0,
 ) -> torch.Tensor:
-    """BCE over all pages; every page overlapping the next request is positive.
+    """Cross-entropy against a triangular soft target centered on the next page.
 
-    `bounds` rows are (first, last) page of the next request, optionally
-    followed by the (first, last) page of the request after it. Requests can
-    be reordered, so a page that is hit one request late is still a good
-    prefetch: the loss is BCE(next) + peek_alpha * BCE(request after next).
+    radius=0 is the plain one-hot target; larger radii give partial credit to
+    pages within `radius` of the target.
     """
     pages = torch.arange(logits.shape[-1], device=logits.device)
-
-    def bce(first: torch.Tensor, last: torch.Tensor) -> torch.Tensor:
-        labels = (pages >= first[:, None]) & (pages <= last[:, None])
-        return nn.functional.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
-
-    loss = bce(bounds[:, 0], bounds[:, 1])
-    if peek_alpha and bounds.shape[1] >= 4:
-        loss = loss + peek_alpha * bce(bounds[:, 2], bounds[:, 3])
-    return loss
+    dist = (pages - target_page[:, None]).abs().float()
+    soft = (1 - dist / (radius + 1)).clamp(min=0)
+    soft = soft / soft.sum(-1, keepdim=True)
+    return -(soft * logits.log_softmax(-1)).sum(-1).mean()
 
 
-def prefetch_range(probabilities: torch.Tensor, alpha: float, k: int) -> list[Pair]:
-    """Widest interval containing argmax with i,j < k and mean P > alpha.
-
-    Break width ties by mean probability, then by the lower starting page.
-    Return byte offset/length pairs, including both endpoints of the interval.
-    """
-    if not math.isfinite(alpha) or not 0 <= alpha <= 1 or k < 1:
-        raise ValueError("alpha must be in [0, 1] and k must be positive")
-    # TODO -- not to be implemented until other parts of the program prove to be reliable
+def prefetch_range(probabilities: torch.Tensor) -> list[Pair]:
     return [(int(probabilities.argmax()) * PAGE_BYTES, PAGE_BYTES)]
 
 
@@ -106,22 +77,14 @@ class BruteModel:
     def __init__(
         self, history: int, niceness: int, train: Sequence[Pair],
         test: Sequence[Pair], epochs: int, batch_size: int = 8,
-        alpha: float = 0.5, k: int = 8, peek_alpha: float = 0.5,
     ) -> None:
-        if min(history, niceness, epochs, batch_size, k) < 1:
-            raise ValueError("history, niceness, epochs, batch size and k must be positive")
-        if not math.isfinite(alpha) or not 0 <= alpha <= 1:
-            raise ValueError("alpha must be in [0, 1]")
-        if not math.isfinite(peek_alpha) or peek_alpha < 0:
-            raise ValueError("peek alpha must be non-negative")
-        for pair in (*train, *test):
-            page_bounds(pair)
+        if min(history, niceness, epochs, batch_size) < 1:
+            raise ValueError("history, niceness, epochs, batch size must be positive")
         if len(train) <= history:
             raise ValueError("training split needs at least min-len + 1 requests")
         self.history, self.niceness = history, niceness
-        self.batch_size, self.alpha, self.k = batch_size, alpha, k
-        self.peek_alpha = peek_alpha
-        torch.manual_seed(0)
+        self.batch_size = batch_size
+        torch.manual_seed(1)
         self.network = SequenceClassifier()
         self.train_losses: list[float] = []
         self.test_losses: list[float] = []
@@ -135,16 +98,16 @@ class BruteModel:
               file=sys.stderr, flush=True)
         for epoch in range(1, epochs + 1):
             self.network.train()
-            for batch, (values, bounds, _) in enumerate(
+            for batch, (values, targets, _) in enumerate(
                 DataLoader(train_data, batch_size=batch_size, shuffle=True), start=1,
             ):
                 optimizer.zero_grad(set_to_none=True)
-                loss = classification_loss(self.network(values), bounds, self.peek_alpha)
+                loss = classification_loss(self.network(values), targets)
                 loss.backward()
                 optimizer.step()
                 if batch == 1 or batch % 100 == 0 or batch == num_batches:
                     print(f"Epoch {epoch}/{epochs}, batch {batch}/{num_batches}: "
-                          f"BCE={loss.item():.6f}", file=sys.stderr, flush=True)
+                          f"CE={loss.item():.6f}", file=sys.stderr, flush=True)
             print(f"Epoch {epoch}/{epochs}: evaluating train and test losses",
                   file=sys.stderr, flush=True)
             training = self._evaluate(train_data)
@@ -153,27 +116,25 @@ class BruteModel:
             self.train_regression_losses.append(training[1])
             self.test_losses.append(testing[0])
             self.test_regression_losses.append(testing[1])
-            print(f"Epoch {epoch}/{epochs}: train BCE={training[0]:.6f}, "
-                  f"test BCE={testing[0]:.6f}, train RMSE={training[1]:.2f} bytes, "
+            print(f"Epoch {epoch}/{epochs}: train CE={training[0]:.6f}, "
+                  f"test CE={testing[0]:.6f}, train RMSE={training[1]:.2f} bytes, "
                   f"test RMSE={testing[1]:.2f} bytes", file=sys.stderr, flush=True)
 
     def _dataset(self, pairs: Sequence[Pair]) -> TensorDataset:
-        values, bounds, future = [], [], []
+        values, targets, future = [], [], []
         for index in range(self.history, len(pairs)):
             values.append(features(pairs[index - self.history:index]))
-            # The last request has no successor; repeat its own bounds for the peek.
-            following = pairs[index + 1] if index + 1 < len(pairs) else pairs[index]
-            bounds.append((*page_bounds(pairs[index]), *page_bounds(following)))
+            targets.append(pairs[index][0] // PAGE_BYTES)
             offsets = [pair[0] for pair in pairs[index:index + self.niceness]]
             # Repeating the last offset preserves the minimum for short tails.
             future.append(offsets + [offsets[-1]] * (self.niceness - len(offsets)))
         if not values:
             return TensorDataset(
                 torch.empty((0, self.history, FEATURES_PER_ACCESS)),
-                torch.empty((0, 4), dtype=torch.long),
+                torch.empty((0,), dtype=torch.long),
                 torch.empty((0, self.niceness), dtype=torch.float64),
             )
-        return TensorDataset(torch.stack(values), torch.tensor(bounds),
+        return TensorDataset(torch.stack(values), torch.tensor(targets),
                              torch.tensor(future, dtype=torch.float64))
 
     @torch.no_grad()
@@ -182,9 +143,9 @@ class BruteModel:
         if not len(dataset):
             return float("nan"), float("nan")
         total_loss = total_error = 0.0
-        for values, bounds, future in DataLoader(dataset, batch_size=self.batch_size):
+        for values, targets, future in DataLoader(dataset, batch_size=self.batch_size):
             logits = self.network(values)
-            total_loss += classification_loss(logits, bounds, self.peek_alpha).item() * len(values)
+            total_loss += classification_loss(logits, targets).item() * len(values)
             predicted = logits.argmax(-1).double() * PAGE_BYTES
             error = (predicted[:, None] - future).square().min(dim=1).values
             total_error += error.sum().item()
@@ -195,10 +156,8 @@ class BruteModel:
         if len(previous) < self.history:
             return None
         history = previous[-self.history:]
-        for pair in history:
-            page_bounds(pair)
         self.network.eval()
-        return self.network(features(history).unsqueeze(0))[0].sigmoid()
+        return self.network(features(history).unsqueeze(0))[0].softmax(-1)
 
     def predict(self, previous: Sequence[Pair], count: int) -> list[Pair]:
         """At most one range for the next request, using byte units."""
@@ -209,7 +168,7 @@ class BruteModel:
         probabilities = self.probabilities(previous)
         if probabilities is None:
             return []
-        return prefetch_range(probabilities, self.alpha, self.k)
+        return prefetch_range(probabilities)
 
 
 def show_losses(model: BruteModel, output_path: str | None) -> None:
@@ -220,7 +179,7 @@ def show_losses(model: BruteModel, output_path: str | None) -> None:
 
     figure, axes = plt.subplots(1, 2, figsize=(10, 4))
     for axis, train, test, label in (
-        (axes[0], model.train_losses, model.test_losses, "Classification BCE"),
+        (axes[0], model.train_losses, model.test_losses, "Classification CE"),
         (axes[1], model.train_regression_losses, model.test_regression_losses,
          "Regression RMSE (bytes)"),
     ):
@@ -260,7 +219,7 @@ def load_or_train(args: argparse.Namespace) -> BruteModel:
     data = load_training(args.training)
     split = min(len(data), max(args.min_len + 1, round(len(data) * 0.8)))
     model = BruteModel(args.min_len, args.niceness, data[:split], data[split:],
-                       args.epochs, args.batch_size, args.alpha, args.k, args.peek_alpha)
+                       args.epochs, args.batch_size)
     checkpoint = {
         "args": cache_args,
         "model": {key: value for key, value in vars(model).items() if key != "network"},
@@ -283,12 +242,8 @@ def main() -> None:
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1,
                         help="future request window for regression scoring only")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--alpha", type=float, default=0.3)
-    parser.add_argument("--peek-alpha", type=float, default=0.5,
-                        help="weight of the classification loss on the request after the next one")
-    parser.add_argument("--k", type=int, default=8, help="exclusive limit on pages on each side")
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"),
                         default="predict_min", help="accepted for ModelPolicy compatibility; unused")
     parser.add_argument("--predict-deltas", action="store_true")
@@ -297,13 +252,9 @@ def main() -> None:
     curve.add_argument("--hide-loss-curve", action="store_true")
     curve.add_argument("--loss-curve", metavar="PATH")
     args = parser.parse_args()
-    for name in ("min_len", "niceness", "epochs", "batch_size", "k"):
+    for name in ("min_len", "niceness", "epochs", "batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
-    if not math.isfinite(args.alpha) or not 0 <= args.alpha <= 1:
-        parser.error("--alpha must be in [0, 1]")
-    if not math.isfinite(args.peek_alpha) or args.peek_alpha < 0:
-        parser.error("--peek-alpha must be non-negative")
     if args.predict_deltas:
         parser.error("--predict-deltas is not supported: classes are absolute pages")
     try:
