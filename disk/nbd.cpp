@@ -450,7 +450,6 @@ Config LoadConfig(const std::string& path) {
   if (!in) throw std::runtime_error("failed to open config file: " + path);
 
   Config cfg;
-  bool have_ports = false;
   std::string line;
   while (std::getline(in, line)) {
     size_t hash = line.find('#');
@@ -472,7 +471,6 @@ Config LoadConfig(const std::string& path) {
       cfg.file = value;
     } else if (key == "ports") {
       cfg.ports = ParsePortList(value);
-      have_ports = true;
     } else if (key == "capacity") {
       cfg.capacity = static_cast<std::size_t>(std::stoull(value));
     } else if (key == "hit_latency_ns") {
@@ -514,7 +512,7 @@ Config LoadConfig(const std::string& path) {
   }
 
   if (cfg.file.empty()) throw std::runtime_error("config is missing required key: file");
-  if (!have_ports) throw std::runtime_error("config is missing required key: ports");
+  if (cfg.ports.empty()) throw std::runtime_error("config is missing required key: ports");
   if ((cfg.prefetch_policy == "model" || cfg.prefetch_policy == "model-prefetcher") &&
       cfg.prefetcher_path.empty()) {
     throw std::runtime_error("model-prefetcher requires prefetcher_path");
@@ -736,12 +734,24 @@ void AppendLog(const Config& cfg, const Stats& stats,
 }  // namespace nbd
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: %s <config.yaml>\n", argv[0]);
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: %s <config.yaml> [ports]\n", argv[0]);
     return 1;
   }
 
+  std::vector<uint16_t> ports;
+  for (int i = 2; i < argc; i++) {
+    try {
+      int port = std::stoi(argv[i]);
+      ports.push_back(port);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "%s: %s\n", argv[1], e.what());
+      return 1;
+    }
+  }
+
   nbd::Config cfg;
+  cfg.ports = ports;
   try {
     cfg = nbd::LoadConfig(argv[1]);
   } catch (const std::exception& e) {

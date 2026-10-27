@@ -59,7 +59,8 @@ whatever evict/prefetch policy is configured — writes/trims/flushes are
 accepted and discarded (nothing a guest writes is ever persisted).
 
 The server listens on one TCP port per entry in a config file's `ports:`
-list. **Each port is its own client identity**: a VM disk that dials a given
+list. These ports can be overriden in the command line.
+**Each port is its own client identity**: a VM disk that dials a given
 port is tracked separately from every other VM's disk for cache
 virtual-time/prefetch purposes (`worker_id` in `SimReadClass`) — assign one
 port per VM disk you want the simulator to treat as distinct. Note that all
@@ -67,11 +68,11 @@ ports on one `nbd_server` process still read from the *same* backing file;
 if VMs need genuinely different disk contents, run separate `nbd_server`
 processes (or configs) with different `file:` paths.
 
-Takes a single argument: a config file path (a deliberately small YAML
+Takes 1+ arguments: a config file path (a deliberately small YAML
 subset — flat `key: value` lines, `#` comments, one inline list for
 `ports:`). See [`disk/nbd.example.yaml`](disk/nbd.example.yaml) for the full
 schema (backing file, ports, cache capacity, hit/miss latency, warmup,
-evict/prefetch policy, log path).
+evict/prefetch policy, log path). And possibly a list of ports.
 
 ### disk/sim.hpp (`SimReadClass`)
 

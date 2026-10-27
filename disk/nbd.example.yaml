@@ -6,7 +6,8 @@
 # for virtual-time/prefetch purposes separately from every other port, so
 # assign one port per VM disk you want the simulator to treat as a distinct
 # client (see kvm/vms.example.yaml, where each VM disk names the host:port
-# of the nbd server it should attach to).
+# of the nbd server it should attach to). This has been migrated to command
+# line for the most part.
 #
 # This is a deliberately small subset of YAML: flat `key: value` lines,
 # `#` comments, and one inline list (`ports:`). Nesting is not supported.
@@ -34,6 +35,9 @@ prefetcher_path: offline.ts_mlr
 prefetcher_type: predict_mean
 prefetcher_min_len: 8
 prefetcher_training: ./logs/oracle.csv
+
+# If log_dir is present, none of the following files need to be present
+log_dir: ./logs
 
 # CSV stats log, appended to (header written once) on a clean shutdown
 # (SIGINT/SIGTERM) -- see disk/nbd.cpp's AppendLog.
