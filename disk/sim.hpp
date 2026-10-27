@@ -87,8 +87,8 @@ public:
         if (offset % SECTOR_SIZE || length % SECTOR_SIZE) {
             std::cerr << "got invalid (offset=" << offset << ",length=" << length << ")\n";
         }
-        uint32_t block_offset = offset / SECTOR_SIZE;
-        uint32_t block_length = length / SECTOR_SIZE;
+        std::uint64_t block_offset = offset / SECTOR_SIZE;
+        std::uint64_t block_length = length / SECTOR_SIZE;
 
         // timing (worker)
         uint64_t now_ns = steady_ns();
@@ -131,7 +131,7 @@ public:
                 });
             }
         }
-        for (std::uint32_t block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
+        for (std::uint64_t block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
             std::lock_guard _{mu};
             bool hit = cache.present(block_offset + block_suboffset);
             total_count += 1;
@@ -162,7 +162,7 @@ public:
                 if (prefetch_log) {
                     const auto& r = prefetch_req.fetch_ranges[i];
                     uint64_t cached = 0;
-                    for (uint32_t b = 0; b < r.block_length; ++b) cached += cache.present(r.block_offset + b);
+                    for (std::uint64_t b = 0; b < r.block_length; ++b) cached += cache.present(r.block_offset + b);
                     std::fprintf(prefetch_log, "%llu,%llu,%llu,%llu,%llu,%llu\n",
                         static_cast<unsigned long long>(worker_id),
                         static_cast<unsigned long long>(r.block_offset) * SECTOR_SIZE,
@@ -269,7 +269,7 @@ public:
     uint64_t add_to_cache(uint64_t worker_id, policy::FetchRange range, bool is_prefetch,
                           bool count_stats) {
         uint64_t latency = 0;
-        for (uint32_t block_suboffset = 0; block_suboffset < range.block_length; ++block_suboffset) {
+        for (std::uint64_t block_suboffset = 0; block_suboffset < range.block_length; ++block_suboffset) {
             if (cache.present(range.block_offset + block_suboffset)) continue;
             // TODO consider what happens if we
             // instead of noop-ing eviction when ctx is present,

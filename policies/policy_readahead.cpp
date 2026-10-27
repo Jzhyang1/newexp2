@@ -15,8 +15,8 @@ void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page, bool i
     (void)is_prefetch;
 }
 
-void ReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                                          std::uint32_t block_length, PrefetchRequest& request) {
+void ReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                                          std::uint64_t block_length, PrefetchRequest& request) {
     (void)context;
     // Suggest the next MAX_PREFETCH_PAGES pages after the requested range.
     request.fetch_count = 1;

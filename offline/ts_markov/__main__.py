@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from typing import Any
 
+from offline.serve import serve
 from offline.data import (
     load_training,
     preprocess_history,
@@ -105,40 +106,6 @@ class MarkovModel:
         return predictions
 
 
-def serve(model: MarkovModel, predict_deltas: bool) -> None:
-    """Serve the line-oriented JSON protocol used by ModelPolicy."""
-    test_offset_errors: list[float] = []
-    test_length_errors: list[float] = []
-    for line in sys.stdin:
-        request: dict[str, Any] = json.loads(line)
-        request_type = request.get("type")
-        if request_type == "get":
-            previous = [tuple(pair) for pair in request["prev_accesses"]]
-            predictions = model.predict(
-                preprocess_history(previous, predict_deltas), int(request["next_n"])
-            )
-            absolute: list[Pair] = []
-            for prediction in predictions:
-                absolute.append(restore_prediction(previous + absolute, prediction, predict_deltas))
-            print(json.dumps(absolute), flush=True)
-        elif request_type == "put":
-            predicted = request.get("predicted_accesses", [])
-            actual = tuple(request["actual_accesses"])
-            if predicted:
-                test_offset_errors.append((int(predicted[0][0]) - actual[0]) ** 2)
-                test_length_errors.append((int(predicted[0][1]) - actual[1]) ** 2)
-            print("[]", flush=True)
-        elif request_type == "kill":
-            if test_offset_errors:
-                offset_rmse = math.sqrt(sum(test_offset_errors) / len(test_offset_errors))
-                length_rmse = math.sqrt(sum(test_length_errors) / len(test_length_errors))
-                print(f"offset test loss: {offset_rmse:.2f}", file=sys.stderr, flush=True)
-                print(f"length test loss: {length_rmse:.2f}", file=sys.stderr, flush=True)
-            break
-        else:
-            raise ValueError(f"unknown request type: {request_type!r}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"), default="predict_min")
@@ -167,7 +134,14 @@ def main() -> None:
     print(f"offset testing loss:  {test_loss_offset:.0f}", file=sys.stderr, flush=True)
     print(f"length testing loss:  {test_loss_length:.0f}", file=sys.stderr, flush=True)
     if not args.dry_run:
-        serve(model, args.predict_deltas)
+        def predict(previous: list[Pair], count: int) -> list[Pair]:
+            predictions = model.predict(preprocess_history(previous, args.predict_deltas), count)
+            absolute: list[Pair] = []
+            for prediction in predictions:
+                absolute.append(restore_prediction(previous + absolute, prediction, args.predict_deltas))
+            return absolute
+
+        serve(predict)
 
 
 if __name__ == "__main__":

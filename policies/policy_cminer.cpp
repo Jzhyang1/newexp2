@@ -13,11 +13,11 @@ CMinerPolicy::CMinerPolicy(Cache& cache, std::size_t window_size, std::uint32_t 
                             std::uint64_t top_k)
     : CachePolicy(cache), assoc_(window_size, min_support), top_k_(top_k) {}
 
-void CMinerPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                                        std::uint32_t block_length, PrefetchRequest& request) {
+void CMinerPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                                        std::uint64_t block_length, PrefetchRequest& request) {
     (void)context;
     request.fetch_count = 0;
-    for (std::uint32_t block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
+    for (std::uint64_t block_suboffset = 0; block_suboffset < block_length; ++block_suboffset) {
         std::uint64_t page = static_cast<std::uint64_t>(block_offset) + block_suboffset;
         std::uint64_t predicted[MAX_PREFETCH_PAGES];
         std::uint64_t predicted_n = 0;
@@ -26,7 +26,7 @@ void CMinerPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t bloc
         assoc_.predict(kSharedKey, page, predicted, predicted_n, capacity);
         for (std::uint64_t i = 0; i < predicted_n; ++i) {
             request.fetch_ranges[request.fetch_count++] =
-                FetchRange{static_cast<std::uint32_t>(predicted[i]), 1};
+                FetchRange{static_cast<std::uint64_t>(predicted[i]), 1};
         }
         // Predict before folding each access in, otherwise it could trivially
         // predict itself.

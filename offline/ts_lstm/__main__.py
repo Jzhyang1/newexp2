@@ -9,6 +9,7 @@ import sys
 from typing import Any, Sequence
 import torch
 from torch import nn
+from offline.serve import serve
 from offline.data import load_training
 from offline.loss import prediction_loss
 from offline.loss_curve import show_loss_curve
@@ -169,39 +170,6 @@ class LSTMModel:
             history.extend(forecast)
         return predictions
 
-def serve(model: LSTMModel) -> None:
-    """Serve the line-oriented JSON protocol used by ModelPolicy."""
-    test_offset_errors: list[float] = []
-    test_length_errors: list[float] = []
-    for line in sys.stdin:
-        request: dict[str, Any] = json.loads(line)
-        request_type = request.get("type")
-        if request_type == "get":
-            previous = [tuple(pair) for pair in request["prev_accesses"]]
-            print(json.dumps(model.predict(previous, int(request["next_n"]))), flush=True)
-        elif request_type == "put":
-            predicted = request.get("predicted_accesses", [])
-            actual = tuple(request["actual_accesses"])
-            if predicted:
-                test_offset_errors.append((int(predicted[0][0]) - actual[0]) ** 2)
-                test_length_errors.append((int(predicted[0][1]) - actual[1]) ** 2)
-            print("[]", flush=True)
-        elif request_type == "kill":
-            if test_offset_errors:
-                print(
-                    f"offset test loss: {math.sqrt(sum(test_offset_errors) / len(test_offset_errors)):.2f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                print(
-                    f"length test loss: {math.sqrt(sum(test_length_errors) / len(test_length_errors)):.2f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            break
-        else:
-            raise ValueError(f"unknown request type: {request_type!r}")
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -248,7 +216,7 @@ def main() -> None:
     print(f"offset testing loss:  {test_loss_offset:.0f}", file=sys.stderr, flush=True)
     print(f"length testing loss:  {test_loss_length:.0f}", file=sys.stderr, flush=True)
     if not args.dry_run:
-        serve(model)
+        serve(model.predict)
 
 
 if __name__ == "__main__":

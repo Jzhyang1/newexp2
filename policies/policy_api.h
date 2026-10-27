@@ -26,8 +26,8 @@
 namespace policy {
 
 struct FetchRange {
-    std::uint32_t block_offset;
-    std::uint32_t block_length;
+    std::uint64_t block_offset;
+    std::uint64_t block_length;
 };
 
 struct PrefetchRequest {
@@ -55,8 +55,8 @@ public:
         (void)page;
         (void)is_prefetch;
     };
-    virtual void on_prefetch_request(uint64_t context, uint32_t block_offset,
-                                     uint32_t block_length, PrefetchRequest& request) {
+    virtual void on_prefetch_request(uint64_t context, std::uint64_t block_offset,
+                                     std::uint64_t block_length, PrefetchRequest& request) {
         (void)context;
         (void)block_offset;
         (void)block_length;
@@ -163,8 +163,8 @@ class ReadaheadPolicy : public CachePolicy {
 public:
     ReadaheadPolicy(Cache& cache);
     void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Groups reads into per-context "streams" the way a hardware stride/stream
@@ -207,16 +207,16 @@ class ContextAwareReadaheadPolicy : public CachePolicy {
 public:
     explicit ContextAwareReadaheadPolicy(Cache& cache, std::uint64_t attach_window = 8,
                                           std::size_t max_streams_per_context = 8);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Replays the next request from an nbd_access.csv-shaped trace. The trace is
 // partitioned by worker_id so concurrent clients retain their own request order.
 class OraclePolicy : public CachePolicy {
     struct Request {
-        std::uint32_t block_offset;
-        std::uint32_t block_length;
+        std::uint64_t block_offset;
+        std::uint64_t block_length;
     };
 
     std::unordered_map<std::uint64_t, std::vector<Request>> requests_;
@@ -224,8 +224,8 @@ class OraclePolicy : public CachePolicy {
 
 public:
     OraclePolicy(Cache& cache, const std::string& path);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Queries an offline Python predictor over its JSON-lines stdin/stdout API.
@@ -234,15 +234,15 @@ class ModelPolicy : public CachePolicy {
     std::unique_ptr<ModelProcess> model_;
     std::size_t min_len_;
     std::mutex mutex_;
-    std::unordered_map<std::uint64_t, std::deque<std::pair<std::uint32_t, std::uint32_t>>> history_;
-    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> pending_;
+    std::unordered_map<std::uint64_t, std::deque<std::pair<std::uint64_t, std::uint64_t>>> history_;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> pending_;
 public:
     ModelPolicy(Cache& cache, const std::string& module, const std::string& type,
                 std::size_t min_len, const std::string& training);
     ~ModelPolicy() override;
     void on_access(std::uint64_t context, std::uint64_t page);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Baseline: mines page-follows-page associations from a single trailing
@@ -254,8 +254,8 @@ class CMinerPolicy : public CachePolicy {
 public:
     explicit CMinerPolicy(Cache& cache, std::size_t window_size = 8,
                            std::uint32_t min_support = 2, std::uint64_t top_k = 4);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Same windowed-association mining as CMinerPolicy, but partitioned per
@@ -267,8 +267,8 @@ class QuickMinePolicy : public CachePolicy {
 public:
     explicit QuickMinePolicy(Cache& cache, std::size_t window_size = 8,
                               std::uint32_t min_support = 2, std::uint64_t top_k = 4);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 // Same global (context-free) windowed-association mining as CMinerPolicy,
@@ -284,8 +284,8 @@ public:
     explicit MithrilPolicy(Cache& cache, std::size_t window_size = 8,
                             std::uint32_t min_support = 2, std::uint64_t top_k = 4,
                             std::uint32_t hot_threshold = 20);
-    void on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                             std::uint32_t block_length, PrefetchRequest& request);
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request);
 };
 
 }  // namespace policy

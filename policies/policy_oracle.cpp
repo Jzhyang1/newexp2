@@ -56,13 +56,13 @@ OraclePolicy::OraclePolicy(Cache& cache, const std::string& path) : CachePolicy(
                                      path + " at line " + std::to_string(line_number + 1));
         }
         requests_[worker_id].push_back(Request{
-            static_cast<std::uint32_t>(byte_offset / 512),
-            static_cast<std::uint32_t>(byte_length / 512)});
+            static_cast<std::uint64_t>(byte_offset / 512),
+            static_cast<std::uint64_t>(byte_length / 512)});
     }
 }
 
-void OraclePolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                                       std::uint32_t block_length, PrefetchRequest& request) {
+void OraclePolicy::on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                                       std::uint64_t block_length, PrefetchRequest& request) {
     auto trace = requests_.find(context);
     if (trace == requests_.end()) return;
 

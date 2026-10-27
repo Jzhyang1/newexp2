@@ -17,8 +17,8 @@ namespace policy {
 namespace {
 
 struct Pair {
-    std::uint32_t offset;
-    std::uint32_t length;
+    std::uint64_t offset;
+    std::uint64_t length;
 };
 
 std::string JsonPair(Pair pair) {
@@ -38,7 +38,7 @@ std::vector<Pair> ParsePairs(const std::string& response) {
         ++cursor;
         return true;
     };
-    const auto number = [&](std::uint32_t& value) {
+    const auto number = [&](std::uint64_t& value) {
         skip_space();
         const char* begin = response.data() + cursor;
         const auto result = std::from_chars(begin, response.data() + response.size(), value);
@@ -46,8 +46,8 @@ std::vector<Pair> ParsePairs(const std::string& response) {
         cursor += result.ptr - begin;
         return true;
     };
-    const auto invalid = [] {
-        std::fprintf(stderr, "model prefetcher: invalid prediction response; expected [[offset,length],...] with uint32 offsets and positive uint32 lengths\n");
+    const auto invalid = [response] {
+        std::fprintf(stderr, "model prefetcher: invalid prediction response %s; expected [[offset,length],...] with uint64 offsets and positive uint64 lengths\n", response.data());
         return std::vector<Pair>{};
     };
 
@@ -136,8 +136,8 @@ void ModelPolicy::on_access(std::uint64_t context, std::uint64_t page) {
     (void)page;
 }
 
-void ModelPolicy::on_prefetch_request(std::uint64_t context, std::uint32_t block_offset,
-                                      std::uint32_t block_length, PrefetchRequest& request) {
+void ModelPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                                      std::uint64_t block_length, PrefetchRequest& request) {
     std::lock_guard lock(mutex_);
     request.fetch_count = 0;
     const Pair actual{block_offset, block_length};
