@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from offline.serve import serve
 from offline.data import load_training
 # We ignore the span for now -- only predict offsets
-FEATURES_PER_ACCESS = 1
+EMBED_DIM = 32
 
 Pair = tuple[int, int]
 DISK_GB = 20
@@ -27,11 +27,11 @@ BLOCK_BYTES = 512
 BLOCKS_PER_PAGE = 4096
 PAGE_BYTES = BLOCK_BYTES * BLOCKS_PER_PAGE
 NUM_PAGES = DISK_BYTES // PAGE_BYTES
-CACHE_PATH = Path(__file__).resolve().parent / "training_cache_coarse_peek.pt"
+CACHE_PATH = Path(__file__).resolve().parent / "training_cache_coarse_emb.pt"
 
 
 def features(pairs: Sequence[Pair]) -> torch.Tensor:
-    return torch.tensor([[offset / DISK_BYTES] for (offset, length) in pairs], dtype=torch.float32)
+    return torch.tensor([offset // PAGE_BYTES for (offset, length) in pairs], dtype=torch.long)
 
 
 class SequenceClassifier(nn.Module):
@@ -39,17 +39,18 @@ class SequenceClassifier(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.embedding = nn.Embedding(NUM_PAGES, EMBED_DIM)
         self.convolution = nn.Sequential(
-            nn.Conv1d(FEATURES_PER_ACCESS, 64, 3, padding=1),
+            nn.Conv1d(EMBED_DIM, 64, 3, padding=1),
             nn.ReLU(),
             nn.Conv1d(64, 64, 3, padding=1),
             nn.ReLU(),
         )
-        self.lstm = nn.LSTM(64, 64, 4, batch_first=True)
+        self.lstm = nn.LSTM(64, 64, 1, batch_first=True)
         self.output = nn.Linear(64, NUM_PAGES)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        encoded = self.convolution(values.transpose(1, 2)).transpose(1, 2)
+        encoded = self.convolution(self.embedding(values).transpose(1, 2)).transpose(1, 2)
         _, (hidden, _) = self.lstm(encoded)
         return self.output(hidden[-1])  # logits; softmax gives page probabilities
 
@@ -91,7 +92,7 @@ class BruteModel:
         self.train_regression_losses: list[float] = []
         self.test_regression_losses: list[float] = []
         train_data, test_data = self._dataset(train), self._dataset(test)
-        optimizer = torch.optim.Adam(self.network.parameters(), lr=0.01)
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=0.001)
         num_batches = math.ceil(len(train_data) / batch_size)
         print(f"Training on {len(train_data)} examples; testing on {len(test_data)} examples; "
               f"{epochs} epochs, {num_batches} batches per epoch",
@@ -130,7 +131,7 @@ class BruteModel:
             future.append(offsets + [offsets[-1]] * (self.niceness - len(offsets)))
         if not values:
             return TensorDataset(
-                torch.empty((0, self.history, FEATURES_PER_ACCESS)),
+                torch.empty((0, self.history), dtype=torch.long),
                 torch.empty((0,), dtype=torch.long),
                 torch.empty((0, self.niceness), dtype=torch.float64),
             )
@@ -242,7 +243,7 @@ def main() -> None:
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--niceness", type=int, default=1,
                         help="future request window for regression scoring only")
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--type", choices=("predict_mean", "predict_min", "predict_max"),
                         default="predict_min", help="accepted for ModelPolicy compatibility; unused")
