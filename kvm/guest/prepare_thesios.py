@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download Thesios shards and emit a compact READ offset/length trace."""
+"""Download Thesios shards and emit a compact READ filename/offset/length trace."""
 import argparse
 import csv
 import hashlib
@@ -9,8 +9,15 @@ import tempfile
 import urllib.request
 
 
+# Bump when the condensed row format changes so stale per-shard caches are skipped.
+CACHE_FORMAT = "v2"
+# Thesios file names are 64 hex chars; 16 (64 bits) keeps the trace small and
+# is far more than enough to tell a day's few hundred thousand files apart.
+FILENAME_CHARS = 16
+
+
 def condense_shard(url, output, trace_dir=None):
-    """Write one shard's READ (offset, length) rows to output.
+    """Write one shard's READ (filename, offset, length) rows to output.
 
     Uses the raw shard from trace_dir (same basename as the URL, as laid down
     by `make thesios-download`) if present, else downloads it.
@@ -39,13 +46,14 @@ def condense_shard(url, output, trace_dir=None):
                     if row.get("op_type", "").strip().upper() != "READ":
                         continue
                     try:
+                        filename = row["filename"][:FILENAME_CHARS]
                         offset = int(row["file_offset"])
                         length = int(row["request_io_size_bytes"])
                     except (KeyError, TypeError, ValueError):
                         continue
-                    if offset < 0 or length <= 0:
+                    if not filename or offset < 0 or length <= 0:
                         continue
-                    writer.writerow((offset, length))
+                    writer.writerow((filename, offset, length))
                     stats[1] += 1
                     stats[2] += length
     return stats
@@ -60,11 +68,11 @@ def prepare(urls, output, cache_dir=None, trace_dir=None):
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
     with open(output, "w", newline="") as out:
-        out.write("offset,length\n")
+        out.write("filename,offset,length\n")
         for url in urls:
             cached = None
             if cache_dir:
-                key = hashlib.sha256(url.encode()).hexdigest()[:16]
+                key = hashlib.sha256(f"{CACHE_FORMAT}:{url}".encode()).hexdigest()[:16]
                 cached = os.path.join(cache_dir, f"{key}.reads.csv")
             if cached and os.path.exists(cached):
                 print(f"cached {url}", flush=True)

@@ -139,10 +139,13 @@ GUEST_GUPS_BLOCK_SIZE ?= 512
 GUEST_GUPS_DIRECT_IO ?= 0
 GUEST_GUPS_SEED ?= 20261007
 
-# Bakes one public Thesios CSV shard into the image and replays its READ
-# requests against the guest's raw root block device. Thesios file offsets are
-# relative to the source file, so use a root image at least as large as the
-# selected cluster's disk (16T for the default shard).
+# Bakes the public Thesios CSV shards into the image and replays their READ
+# requests against the guest's raw root block device. Thesios offsets are
+# relative to the source file, so the image is grown to a sparse
+# GUEST_THESIOS_DISK_SIZE and thesios_bench.py gives each file a random,
+# non-overlapping extent past the filesystem on first visit (GUEST_THESIOS_SEED
+# makes the layout repeatable). Keep the size under the host filesystem's max
+# file size (16T on ext4); one day's reads span ~2T of files.
 GUEST_THESIOS ?= 0
 GUEST_THESIOS_TRACE_NUM ?= 99
 GUEST_THESIOS_BASE_URL ?= https://storage.googleapis.com/thesios-io-traces/cluster1_16TB/20240115
@@ -151,6 +154,8 @@ GUEST_THESIOS_TRACE_NAMES := $(addsuffix -of-00100,$(addprefix data-,$(GUEST_THE
 GUEST_THESIOS_TRACE_SEQ_URL := $(addprefix $(GUEST_THESIOS_BASE_URL)/,$(GUEST_THESIOS_TRACE_NAMES))
 GUEST_THESIOS_TRACE_URLS := $(subst $(SPACE),$(COMMA),$(GUEST_THESIOS_TRACE_SEQ_URL))
 GUEST_THESIOS_MAX_REQUESTS ?= 0
+GUEST_THESIOS_DISK_SIZE ?= 8T
+GUEST_THESIOS_SEED ?= 20261007
 GUEST_THESIOS_DEVICE ?= /dev/vda
 GUEST_THESIOS_DIRECT_IO ?= 0
 
@@ -217,6 +222,7 @@ guest-image: $(if $(filter 1,$(GUEST_THESIOS)),thesios-download) $(if $(filter 1
 	  THESIOS_ENABLE=$(GUEST_THESIOS) THESIOS_TRACE_URLS=$(GUEST_THESIOS_TRACE_URLS) \
 	  THESIOS_MAX_REQUESTS=$(GUEST_THESIOS_MAX_REQUESTS) THESIOS_DEVICE=$(GUEST_THESIOS_DEVICE) \
 	  THESIOS_DIRECT_IO=$(GUEST_THESIOS_DIRECT_IO) THESIOS_DIR=$(THESIOS_DIR) \
+	  THESIOS_DISK_SIZE=$(GUEST_THESIOS_DISK_SIZE) THESIOS_SEED=$(GUEST_THESIOS_SEED) \
 	  YCSB_ASSETS_DIR=$(YCSB_ASSETS_DIR) \
 	  FORCE_REBUILD=$(FORCE_REBUILD) \
 	  bash kvm/guest/build_image.sh

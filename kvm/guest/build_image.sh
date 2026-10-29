@@ -18,8 +18,11 @@
 # Independent of YCSB_ENABLE; both datasets can be baked into the same
 # image at once (WORKLOAD_SCRIPT picks which one actually runs at boot).
 #
-# If THESIOS_ENABLE=1, also downloads one public Thesios CSV shard and writes
-# its metadata under /opt/workload for thesios_bench.py to replay at boot.
+# If THESIOS_ENABLE=1, also bakes a condensed public Thesios trace (filename,
+# offset, length per read) under /opt/workload for thesios_bench.py to replay
+# at boot, and grows ROOTFS_IMG to a sparse THESIOS_DISK_SIZE: the bench gives
+# each trace file a random extent past the ext4 filesystem (which keeps its
+# own size), so the replay spans the whole disk instead of one file's range.
 #
 # All writes here go straight to ROOTFS_IMG on the host filesystem via
 # debootstrap/chroot -- a completely different path from nbd_server, which
@@ -95,7 +98,7 @@ GUPS_BLOCK_SIZE=${GUPS_BLOCK_SIZE:-4096}
 GUPS_DIRECT_IO=${GUPS_DIRECT_IO:-0}
 GUPS_SEED=${GUPS_SEED:-20261007}
 
-# Optional: bake one public Thesios CSV shard into /opt/workload. The trace
+# Optional: bake a condensed Thesios trace into /opt/workload. The trace
 # itself is downloaded on the host, not from inside the guest, so boot does
 # not depend on network access. See the Makefile's GUEST_THESIOS_* vars.
 THESIOS_ENABLE=${THESIOS_ENABLE:-0}
@@ -103,6 +106,10 @@ THESIOS_TRACE_URLS=${THESIOS_TRACE_URLS:-https://storage.googleapis.com/thesios-
 THESIOS_MAX_REQUESTS=${THESIOS_MAX_REQUESTS:-0}
 THESIOS_DEVICE=${THESIOS_DEVICE:-/dev/vda}
 THESIOS_DIRECT_IO=${THESIOS_DIRECT_IO:-0}
+# Sparse size the image is grown to; must stay under the host filesystem's
+# max file size (16T on ext4).
+THESIOS_DISK_SIZE=${THESIOS_DISK_SIZE:-8T}
+THESIOS_SEED=${THESIOS_SEED:-20261007}
 # Directory of raw shards named like the URL basenames (`make thesios-download`).
 THESIOS_DIR=${THESIOS_DIR:-$(dirname "$ROOTFS_IMG")/assets/thesios}
 IFS=',' read -ra THESIOS_URLS <<< "$THESIOS_TRACE_URLS"
@@ -127,6 +134,7 @@ if [[ "$FORCE_REBUILD" == "1" || ! -f "$ROOTFS_IMG" ]]; then
 fi
 
 REQUIRED_TOOLS=(losetup chroot rsync mount mkfs.ext4)
+[[ "$THESIOS_ENABLE" == "1" ]] && REQUIRED_TOOLS+=(dumpe2fs numfmt)
 [[ "$REBUILD_ROOTFS" == "1" ]] && REQUIRED_TOOLS+=(debootstrap)
 for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -166,6 +174,22 @@ else
     echo "build_image.sh: reusing existing rootfs $ROOTFS_IMG"
 fi
 
+# Thesios: the filesystem keeps its size and the rest of the (sparse) image is
+# the extent space thesios_bench.py lays trace files out in. Done before
+# mounting so a reused image gets (re)sized too; growing a file under an ext4
+# filesystem is harmless, and the guest sees the larger /dev/vda.
+THESIOS_FS_BYTES=0
+if [[ "$THESIOS_ENABLE" == "1" ]]; then
+    THESIOS_FS_BYTES=$(dumpe2fs -h "$ROOTFS_IMG" 2>/dev/null \
+        | awk -F: '/^Block count/ {c=$2} /^Block size/ {b=$2} END {print c * b}')
+    THESIOS_DISK_BYTES=$(numfmt --from=iec "$THESIOS_DISK_SIZE")
+    if (( THESIOS_FS_BYTES <= 0 || THESIOS_DISK_BYTES <= THESIOS_FS_BYTES )); then
+        echo "THESIOS_DISK_SIZE=$THESIOS_DISK_SIZE must exceed the ${THESIOS_FS_BYTES}-byte filesystem" >&2
+        exit 1
+    fi
+    truncate -s "$THESIOS_DISK_BYTES" "$ROOTFS_IMG"
+fi
+
 LOOP=$(losetup -f --show "$ROOTFS_IMG")
 mount "$LOOP" "$MNT"
 
@@ -187,7 +211,8 @@ stamp_ok() {
 
 YCSB_STAMP="$YCSB_VERSION $SQLITE_JDBC_VERSION $YCSB_RECORDS $YCSB_FIELD_COUNT $YCSB_FIELD_LENGTH $YCSB_WORKLOAD $YCSB_SEED"
 GUPS_STAMP="$GUPS_TABLE_MB"
-THESIOS_STAMP=$(printf '%s\n' "${THESIOS_URLS[@]}" | sha256sum | cut -d' ' -f1)
+# "v2": the trace carries a filename column (older images baked offset,length only).
+THESIOS_STAMP=$(printf 'v2\n%s\n' "${THESIOS_URLS[@]}" | sha256sum | cut -d' ' -f1)
 
 YCSB_MISSING=0
 if [[ "$YCSB_ENABLE" == "1" ]]; then
@@ -321,7 +346,9 @@ if [[ "$THESIOS_ENABLE" == "1" ]]; then
     "trace_path": "${THESIOS_TRACE}",
     "device_path": "${THESIOS_DEVICE}",
     "max_requests": ${THESIOS_MAX_REQUESTS},
-    "direct_io": ${THESIOS_DIRECT_IO}
+    "direct_io": ${THESIOS_DIRECT_IO},
+    "region_start_bytes": ${THESIOS_FS_BYTES},
+    "seed": ${THESIOS_SEED}
 }
 EOF
 fi
@@ -477,5 +504,5 @@ if [[ "$GUPS_ENABLE" == "1" ]]; then
     echo "gups: ${GUPS_TABLE_MB}MB table baked at /opt/workload/gups_table.bin, ${GUPS_UPDATES} random ${GUPS_BLOCK_SIZE}-byte reads at boot (see /opt/workload/gups_config.json)"
 fi
 if [[ "$THESIOS_ENABLE" == "1" ]]; then
-    echo "thesios: condensed ${#THESIOS_URLS[@]} shard(s) baked at /opt/workload/thesios_trace.csv, max_requests=${THESIOS_MAX_REQUESTS} (0=all)"
+    echo "thesios: condensed ${#THESIOS_URLS[@]} shard(s) baked at /opt/workload/thesios_trace.csv, max_requests=${THESIOS_MAX_REQUESTS} (0=all), image grown to sparse ${THESIOS_DISK_SIZE} (files laid out past byte ${THESIOS_FS_BYTES})"
 fi
