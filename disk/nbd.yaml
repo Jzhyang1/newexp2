@@ -11,16 +11,16 @@ miss_latency_ns: 300000
 warmup: 0
 
 evict_policy: lru
-prefetch_policy: model-prefetcher       # none | readahead | oracle | model-prefetcher | cminer | quickmine | mithril
+prefetch_policy: quickmine       # none | readahead | oracle | model-prefetcher | cminer | quickmine | mithril
 latency_mode: simulated     # simulated | physical
 oracle_file: ./logs/oracle.csv
 # Required when prefetch_policy is `model-prefetcher`
-prefetcher_path: offline.ts_mlr
-prefetcher_type: predict_mean
-prefetcher_min_len: 32
+prefetcher_path: offline.tsc_beam
+prefetcher_type: predict_min
+prefetcher_min_len: 16
 prefetcher_training: ./logs/oracle.csv
 
 log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv
-vm_log_dir: /tmp/kvm-launch
+vm_log_dir: ./kvm
 prefetch_log: ./logs/nbd_prefetch.csv

@@ -50,14 +50,11 @@ OraclePolicy::OraclePolicy(Cache& cache, const std::string& path) : CachePolicy(
         const std::uint64_t worker_id = ParseField(worker, "worker_id", path, line_number + 1);
         const std::uint64_t byte_offset = ParseField(offset, "offset", path, line_number + 1);
         const std::uint64_t byte_length = ParseField(length, "length", path, line_number + 1);
-        if (byte_offset % 512 != 0 || byte_length == 0 || byte_length % 512 != 0 ||
-            byte_offset / 512 > UINT32_MAX || byte_length / 512 > UINT32_MAX) {
+        if (byte_offset % 512 != 0 || byte_length == 0 || byte_length % 512 != 0) {
             throw std::runtime_error("oracle trace row is not a valid sector-aligned request in " +
                                      path + " at line " + std::to_string(line_number + 1));
         }
-        requests_[worker_id].push_back(Request{
-            static_cast<std::uint64_t>(byte_offset / 512),
-            static_cast<std::uint64_t>(byte_length / 512)});
+        requests_[worker_id].push_back(Request{byte_offset / 512, byte_length / 512});
     }
 }
 

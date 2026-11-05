@@ -21,7 +21,7 @@
 # If THESIOS_ENABLE=1, also bakes a condensed public Thesios trace (filename,
 # offset, length per read) under /opt/workload for thesios_bench.py to replay
 # at boot, and grows ROOTFS_IMG to a sparse THESIOS_DISK_SIZE: the bench gives
-# each trace file a random extent past the ext4 filesystem (which keeps its
+# each trace file a hashed offset past the ext4 filesystem (which keeps its
 # own size), so the replay spans the whole disk instead of one file's range.
 #
 # All writes here go straight to ROOTFS_IMG on the host filesystem via
@@ -175,7 +175,7 @@ else
 fi
 
 # Thesios: the filesystem keeps its size and the rest of the (sparse) image is
-# the extent space thesios_bench.py lays trace files out in. Done before
+# the space thesios_bench.py lays trace files out in. Done before
 # mounting so a reused image gets (re)sized too; growing a file under an ext4
 # filesystem is harmless, and the guest sees the larger /dev/vda.
 THESIOS_FS_BYTES=0

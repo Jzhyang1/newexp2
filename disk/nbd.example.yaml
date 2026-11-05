@@ -65,4 +65,4 @@ prefetch_log: ./logs/nbd_prefetch.csv
 # (written by the guest over 9p, if modified since the server started) fills
 # the workload / workload_runtime_seconds columns of `log`. Missing files ->
 # those columns are left empty.
-vm_log_dir: /tmp/kvm-launch
+vm_log_dir: ./kvm

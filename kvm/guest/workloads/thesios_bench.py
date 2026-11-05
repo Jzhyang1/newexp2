@@ -2,19 +2,19 @@
 
 The image builder bakes the condensed trace and its metadata under
 /opt/workload/thesios_config.json. Thesios offsets are relative to a file, so
-each file is given its own extent of the (sparse) device the first time the
-trace touches it: a random, granule-aligned spot past `region_start_bytes`
-(the guest's filesystem) that no other file has been given. Extent sizes come
-from a first pass over the trace (the furthest byte each file is read to); the
-random choices are seeded, so a given trace always lays out the same way.
+each file is placed at a granule-aligned spot past `region_start_bytes` (the
+guest's filesystem) given by a stable hash of (seed, filename), so no per-file
+state is kept. Distinct files may overlap and share cache; in expectation the hit
+rate is close to a real disk's. Reads that would run off the device end are
+folded back into the usable region.
 Trace writes are skipped because the running guest's writes are intentionally
 discarded by nbd_server.
 """
 import csv
+import hashlib
 import json
 import mmap
 import os
-import random
 import time
 
 with open("/opt/workload/thesios_config.json") as f:
@@ -43,14 +43,22 @@ def trace_rows():
     """
     valid = 0
     with open(trace_path, newline="") as trace:
-        for row in csv.DictReader(trace):
+        rows = csv.reader(trace)
+        header = next(rows, [])
+        try:
+            name_col = header.index("filename")
+            offset_col = header.index("offset")
+            size_col = header.index("length")
+        except ValueError:
+            raise RuntimeError(f"{trace_path} needs filename, offset, length columns")
+        for row in rows:
             if max_requests and valid >= max_requests:
                 return
             try:
-                name = row["filename"]
-                offset = int(row["offset"])
-                size = int(row["length"])
-            except (KeyError, TypeError, ValueError):
+                name = row[name_col]
+                offset = int(row[offset_col])
+                size = int(row[size_col])
+            except (IndexError, ValueError):
                 yield None
                 continue
             if not name or offset < 0 or size <= 0:
@@ -61,45 +69,36 @@ def trace_rows():
 
 
 class Layout:
-    """Hands each file a random free extent of granules, once, on first visit."""
+    """Maps (file, offset) to a device offset with a stable hash; no per-file state.
 
-    MAX_TRIES = 1000
+    Each file's base is a granule-aligned spot in the usable region derived from
+    hash(seed, name). Files may overlap (and so share cache) and an extent may run
+    past the device end, in which case the read is folded back into the region.
+    """
 
-    def __init__(self, device_size, extents):
-        self.extents = extents
+    def __init__(self, device_size):
         self.first = -(-region_start // granule)  # first usable granule
         self.count = device_size // granule - self.first
-        self.rng = random.Random(seed)
-        self.bases = {}  # file -> byte offset of its extent
-        self.provisioned = set()  # every granule index handed out so far
+        if self.count <= 0:
+            raise RuntimeError("device has no space past region_start_bytes")
+        self.span = self.count * granule  # usable bytes
+        self.base_cache = None  # (name, base): trace rows come in file runs
 
     def base(self, name):
-        if name not in self.bases:
-            self.bases[name] = self._place(name)
-        return self.bases[name]
+        if self.base_cache is None or self.base_cache[0] != name:
+            digest = hashlib.blake2b(f"{seed}:{name}".encode(), digest_size=8).digest()
+            granule_index = int.from_bytes(digest, "little") % self.count
+            self.base_cache = (name, granule_index * granule)
+        return self.base_cache[1]
 
-    def _place(self, name):
-        need = -(-self.extents[name] // granule)
-        if need > self.count:
-            raise RuntimeError(f"{name} needs {need} granules; device has {self.count}")
-        for _ in range(self.MAX_TRIES):
-            start = self.rng.randrange(self.count - need + 1)
-            granules = range(start, start + need)
-            if self.provisioned.isdisjoint(granules):
-                self.provisioned.update(granules)
-                return (self.first + start) * granule
-        raise RuntimeError(
-            f"no free {need}-granule extent for {name} after {self.MAX_TRIES} tries "
-            f"({len(self.provisioned)}/{self.count} granules provisioned); "
-            "use a larger device"
-        )
+    def locate(self, name, file_offset, size):
+        if size > self.span:
+            raise RuntimeError(f"read of {size} bytes exceeds usable {self.span} bytes")
+        rel = (self.base(name) + file_offset) % self.span
+        if rel + size > self.span:
+            rel %= self.span - size + 1
+        return self.first * granule + rel
 
-
-extents = {}
-for item in trace_rows():
-    if item is not None:
-        name, offset, size = item
-        extents[name] = max(extents.get(name, 0), offset + size)
 
 read_count = 0
 skipped_count = 0
@@ -109,9 +108,9 @@ open_flags = os.O_RDONLY | (getattr(os, "O_DIRECT", 0) if direct_io else 0)
 if direct_io and not getattr(os, "O_DIRECT", 0):
     raise RuntimeError("THESIOS_DIRECT_IO requires Linux O_DIRECT support")
 device_fd = os.open(device_path, open_flags)
-layout = Layout(os.lseek(device_fd, 0, os.SEEK_END), extents)
+layout = Layout(os.lseek(device_fd, 0, os.SEEK_END))
 print(
-    f"THESIOS_BENCH layout: {len(extents)} files, region from {region_start} bytes, "
+    f"THESIOS_BENCH layout: hashed layout: region from {region_start} bytes, "
     f"{layout.count} granules of {granule} bytes, seed {seed}",
     flush=True,
 )
@@ -123,7 +122,7 @@ try:
             skipped_count += 1
             continue
         name, file_offset, size = item
-        offset = layout.base(name) + file_offset
+        offset = layout.locate(name, file_offset, size)
         if direct_io:
             sector_size = 512
             aligned_offset = offset // sector_size * sector_size

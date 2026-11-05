@@ -48,6 +48,21 @@ history is too short, or `next_n` is zero. `put` acknowledges with `[]` and
 `--type` is accepted for launcher compatibility and has no effect;
 `--predict-deltas` is rejected because classes are absolute pages.
 
+`offline.tsc_beam` classifies over a 1024 TiB (2**50 B) address space with 1024
+buckets at every granularity: 1 TiB, 1 GiB, 1 MiB, 1 KiB (`--levels 5` adds
+1 B). A history encoder (per-level bucket embeddings, two convolutions, LSTM)
+runs once per request, then a GRU walks down the levels emitting 1024 class
+probabilities per level, conditioned on the buckets chosen above. Training is
+teacher-forced, so one pass scores every level (loss is -log P(leaf path)).
+Prediction is a beam search (`--beam`, widened to `next_n` when larger) that
+is batched over requests and beams: each level is one GRU step plus one matmul,
+so evaluation cost is `levels` batched steps, not `beam * levels` per request.
+Training and held-out testing report cross-entropy, beam recall of the true
+leaf bucket, and top-1 RMSE in bytes. `get` returns up to `next_n` leaf
+buckets as `(offset, leaf_size)` ranges, most probable first. Run it with
+`python -m offline.tsc_beam --training logs/oracle.csv --min-len 8 --dry-run`.
+No training cache is kept.
+
 `ts_*` folders are timeseries regression models -- they take in the last n offset,span pairs and predict the next offset,span pairs. The interface for these are: 
 boot parameters: 
     - `--type`: `predict_mean`, `predict_min`, or `predict_max`

@@ -142,9 +142,9 @@ GUEST_GUPS_SEED ?= 20261007
 # Bakes the public Thesios CSV shards into the image and replays their READ
 # requests against the guest's raw root block device. Thesios offsets are
 # relative to the source file, so the image is grown to a sparse
-# GUEST_THESIOS_DISK_SIZE and thesios_bench.py gives each file a random,
-# non-overlapping extent past the filesystem on first visit (GUEST_THESIOS_SEED
-# makes the layout repeatable). Keep the size under the host filesystem's max
+# GUEST_THESIOS_DISK_SIZE and thesios_bench.py places each file at a
+# stable hash of (GUEST_THESIOS_SEED, filename) past the filesystem, keeping no
+# per-file state (files may overlap). Keep the size under the host filesystem's max
 # file size (16T on ext4); one day's reads span ~2T of files.
 GUEST_THESIOS ?= 0
 GUEST_THESIOS_TRACE_NUM ?= 99
@@ -153,7 +153,7 @@ GUEST_THESIOS_TRACE_SEQ_NUM := $(shell seq -f "%05g" 0 $(GUEST_THESIOS_TRACE_NUM
 GUEST_THESIOS_TRACE_NAMES := $(addsuffix -of-00100,$(addprefix data-,$(GUEST_THESIOS_TRACE_SEQ_NUM)))
 GUEST_THESIOS_TRACE_SEQ_URL := $(addprefix $(GUEST_THESIOS_BASE_URL)/,$(GUEST_THESIOS_TRACE_NAMES))
 GUEST_THESIOS_TRACE_URLS := $(subst $(SPACE),$(COMMA),$(GUEST_THESIOS_TRACE_SEQ_URL))
-GUEST_THESIOS_MAX_REQUESTS ?= 0
+GUEST_THESIOS_MAX_REQUESTS ?= 200000
 GUEST_THESIOS_DISK_SIZE ?= 8T
 GUEST_THESIOS_SEED ?= 20261007
 GUEST_THESIOS_DEVICE ?= /dev/vda
