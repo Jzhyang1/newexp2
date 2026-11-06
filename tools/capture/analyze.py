@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Join + analyse a traced capture and draw the figures.
 
-  ./bin/python tools/capture/analyze.py --run logs/capture/base --sweep-prefix sw_ --out offline/capture_results
+  ./bin/python tools/capture/analyze.py --run logs/capture/base --sweep-prefix sw_ --out ./capture_results
 
 Outputs (PNG + numbers.json) under --out.  Needs numpy/pandas/matplotlib (the repo venv has them).
 """
@@ -544,7 +544,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="logs/capture/base")
     ap.add_argument("--sweep-prefix", default="sw_")
-    ap.add_argument("--out", default="offline/capture_results")
+    ap.add_argument("--out", default="capture_results")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
