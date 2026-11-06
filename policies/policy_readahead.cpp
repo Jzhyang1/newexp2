@@ -7,7 +7,8 @@
 
 namespace policy {
 
-ReadaheadPolicy::ReadaheadPolicy(Cache& cache) : CachePolicy(cache) {}
+ReadaheadPolicy::ReadaheadPolicy(Cache& cache, std::uint64_t pages)
+    : CachePolicy(cache), pages_(pages > MAX_PREFETCH_PAGES ? MAX_PREFETCH_PAGES : pages) {}
 
 void ReadaheadPolicy::on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch) {
     (void)context;
@@ -19,9 +20,9 @@ void ReadaheadPolicy::on_prefetch_request(std::uint64_t context, std::uint64_t b
                                           std::uint64_t block_length, PrefetchRequest& request) {
     (void)context;
     // Suggest the next MAX_PREFETCH_PAGES pages after the requested range.
+    if (pages_ == 0) return;
     request.fetch_count = 1;
-    request.fetch_ranges[0] =
-        FetchRange{block_offset + block_length, MAX_PREFETCH_PAGES};
+    request.fetch_ranges[0] = FetchRange{block_offset + block_length, pages_};
 };
 
 }  // namespace policy

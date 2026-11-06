@@ -96,3 +96,5 @@ median I/O wait is 169 µs.
 * Page-hit rates at different page sizes are not comparable as "hit rate per byte"; compare reads fully cached and
   the admitted bytes together.
 * The `model-prefetcher` path still assumes 512 B blocks (`offline/serve.py`).
+
+**Follow-up:** local disk as extended page cache vs. prefetching cache: see [localdisk.md](localdisk.md).

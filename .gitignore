@@ -16,7 +16,9 @@ kvm/*.yaml
 !kvm/vms.example.yaml
 !kvm/vms.yaml
 
+capture_results/
 logs/
+*.csv
 *.log
 *.png
 *.pt

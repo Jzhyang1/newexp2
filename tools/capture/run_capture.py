@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--name", default="run")
     ap.add_argument("--out-root", default=os.path.join(ROOT, "logs/capture"))
     ap.add_argument("--root-img", default=os.path.join(ROOT, "disk/data/nbd_disk.img"))
-    ap.add_argument("--data-img", default=os.path.join(ROOT, "disk/data/faiss_data.img"))
+    ap.add_argument("--data-img", default="", help="default: disk/data/<workload>_data.img")
     ap.add_argument("--queries", default=os.path.join(ROOT, "disk/data/faiss_queries.npy"))
     ap.add_argument("--kernel", default=os.path.join(ROOT, "disk/data/vmlinuz"))
     ap.add_argument("--initrd", default=os.path.join(ROOT, "disk/data/initrd.img"))
@@ -45,6 +45,10 @@ def main():
     ap.add_argument("--data-port", type=int, default=10810)
     ap.add_argument("--mem", default="1G")
     ap.add_argument("--vcpus", type=int, default=2)
+    ap.add_argument("--workload", default="faiss", choices=["faiss", "ycsb"])
+    ap.add_argument("--ycsb-ops", type=int, default=200000, help="YCSB: operations of the transaction phase (a prefix of the full run)")
+    ap.add_argument("--ycsb-workload", default="workloadc")
+    ap.add_argument("--ycsb-distribution", default="zipfian")
     ap.add_argument("--n-queries", type=int, default=3000)
     ap.add_argument("--nprobe", type=int, default=8)
     ap.add_argument("--k", type=int, default=10)
@@ -54,12 +58,20 @@ def main():
     ap.add_argument("--prefetch", default="none")
     ap.add_argument("--evict", default="lru")
     ap.add_argument("--oracle-file", default="", help="access.csv of an earlier run, for prefetch=oracle")
+    ap.add_argument("--readahead-pages", type=int, default=512, help="window of prefetch=readahead, in cache pages")
+    ap.add_argument("--prefetch-budget-pages", type=int, default=0, help="cap on new pages prefetched per request, any policy (0 = unlimited)")
+    ap.add_argument("--latency-mode", default="simulated", choices=["simulated", "physical"],
+                    help="physical = nbd_server sleeps --miss-ns per request with a miss, so guest timings feel it")
+    ap.add_argument("--hit-ns", type=int, default=30000)
+    ap.add_argument("--miss-ns", type=int, default=300000)
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--buffer-kb", type=int, default=2048, help="ftrace ring buffer per cpu per instance (guest RAM it steals!)")
     ap.add_argument("--probe-debug", action="store_true")
     ap.add_argument("--no-trace", action="store_true", help="skip the guest tracer (host-only features)")
     args = ap.parse_args()
 
+    if not args.data_img:
+        args.data_img = os.path.join(ROOT, "disk/data/%s_data.img" % args.workload)
     run = os.path.join(args.out_root, args.name)
     shutil.rmtree(run, ignore_errors=True)
     tools = os.path.join(run, "tools")
@@ -69,12 +81,16 @@ def main():
     for fn in os.listdir(os.path.join(ROOT, "kvm/guest/trace")):
         if fn.endswith((".py", ".sh")):
             shutil.copy(os.path.join(ROOT, "kvm/guest/trace", fn), tools)
-    shutil.copy(args.queries, os.path.join(tools, "queries.npy"))
+    if args.workload == "faiss":
+        shutil.copy(args.queries, os.path.join(tools, "queries.npy"))
     meta = json.load(open(args.data_img + ".meta.json"))
     run_cfg = dict(n_queries=args.n_queries, nprobe=args.nprobe, k=args.k, think_us=args.think_us, probe_debug=args.probe_debug, trace=not args.no_trace,
                    sync_tail_offset=meta["tail_offset"], sync_base=0,
                    marker_instances=["", "instances/blk/", "instances/app/", "instances/stk/"],
-                   buffer_kb=args.buffer_kb)
+                   buffer_kb=args.buffer_kb, workload=args.workload)
+    if args.workload == "ycsb":
+        run_cfg["ycsb"] = dict(workload=args.ycsb_workload, ops=args.ycsb_ops, records=meta["records"], fields=meta["fields"],
+                               field_length=meta["field_length"], distribution=args.ycsb_distribution)
     json.dump(run_cfg, open(os.path.join(tools, "run_config.json"), "w"))
     json.dump(dict(vars(args), meta_file=args.data_img + ".meta.json", mono_start_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC)),
               open(os.path.join(run, "args.json"), "w"), indent=1)
@@ -87,7 +103,8 @@ def main():
               access_log=os.path.join(run, "root_access.csv"), prefetch_log=os.path.join(run, "root_prefetch.csv"),
               vm_log_dir=run)
     write_cfg(cfg_data, source="local", file=args.data_img, ports=f"[{args.data_port}]", capacity=args.capacity,
-              page_size=args.page_size, hit_latency_ns=30000, miss_latency_ns=300000, latency_mode="simulated",
+              page_size=args.page_size, hit_latency_ns=args.hit_ns, miss_latency_ns=args.miss_ns, latency_mode=args.latency_mode,
+              readahead_pages=args.readahead_pages, prefetch_budget_pages=args.prefetch_budget_pages,
               evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=(args.oracle_file or os.path.join(run, "access.csv")), log=os.path.join(run, "results.csv"),
               access_log=os.path.join(run, "access.csv"), prefetch_log=os.path.join(run, "prefetch.csv"),
               feature_log=os.path.join(run, "features.csv"), cache_log=os.path.join(run, "cache.csv"),

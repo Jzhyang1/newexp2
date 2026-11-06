@@ -101,6 +101,35 @@ public:
 
     bool track_meta() const { return feature_log || cache_log; }
 
+    // Max number of *new* pages (pages not already resident) any one request may
+    // prefetch, whatever the policy asks for; 0 = unlimited. Applied here, after
+    // the policy has answered, so every policy is held to the same backend
+    // traffic per request and comparisons between them are not decided by how
+    // much data each is willing to pull in. Ranges are cut in the order the
+    // policy proposed them.
+    uint64_t prefetch_budget_pages{0};
+
+    // Caller holds mu, after the demand pages have been admitted.
+    void apply_prefetch_budget(policy::PrefetchRequest& req) {
+        if (prefetch_budget_pages == 0) return;
+        uint64_t left = prefetch_budget_pages;
+        uint64_t keep = 0;
+        for (uint64_t i = 0; i < req.fetch_count && left > 0; ++i) {
+            policy::FetchRange r = req.fetch_ranges[i];
+            uint64_t len = 0;
+            for (; len < r.block_length; ++len) {
+                if (!cache.present(r.block_offset + len)) {
+                    if (left == 0) break;
+                    --left;
+                }
+            }
+            if (len == 0) continue;
+            r.block_length = len;
+            req.fetch_ranges[keep++] = r;
+        }
+        req.fetch_count = keep;
+    }
+
     // Writes only change data, never cache residency: the cache tracks page
     // presence, not contents, and reads re-patch from the overlay every time.
     uint32_t write(uint64_t offset, const void* buf, uint64_t length) override {
@@ -256,6 +285,7 @@ public:
         {
             // admit the prefetched pages last
             std::lock_guard _{mu};
+            apply_prefetch_budget(prefetch_req);
             for (uint64_t i = 0; i < prefetch_req.fetch_count; ++i) {
                 if (prefetch_log) {
                     const auto& r = prefetch_req.fetch_ranges[i];

@@ -459,6 +459,8 @@ struct Config {
   std::string evict_policy = "none";      // none | fifo | lifo | lru | lru_cxt_aware | mru
   std::string prefetch_policy = "none";   // none | readahead | oracle | cminer | quickmine | mithril | readahead_cxt_aware
   std::string oracle_file = "./logs/oracle.csv";
+  uint64_t prefetch_budget_pages = 0;     // max new pages one request may prefetch, for every policy (0 = unlimited)
+  uint64_t readahead_pages = 512;         // readahead prefetch window, in cache pages (<= MAX_PREFETCH_PAGES)
   std::string prefetcher_path;
   std::string prefetcher_type = "predict_mean";
   std::size_t prefetcher_min_len = 1;
@@ -564,6 +566,10 @@ Config LoadConfig(const std::string& path) {
       cfg.prefetch_policy = value;
     } else if (key == "oracle_file") {
       cfg.oracle_file = value;
+    } else if (key == "prefetch_budget_pages") {
+      cfg.prefetch_budget_pages = std::stoull(value);
+    } else if (key == "readahead_pages") {
+      cfg.readahead_pages = std::stoull(value);
     } else if (key == "prefetcher_path") {
       cfg.prefetcher_path = value;
     } else if (key == "prefetcher_type") {
@@ -610,7 +616,7 @@ policy::CachePolicy* MakeEvictPolicy(const std::string& name, policy::Cache& cac
 
 policy::CachePolicy* MakePrefetchPolicy(const Config& cfg, policy::Cache& cache) {
   const std::string& name = cfg.prefetch_policy;
-  if (name == "readahead") return new policy::ReadaheadPolicy(cache);
+  if (name == "readahead") return new policy::ReadaheadPolicy(cache, cfg.readahead_pages);
   if (name == "oracle") return new policy::OraclePolicy(cache, cfg.oracle_file);
   if (name == "model" || name == "model-prefetcher") return new policy::ModelPolicy(
       cache, cfg.prefetcher_path, cfg.prefetcher_type,
@@ -937,9 +943,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  nbd::BlockReadClass* reader = new nbd::SimReadClass(
+  auto* sim = new nbd::SimReadClass(
       f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log,
       feature_log, cache_log, overlay);
+  sim->prefetch_budget_pages = cfg.prefetch_budget_pages;
+  nbd::BlockReadClass* reader = sim;
 
   signal(SIGPIPE, SIG_IGN);
 

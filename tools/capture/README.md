@@ -9,6 +9,7 @@ build_faiss_disk.py   host: build the FAISS IVF index + ext4 data image (disk/da
 run_capture.py        host: 2x nbd_server (root disk, data disk) + QEMU + guest tracer  -> logs/capture/<name>/
 replay.py             host: replay a captured request stream into nbd_server (no VM), for policy/geometry sweeps
 sweep.py              host: grid of replays (policy x page size x cache size)
+localdisk_study.py    host: local-disk-as-page-cache vs prefetch study (live RAM arms + replay cache arms); localdisk_analyze.py / localdisk_late.py summarise -> capture_results/localdisk.md
 analyze.py            host: join + figures + numbers.json  -> capture_results/
 capture_lib.py        parsers, clock sync, extent-map layout, the per-request join
 ../../kvm/guest/trace/  guest side: bootstrap.sh (PID 1), guest_main.py (tracefs tracer + workload driver), faiss_ondisk.py

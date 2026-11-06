@@ -165,10 +165,13 @@ public:
 
 class ReadaheadPolicy : public CachePolicy {
 public:
-    ReadaheadPolicy(Cache& cache);
+    // `pages`: how many pages after each request to prefetch (<= MAX_PREFETCH_PAGES)
+    explicit ReadaheadPolicy(Cache& cache, std::uint64_t pages = MAX_PREFETCH_PAGES);
     void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch);
     void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
                              std::uint64_t block_length, PrefetchRequest& request);
+private:
+    std::uint64_t pages_;
 };
 
 // Groups reads into per-context "streams" the way a hardware stride/stream

@@ -149,7 +149,10 @@ def load_markers(run):
         m = re.match(r"APP q_end i=(\d+) dt_us=(\d+)", rest)
         if m and int(m.group(1)) in q:
             q[int(m.group(1))].update(t1=ts, dt_us=int(m.group(2)))
-    return pd.DataFrame([v for v in q.values() if "t1" in v]).sort_values("t0").reset_index(drop=True)
+    rows = [v for v in q.values() if "t1" in v]
+    if not rows:  # workloads without per-query markers (e.g. YCSB)
+        return pd.DataFrame(columns=["i", "t0", "t1", "lists", "dt_us"])
+    return pd.DataFrame(rows).sort_values("t0").reset_index(drop=True)
 
 
 def load_host(run):
@@ -266,6 +269,25 @@ class Layout:
         return res
 
 
+class FileLayout:
+    """disk byte offset -> (file, file offset) for a data disk that holds plain files (no FAISS list structure)."""
+    def __init__(self, img, names):
+        tab = []
+        for name in names:
+            for la, lb, pa, pb in extents(img, "/" + name):
+                tab.append((pa * 4096, (pb + 1) * 4096, name, la * 4096))
+        tab.sort()
+        self.tab = tab
+        self.tab_start = np.array([t[0] for t in tab])
+
+    def locate(self, disk_off):
+        i = np.searchsorted(self.tab_start, disk_off, side="right") - 1
+        if i < 0:
+            return None
+        s, e, name, fs = self.tab[i]
+        return (name, fs + (disk_off - s)) if disk_off < e else None
+
+
 # --- the join -------------------------------------------------------------------
 def join(run, verbose=True):
     args = json.load(open(os.path.join(run, "args.json")))
@@ -278,7 +300,8 @@ def join(run, verbose=True):
     tail = meta["tail_offset"]
     reads["is_probe"] = reads.offset >= tail
     reads["g_arrive"] = reads.arrive_ns - off_at(reads.arrive_ns.values - 0)  # guest-clock time of arrival
-    layout = Layout(args["data_img"], meta)
+    faiss_like = "list_offset_size_codesize" in meta
+    layout = Layout(args["data_img"], meta) if faiss_like else FileLayout(args["data_img"], ["ycsb.db"])
 
     # ---- match to guest block requests (same start sector + length, nearest preceding issue) ----
     iss = blk["issue"][(blk["issue"].dmaj == 254) & (blk["issue"].dmin == 16)].reset_index(drop=True)
@@ -329,7 +352,7 @@ def join(run, verbose=True):
     locs = [layout.locate(int(o)) for o in reads.offset.values]
     reads["file"] = [l[0] if l else ("raw-tail" if o >= meta["fs_bytes"] else "fs-metadata") for l, o in zip(locs, reads.offset.values)]
     reads["file_off"] = [l[1] if l else -1 for l in locs]
-    reads["list_id"] = [layout.list_of_file_off(f) if fn == "index.ivfdata" else -1 for f, fn in zip(reads.file_off.values, reads.file.values)]
+    reads["list_id"] = [layout.list_of_file_off(f) if (faiss_like and fn == "index.ivfdata") else -1 for f, fn in zip(reads.file_off.values, reads.file.values)]
 
     # ---- application context: which query / list slot the request belongs to ----
     q = load_markers(run)

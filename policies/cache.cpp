@@ -28,6 +28,7 @@ bool Cache::evict(std::uint64_t page) {
 std::pair<bool, std::uint64_t> Cache::insert(std::uint64_t page) {
 	// returns false if eviction happened
 	if (pages_.find(page) != pages_.end()) return {true, 0}; // already present
+	if (capacity == 0) return {true, 0};  // zero-size cache: nothing is ever resident
 
 	if (pages_.size() < capacity) {
 		pages_.insert(page);

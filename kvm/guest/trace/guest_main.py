@@ -158,6 +158,24 @@ def sync_probes(tag, n=8):
     return res
 
 
+def launch_workload(env=None):
+    """Start the workload with its stdin as a start barrier (it must not do I/O before its pid is in the
+    tracing filters); returns the Popen. Whatever it is exec's in place, so proc.pid is the traced pid."""
+    if cfg.get("workload", "faiss") == "ycsb":
+        y = cfg["ycsb"]
+        cp = ":".join(["/opt/ycsb/jdbc-binding/conf", "/opt/ycsb/conf", "/opt/ycsb/lib/*", "/opt/ycsb/jdbc-binding/lib/*"])
+        cmd = ["java", "-Xmx256m", "-Djava.io.tmpdir=/tmp", "-cp", cp, "site.ycsb.Client", "-t",
+               "-db", "site.ycsb.db.JdbcDBClient", "-P", "/opt/ycsb/workloads/" + y["workload"],
+               "-p", "db.driver=org.sqlite.JDBC", "-p", "db.url=jdbc:sqlite:/tmp/data/ycsb.db?open_mode=1",
+               "-p", f"recordcount={y['records']}", "-p", f"operationcount={y['ops']}",
+               "-p", f"fieldcount={y['fields']}", "-p", f"fieldlength={y['field_length']}",
+               "-p", f"requestdistribution={y['distribution']}", "-threads", "1", "-s"]
+        # `read` blocks until the barrier byte; exec keeps the pid
+        return subprocess.Popen(["/bin/sh", "-c", 'read x; cd /opt/ycsb; exec "$@"', "sh"] + cmd,
+                                stdin=subprocess.PIPE, env=env, stdout=open(f"{OUT}/workload.out", "w"), stderr=subprocess.STDOUT)
+    return subprocess.Popen(["python3", "/tmp/tools/faiss_ondisk.py"], stdin=subprocess.PIPE, env=env)
+
+
 def main():
     info = {"cmdline": open("/proc/cmdline").read(), "uname": os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname())}
     info["ra_kb"] = {d: open(f"/sys/block/{d}/queue/read_ahead_kb").read().strip() for d in os.listdir("/sys/block") if d.startswith("vd")}
@@ -191,8 +209,8 @@ def main():
     if not cfg.get("trace", True):
         # host-only run (policy sweeps): no tracefs at all, just sync probes + workload
         probes = sync_probes("pre")
-        proc = subprocess.Popen(["python3", "/tmp/tools/faiss_ondisk.py"], stdin=subprocess.PIPE)
-        proc.stdin.write(b"g")
+        proc = launch_workload()
+        proc.stdin.write(b"g\n")
         proc.stdin.flush()
         rc = proc.wait()
         probes += sync_probes("post")
@@ -259,10 +277,10 @@ def main():
     # ---- sync probes, workload, sync probes ------------------------------
     probes = sync_probes("pre")
     env = dict(os.environ, PYTHONUNBUFFERED="1")
-    proc = subprocess.Popen(["python3", "/tmp/tools/faiss_ondisk.py"], stdin=subprocess.PIPE, env=env)
+    proc = launch_workload(env)
     for d in (app, stk):
         w(f"{d}set_event_pid", str(proc.pid))
-    proc.stdin.write(b"g")
+    proc.stdin.write(b"g\n")
     proc.stdin.flush()
     t_start = mono_ns()
     rc = proc.wait()

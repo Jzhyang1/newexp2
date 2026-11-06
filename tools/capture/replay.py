@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--evict", default="lru")
     ap.add_argument("--page-size", type=int, default=65536)
     ap.add_argument("--capacity", type=int, default=4096)
+    ap.add_argument("--readahead-pages", type=int, default=512)
+    ap.add_argument("--prefetch-budget-pages", type=int, default=0, help="cap on new pages prefetched per request, any policy (0 = unlimited)")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -66,7 +68,7 @@ def main():
     with open(cfg, "w") as c:
         for k, v in dict(source="local", file=args.data_img, ports=f"[{args.port}]", capacity=args.capacity,
                          page_size=args.page_size, hit_latency_ns=30000, miss_latency_ns=300000, latency_mode="simulated",
-                         evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=oracle,
+                         readahead_pages=args.readahead_pages, prefetch_budget_pages=args.prefetch_budget_pages, evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=oracle,
                          log=os.path.join(run, "results.csv"), access_log=os.path.join(run, "access.csv"),
                          prefetch_log=os.path.join(run, "prefetch.csv"), feature_log=os.path.join(run, "features.csv"),
                          cache_log=os.path.join(run, "cache.csv"), vm_log_dir=run).items():
