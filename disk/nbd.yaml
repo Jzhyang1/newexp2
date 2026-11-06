@@ -3,9 +3,11 @@ source: local
 file: disk/data/nbd_disk.img
 ports: [10809]
 
-# 2M of simulated disk cache -- online sources say up to 100GB is fair for disk cache,
-# but we don't have that many processes and they don't run for long so we can be smaller
-capacity: 8192
+# Cache geometry: `capacity` pages of `page_size` bytes each. Pages are 64 KiB (was one
+# 512 B sector) so per-page policy state stays tractable on multi-TB disks, and
+# 4096 pages = 256 MiB of simulated disk cache (was 8192 sectors = 4 MiB).
+page_size: 65536
+capacity: 4096
 hit_latency_ns: 30000
 miss_latency_ns: 300000
 warmup: 0
@@ -24,3 +26,7 @@ log: ./logs/nbd_results.csv
 access_log: ./logs/nbd_access.csv
 vm_log_dir: ./kvm
 prefetch_log: ./logs/nbd_prefetch.csv
+
+# Optional signal logs (see offline/SIGNALS.md, tools/capture/): per-request host features and per-cache-event residency.
+# feature_log: ./logs/nbd_features.csv
+# cache_log: ./logs/nbd_cache.csv

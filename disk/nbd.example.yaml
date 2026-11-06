@@ -16,7 +16,9 @@ source: local              # only "local" (a real backing file) is implemented
 file: ./data.bin            # exported device size == this file's size
 ports: [10809, 10810, 10811]
 
-capacity: 4096              # cache capacity, in SECTOR_SIZE (512B) pages
+page_size: 65536            # cache/policy page size in bytes (power of two, >= 512); capacity, prefetch ranges and the
+                            # hit counts in the logs are all in these units
+capacity: 4096              # cache capacity, in pages of page_size bytes (4096 x 64 KiB = 256 MiB)
 hit_latency_ns: 30000
 miss_latency_ns: 300000
 # simulated: the simulator accumulates latency in its stats (default).
@@ -66,3 +68,9 @@ prefetch_log: ./logs/nbd_prefetch.csv
 # the workload / workload_runtime_seconds columns of `log`. Missing files ->
 # those columns are left empty.
 vm_log_dir: ./kvm
+
+# Per-request host-side feature log (offset, length, cmd type/flags, arrival/start/end ns on CLOCK_MONOTONIC, pread +
+# policy time, think time, queue depth, page hits, prefetch-hit and issued counts). Empty/absent disables.
+# feature_log: ./logs/nbd_features.csv
+# Per-cache-event log: ts_ns,req,admit|evict,page,prefetched,resident_ns,hits,used. Empty/absent disables.
+# cache_log: ./logs/nbd_cache.csv

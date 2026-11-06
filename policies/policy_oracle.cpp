@@ -54,7 +54,9 @@ OraclePolicy::OraclePolicy(Cache& cache, const std::string& path) : CachePolicy(
             throw std::runtime_error("oracle trace row is not a valid sector-aligned request in " +
                                      path + " at line " + std::to_string(line_number + 1));
         }
-        requests_[worker_id].push_back(Request{byte_offset / 512, byte_length / 512});
+        const std::uint64_t first = byte_offset / cache.page_size;
+        const std::uint64_t last = (byte_offset + byte_length - 1) / cache.page_size;
+        requests_[worker_id].push_back(Request{first, last - first + 1});
     }
 }
 

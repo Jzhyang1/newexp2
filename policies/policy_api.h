@@ -76,7 +76,8 @@ public:
 class Cache {
     // Thread unsafe cache
 public:
-    Cache(std::size_t capacity, std::uint64_t hit_latency_ns = 0, std::uint64_t miss_latency_ns = 0);
+    Cache(std::size_t capacity, std::uint64_t hit_latency_ns = 0, std::uint64_t miss_latency_ns = 0,
+          std::uint64_t page_size = 512);
 
     // We track if a page is in the cache
     bool present(std::uint64_t page) const;
@@ -90,6 +91,9 @@ public:
 
     // some data tracking
     const std::size_t capacity;
+    // Bytes per page: every page number / block_offset / block_length in the
+    // policy API is in these units (512 = one sector, the historical default).
+    const std::uint64_t page_size;
     std::size_t size();
 
     // timing info

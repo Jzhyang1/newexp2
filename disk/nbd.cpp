@@ -30,11 +30,13 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -255,6 +257,8 @@ bool SendReply(int fd, uint32_t error, uint64_t handle) {
 // a read request containing at least one cache miss is delayed by that flat
 // amount of real time before its data is sent, so the guest's measured run
 // time reflects cache performance. (Flat per request, not per missed sector.)
+static std::atomic<uint32_t> g_inflight{0};
+
 void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
                        uint64_t physical_miss_ns) {
   static thread_local std::vector<uint8_t> buf(1 << 20, 0);
@@ -275,10 +279,20 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
       return;
     }
 
+    const uint64_t arrive_ns = steady_ns();
     uint16_t type = be16toh(req.type);
     uint64_t handle = req.handle;  // opaque; echoed back as-is
     uint64_t offset = be64toh(req.offset);
     uint32_t length = be32toh(req.length);
+    ReqInfo info;
+    info.handle = be64toh(handle);
+    info.type = type;
+    info.flags = be16toh(req.flags);
+    info.arrive_ns = arrive_ns;
+    info.inflight = g_inflight.fetch_add(1);
+    { int q = 0; if (ioctl(fd, FIONREAD, &q) == 0 && q > 0) info.queued_bytes = static_cast<uint32_t>(q); }
+    info.req_length = length;
+    struct InflightGuard { ~InflightGuard() { g_inflight.fetch_sub(1); } } inflight_guard;
 
     switch (type) {
       case kCmdRead: {
@@ -287,7 +301,7 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
         while (remaining > 0) {
           size_t chunk = static_cast<size_t>(std::min<uint64_t>(remaining, buf.size()));
           uint64_t miss_blocks = 0;
-          reader->read(worker_id, offset, chunk, buf.data(), &miss_blocks);
+          reader->read(worker_id, offset, chunk, buf.data(), &miss_blocks, &info);
           if (physical_miss_ns > 0 && miss_blocks > 0) {
             std::this_thread::sleep_for(std::chrono::nanoseconds(physical_miss_ns));
           }
@@ -300,6 +314,7 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
       }
       case kCmdWrite: {
         if (!DiscardFull(fd, length)) return;
+        reader->on_command(worker_id, offset, length, info);
         if (!SendReply(fd, 0, handle)) return;
         break;
       }
@@ -308,6 +323,7 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
       case kCmdFlush:
       case kCmdTrim:
       case kCmdWriteZeroes:
+        reader->on_command(worker_id, offset, length, info);
         if (!SendReply(fd, 0, handle)) return;
         break;
       default:
@@ -399,7 +415,10 @@ struct Config {
   std::string source = "local";       // only "local" (a real backing file) is supported
   std::string file;                   // path to the backing file
   std::vector<uint16_t> ports;        // one export/client identity per port
-  std::size_t capacity = 4096;        // cache capacity, in SECTOR_SIZE-sized pages
+  std::size_t capacity = 4096;        // cache capacity, in pages of `page_size` bytes
+  uint64_t page_size = 4096;          // cache/policy page size in bytes (multiple of 512, power of two).
+                                      // Policies, logs' hit counts and `capacity` are all in these units;
+                                      // a larger page keeps per-page state tractable on multi-TB disks.
   uint64_t hit_latency_ns = 0;
   uint64_t miss_latency_ns = 0;
   std::string latency_mode = "simulated"; // simulated | physical (sleep miss_latency_ns per missing read)
@@ -418,6 +437,8 @@ struct Config {
                                  // event log, for verifying capture correctness; set to "" to disable
   std::string prefetch_log = "./logs/nbd_prefetch.csv";  // per-prefetched-range (worker_id,offset,length,hits,total,req)
                                  // log, same shape as access_log (for heatmap comparison); "" to disable
+  std::string feature_log;       // per-request host-side feature log (see disk/sim.hpp); "" (default) disables
+  std::string cache_log;         // per-cache-event log (admit/evict, with prefetch + reuse info); "" disables
 };
 
 std::string Trim(const std::string& s) {
@@ -473,6 +494,16 @@ Config LoadConfig(const std::string& path) {
       cfg.ports = ParsePortList(value);
     } else if (key == "capacity") {
       cfg.capacity = static_cast<std::size_t>(std::stoull(value));
+    } else if (key == "page_size") {
+      cfg.page_size = std::stoull(value);
+      if (cfg.page_size < SECTOR_SIZE || cfg.page_size % SECTOR_SIZE ||
+          (cfg.page_size & (cfg.page_size - 1))) {
+        throw std::runtime_error("page_size must be a power of two and a multiple of 512");
+      }
+    } else if (key == "feature_log") {
+      cfg.feature_log = value;
+    } else if (key == "cache_log") {
+      cfg.cache_log = value;
     } else if (key == "hit_latency_ns") {
       cfg.hit_latency_ns = std::stoull(value);
     } else if (key == "miss_latency_ns") {
@@ -778,7 +809,7 @@ int main(int argc, char **argv) {
   // The exported device size is exactly the backing file's size.
   uint64_t size = static_cast<uint64_t>(st.st_size);
 
-  static policy::Cache cache(cfg.capacity, cfg.hit_latency_ns, cfg.miss_latency_ns);
+  static policy::Cache cache(cfg.capacity, cfg.hit_latency_ns, cfg.miss_latency_ns, cfg.page_size);
   policy::CachePolicy* evict_policy = nbd::MakeEvictPolicy(cfg.evict_policy, cache);
   policy::CachePolicy* prefetch_policy = nbd::MakePrefetchPolicy(cfg, cache);
 
@@ -812,8 +843,20 @@ int main(int argc, char **argv) {
     std::fflush(prefetch_log);
   }
 
+  auto open_log = [](const std::string& path) -> FILE* {
+    if (path.empty()) return nullptr;
+    std::filesystem::path p(path);
+    if (!p.parent_path().empty()) std::filesystem::create_directories(p.parent_path());
+    FILE* fp = fopen(path.c_str(), "w");
+    if (!fp) { perror(("failed to open log " + path).c_str()); std::exit(1); }
+    return fp;
+  };
+  FILE* feature_log = open_log(cfg.feature_log);
+  FILE* cache_log = open_log(cfg.cache_log);
+
   nbd::BlockReadClass* reader = new nbd::SimReadClass(
-      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log);
+      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log,
+      feature_log, cache_log);
 
   signal(SIGPIPE, SIG_IGN);
 
@@ -869,6 +912,8 @@ int main(int argc, char **argv) {
   delete evict_policy;
   if (access_log) std::fclose(access_log);
   if (prefetch_log) std::fclose(prefetch_log);
+  if (feature_log) std::fclose(feature_log);
+  if (cache_log) std::fclose(cache_log);
   std::fclose(f);
   return 0;
 }

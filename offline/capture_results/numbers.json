@@ -1,0 +1,489 @@
+{
+ "blk_counts": {
+  "issue": 23422,
+  "complete": 23422,
+  "bio": 23422,
+  "merge": 0,
+  "cache_add": 574043,
+  "cache_del": 396912,
+  "ra": 16810,
+  "fault_around": 83701,
+  "marks": 40001
+ },
+ "len_median_kib": 128.0,
+ "len_frac_128k": 0.5270564211834687,
+ "frac_sequential_exact": 0.2151196342167177,
+ "demand_total_gib": 74.94740172475576,
+ "nbd_total_gib": 2.188732147216797,
+ "guest_absorbed_frac": 0.9707964239340156,
+ "corr_probe_vs_nbd_log": 0.15921821918025447,
+ "join_match_rate": 0.9601116872756282,
+ "g2h_us_median": 1272.9885,
+ "n_requests": 22527,
+ "n_visits": 15833,
+ "requests_per_visit": 1.4227878481652245,
+ "frac_visits_in_probe_set_pm1": 0.8145645171477294,
+ "lookahead": [
+  {
+   "K": 0,
+   "cache_state": false,
+   "top1": 0.1335,
+   "top4": 0.2802,
+   "top8": 0.3205
+  },
+  {
+   "K": 0,
+   "cache_state": true,
+   "top1": 0.1011,
+   "top4": 0.1334,
+   "top8": 0.1383
+  },
+  {
+   "K": 1,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 1,
+   "cache_state": true,
+   "top1": 0.1311,
+   "top4": 0.191,
+   "top8": 0.2017
+  },
+  {
+   "K": 2,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 2,
+   "cache_state": true,
+   "top1": 0.1389,
+   "top4": 0.2032,
+   "top8": 0.2154
+  },
+  {
+   "K": 4,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 4,
+   "cache_state": true,
+   "top1": 0.1462,
+   "top4": 0.2151,
+   "top8": 0.2285
+  },
+  {
+   "K": 8,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 8,
+   "cache_state": true,
+   "top1": 0.1526,
+   "top4": 0.2248,
+   "top8": 0.2411
+  },
+  {
+   "K": 16,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 16,
+   "cache_state": true,
+   "top1": 0.1563,
+   "top4": 0.2304,
+   "top8": 0.247
+  },
+  {
+   "K": 32,
+   "cache_state": false,
+   "top1": 0.1412,
+   "top4": 0.3323,
+   "top8": 0.5131
+  },
+  {
+   "K": 32,
+   "cache_state": true,
+   "top1": 0.1597,
+   "top4": 0.2345,
+   "top8": 0.2517
+  }
+ ],
+ "signals": [
+  {
+   "context": "Popularity only (no context)",
+   "tier": "H",
+   "top1": 0.0013,
+   "top4": 0.0049,
+   "top8": 0.0097
+  },
+  {
+   "context": "Last list (Markov-1)",
+   "tier": "H",
+   "top1": 0.0825,
+   "top4": 0.2335,
+   "top8": 0.2681
+  },
+  {
+   "context": "Last 2 lists (Markov-2)",
+   "tier": "H",
+   "top1": 0.1132,
+   "top4": 0.2426,
+   "top8": 0.2683
+  },
+  {
+   "context": "M1 + inter-arrival gap",
+   "tier": "H",
+   "top1": 0.0852,
+   "top4": 0.2379,
+   "top8": 0.269
+  },
+  {
+   "context": "M1 + request length",
+   "tier": "H",
+   "top1": 0.0946,
+   "top4": 0.2409,
+   "top8": 0.2692
+  },
+  {
+   "context": "M1 + cache hit/miss of the request",
+   "tier": "H",
+   "top1": 0.0938,
+   "top4": 0.2379,
+   "top8": 0.2683
+  },
+  {
+   "context": "M1 + guest rq flags + readahead kind",
+   "tier": "G",
+   "top1": 0.0824,
+   "top4": 0.2408,
+   "top8": 0.2689
+  },
+  {
+   "context": "M1 + position in query (app marker)",
+   "tier": "App",
+   "top1": 0.1399,
+   "top4": 0.2518,
+   "top8": 0.2695
+  },
+  {
+   "context": "M2 + position in query (app marker)",
+   "tier": "App",
+   "top1": 0.1174,
+   "top4": 0.2428,
+   "top8": 0.2683
+  },
+  {
+   "context": "Current query's probe list known (oracle) + M2",
+   "tier": "App",
+   "top1": 0.1664,
+   "top4": 0.3809,
+   "top8": 0.4718
+  },
+  {
+   "context": "Frequent lists NOT resident in guest page cache",
+   "tier": "G",
+   "top1": 0.0024,
+   "top4": 0.0068,
+   "top8": 0.0118
+  },
+  {
+   "context": "Upcoming probes (this + 3 queries) NOT resident in guest cache (oracle)",
+   "tier": "App+G",
+   "top1": 0.1432,
+   "top4": 0.2103,
+   "top8": 0.2229
+  }
+ ],
+ "faults_on_ivfdata": 60458,
+ "faults_total": 224386,
+ "fault_pcs_in_libfaiss": 60528,
+ "fault_distinct_pc_64B": 54,
+ "blocked_median_us": 169.0,
+ "sweep": [
+  {
+   "name": "cache1024m_none",
+   "prefetch": "none",
+   "page": 65536,
+   "cache_mib": 1024.0,
+   "req_hit": 0.5076,
+   "page_hit": 0.5953,
+   "backend_gib": 1.4062,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 3.333,
+   "n": 22563,
+   "policy_s": 0.0193
+  },
+  {
+   "name": "cache1024m_quickmine",
+   "prefetch": "quickmine",
+   "page": 65536,
+   "cache_mib": 1024.0,
+   "req_hit": 0.5183,
+   "page_hit": 0.6055,
+   "backend_gib": 1.4594,
+   "pf_admits": 1451,
+   "pf_used": 862,
+   "pf_acc": 0.5941,
+   "miss_s": 3.2604,
+   "n": 22563,
+   "policy_s": 0.0866
+  },
+  {
+   "name": "cache1024m_readahead",
+   "prefetch": "readahead",
+   "page": 65536,
+   "cache_mib": 1024.0,
+   "req_hit": 0.8835,
+   "page_hit": 0.881,
+   "backend_gib": 52.3347,
+   "pf_admits": 850677,
+   "pf_used": 33505,
+   "pf_acc": 0.0394,
+   "miss_s": 0.7887,
+   "n": 22563,
+   "policy_s": 0.2159
+  },
+  {
+   "name": "cache64m_none",
+   "prefetch": "none",
+   "page": 65536,
+   "cache_mib": 64.0,
+   "req_hit": 0.1564,
+   "page_hit": 0.2935,
+   "backend_gib": 2.4548,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 5.7105,
+   "n": 22563,
+   "policy_s": 0.0235
+  },
+  {
+   "name": "cache64m_quickmine",
+   "prefetch": "quickmine",
+   "page": 65536,
+   "cache_mib": 64.0,
+   "req_hit": 0.2748,
+   "page_hit": 0.4004,
+   "backend_gib": 3.0546,
+   "pf_admits": 15913,
+   "pf_used": 6129,
+   "pf_acc": 0.3852,
+   "miss_s": 4.9089,
+   "n": 22563,
+   "policy_s": 0.0936
+  },
+  {
+   "name": "cache64m_readahead",
+   "prefetch": "readahead",
+   "page": 65536,
+   "cache_mib": 64.0,
+   "req_hit": 0.4319,
+   "page_hit": 0.4138,
+   "backend_gib": 380.8215,
+   "pf_admits": 6206009,
+   "pf_used": 14852,
+   "pf_acc": 0.0024,
+   "miss_s": 3.8451,
+   "n": 22563,
+   "policy_s": 1.0864
+  },
+  {
+   "name": "page1024k_none",
+   "prefetch": "none",
+   "page": 1048576,
+   "cache_mib": 256.0,
+   "req_hit": 0.7482,
+   "page_hit": 0.755,
+   "backend_gib": 5.9111,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 1.7043,
+   "n": 22563,
+   "policy_s": 0.0062
+  },
+  {
+   "name": "page1024k_quickmine",
+   "prefetch": "quickmine",
+   "page": 1048576,
+   "cache_mib": 256.0,
+   "req_hit": 0.7733,
+   "page_hit": 0.7796,
+   "backend_gib": 17.1143,
+   "pf_admits": 12080,
+   "pf_used": 1122,
+   "pf_acc": 0.0929,
+   "miss_s": 1.5348,
+   "n": 22563,
+   "policy_s": 0.0383
+  },
+  {
+   "name": "page256k_none",
+   "prefetch": "none",
+   "page": 262144,
+   "cache_mib": 256.0,
+   "req_hit": 0.5524,
+   "page_hit": 0.5952,
+   "backend_gib": 3.0789,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 3.03,
+   "n": 22563,
+   "policy_s": 0.014
+  },
+  {
+   "name": "page256k_quickmine",
+   "prefetch": "quickmine",
+   "page": 262144,
+   "cache_mib": 256.0,
+   "req_hit": 0.6304,
+   "page_hit": 0.6658,
+   "backend_gib": 5.9338,
+   "pf_admits": 13896,
+   "pf_used": 2647,
+   "pf_acc": 0.1905,
+   "miss_s": 2.502,
+   "n": 22563,
+   "policy_s": 0.0566
+  },
+  {
+   "name": "page4k_none",
+   "prefetch": "none",
+   "page": 4096,
+   "cache_mib": 256.0,
+   "req_hit": 0.0051,
+   "page_hit": 0.0034,
+   "backend_gib": 2.1829,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 6.7344,
+   "n": 22563,
+   "policy_s": 0.1845
+  },
+  {
+   "name": "page4k_quickmine",
+   "prefetch": "quickmine",
+   "page": 4096,
+   "cache_mib": 256.0,
+   "req_hit": 0.0083,
+   "page_hit": 0.0089,
+   "backend_gib": 2.1892,
+   "pf_admits": 4808,
+   "pf_used": 3165,
+   "pf_acc": 0.6583,
+   "miss_s": 6.7128,
+   "n": 22563,
+   "policy_s": 0.5442
+  },
+  {
+   "name": "pol_cminer",
+   "prefetch": "cminer",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 0.2891,
+   "page_hit": 0.4211,
+   "backend_gib": 2.8235,
+   "pf_admits": 13307,
+   "pf_used": 6525,
+   "pf_acc": 0.4903,
+   "miss_s": 4.8117,
+   "n": 22563,
+   "policy_s": 0.1108
+  },
+  {
+   "name": "pol_mithril",
+   "prefetch": "mithril",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 0.2891,
+   "page_hit": 0.4211,
+   "backend_gib": 2.8235,
+   "pf_admits": 13307,
+   "pf_used": 6525,
+   "pf_acc": 0.4903,
+   "miss_s": 4.8117,
+   "n": 22563,
+   "policy_s": 0.1103
+  },
+  {
+   "name": "pol_none",
+   "prefetch": "none",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 0.169,
+   "page_hit": 0.3104,
+   "backend_gib": 2.3962,
+   "pf_admits": 0,
+   "pf_used": 0,
+   "pf_acc": 0.0,
+   "miss_s": 5.6247,
+   "n": 22563,
+   "policy_s": 0.033
+  },
+  {
+   "name": "pol_oracle",
+   "prefetch": "oracle",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 1.0,
+   "page_hit": 1.0,
+   "backend_gib": 2.3975,
+   "pf_admits": 39279,
+   "pf_used": 39279,
+   "pf_acc": 1.0,
+   "miss_s": 0.0003,
+   "n": 22563,
+   "policy_s": 0.1795
+  },
+  {
+   "name": "pol_quickmine",
+   "prefetch": "quickmine",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 0.2891,
+   "page_hit": 0.4211,
+   "backend_gib": 2.8235,
+   "pf_admits": 13307,
+   "pf_used": 6525,
+   "pf_acc": 0.4903,
+   "miss_s": 4.8117,
+   "n": 22563,
+   "policy_s": 0.1111
+  },
+  {
+   "name": "pol_readahead",
+   "prefetch": "readahead",
+   "page": 65536,
+   "cache_mib": 256.0,
+   "req_hit": 0.7129,
+   "page_hit": 0.7033,
+   "backend_gib": 131.6859,
+   "pf_admits": 2140651,
+   "pf_used": 23674,
+   "pf_acc": 0.0111,
+   "miss_s": 1.9434,
+   "n": 22563,
+   "policy_s": 0.4963
+  }
+ ]
+}

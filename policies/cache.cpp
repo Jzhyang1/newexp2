@@ -6,8 +6,9 @@
 
 namespace policy {
 
-Cache::Cache(std::size_t capacity, std::uint64_t hit_latency_ns, std::uint64_t miss_latency_ns)
-	: capacity(capacity), hit_latency_ns(hit_latency_ns), miss_latency_ns(miss_latency_ns) {}
+Cache::Cache(std::size_t capacity, std::uint64_t hit_latency_ns, std::uint64_t miss_latency_ns,
+			 std::uint64_t page_size)
+	: capacity(capacity), page_size(page_size), hit_latency_ns(hit_latency_ns), miss_latency_ns(miss_latency_ns) {}
 
 bool Cache::present(std::uint64_t page) const {
 	return pages_.find(page) != pages_.end();

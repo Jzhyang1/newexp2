@@ -50,6 +50,17 @@ class SimReadClass : public BlockReadClass {
     // per range the prefetch policy asked for; `hits` = pages already cached
     // (wasted prefetch), `req` = index of the read request that triggered it.
     FILE* prefetch_log;
+    // Optional per-request host-side feature log (signals #1-12 of
+    // offline/SIGNALS.md): one row per read()/non-read command, timestamps are
+    // CLOCK_MONOTONIC ns (steady_ns()) so they can be joined with guest traces.
+    FILE* feature_log;
+    // Optional per-cache-event log (admit/evict with prefetch provenance and
+    // how often the page was reused while resident).
+    FILE* cache_log;
+    // Residency metadata, only maintained when feature_log/cache_log is on.
+    struct PageMeta { uint64_t admit_ns; uint64_t admit_req; uint32_t hits; bool prefetched; bool used; };
+    std::unordered_map<uint64_t, PageMeta> page_meta;
+    uint64_t cur_req_idx{0};   // request currently being served (cache_log context; protected by mu)
     uint64_t sim_start;
     std::atomic<uint64_t> global_idx;
 
@@ -70,25 +81,45 @@ public:
             policy::CachePolicy* evict_policy,
             policy::CachePolicy* prefetch_policy,
             FILE* access_log = nullptr,
-            FILE* prefetch_log = nullptr
+            FILE* prefetch_log = nullptr,
+            FILE* feature_log = nullptr,
+            FILE* cache_log = nullptr
         ):  f(f), warmup(warmup), cache(cache),
             evict_policy(evict_policy), prefetch_policy(prefetch_policy),
-            access_log(access_log), prefetch_log(prefetch_log) {
+            access_log(access_log), prefetch_log(prefetch_log),
+            feature_log(feature_log), cache_log(cache_log) {
                 sim_start = steady_ns();
+                if (feature_log) std::fprintf(feature_log,
+                    "req,worker,type,flags,handle,offset,length,req_length,arrive_ns,start_ns,end_ns,"
+                    "pread_ns,policy_ns,think_ns,inflight,queued_bytes,hits,total,pf_hits,pf_issued\n");
+                if (cache_log) std::fprintf(cache_log, "ts_ns,req,event,page,prefetched,resident_ns,hits,used\n");
             }
 
+    bool track_meta() const { return feature_log || cache_log; }
+
+    void on_command(uint64_t worker_id, uint64_t offset, uint64_t length, const ReqInfo& info) override {
+        if (!feature_log) return;
+        std::lock_guard _{mu};
+        uint64_t now = steady_ns();
+        std::fprintf(feature_log, "-1,%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,0,0,0,%u,%u,0,0,0,0\n",
+            (unsigned long long)worker_id, info.type, info.flags, (unsigned long long)info.handle,
+            (unsigned long long)offset, (unsigned long long)length, (unsigned long long)info.req_length,
+            (unsigned long long)info.arrive_ns, (unsigned long long)now, (unsigned long long)now,
+            info.inflight, info.queued_bytes);
+    }
+
     uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf,
-                  uint64_t* miss_blocks = nullptr) override {
+                  uint64_t* miss_blocks = nullptr, const ReqInfo* info = nullptr) override {
+        const uint64_t start_ns = steady_ns();
         // manage warmup period
         uint64_t req_idx = global_idx.fetch_add(1);
         bool count_stats = req_idx >= warmup;
 
-        // bytes to disk units
-        if (offset % SECTOR_SIZE || length % SECTOR_SIZE) {
-            std::cerr << "got invalid (offset=" << offset << ",length=" << length << ")\n";
-        }
-        std::uint64_t block_offset = offset / SECTOR_SIZE;
-        std::uint64_t block_length = length / SECTOR_SIZE;
+        // bytes to cache pages (page_size bytes each); unaligned requests cover every page they touch
+        const std::uint64_t psz = cache.page_size;
+        std::uint64_t block_offset = offset / psz;
+        std::uint64_t block_length = length ? (offset + length - 1) / psz - block_offset + 1 : 0;
+        uint64_t pf_hits = 0;
 
         // timing (worker)
         uint64_t now_ns = steady_ns();
@@ -124,6 +155,7 @@ public:
         policy::PrefetchRequest prefetch_req;
         {
             std::lock_guard _{mu};
+            cur_req_idx = req_idx;
             if (prefetch_policy) {
                 policy_ns += charge_policy_ns([&]{
                     prefetch_policy->on_prefetch_request(
@@ -136,6 +168,14 @@ public:
             bool hit = cache.present(block_offset + block_suboffset);
             total_count += 1;
             hit_count += hit;
+            if (hit && track_meta()) {
+                auto m = page_meta.find(block_offset + block_suboffset);
+                if (m != page_meta.end()) {
+                    m->second.hits++;
+                    if (m->second.prefetched && !m->second.used) pf_hits++;  // first use of a prefetched page
+                    m->second.used = true;
+                }
+            }
 
             policy_ns += add_to_cache(worker_id, policy::FetchRange{block_offset + block_suboffset, 1}, false, count_stats);
 
@@ -165,8 +205,8 @@ public:
                     for (std::uint64_t b = 0; b < r.block_length; ++b) cached += cache.present(r.block_offset + b);
                     std::fprintf(prefetch_log, "%llu,%llu,%llu,%llu,%llu,%llu\n",
                         static_cast<unsigned long long>(worker_id),
-                        static_cast<unsigned long long>(r.block_offset) * SECTOR_SIZE,
-                        static_cast<unsigned long long>(r.block_length) * SECTOR_SIZE,
+                        static_cast<unsigned long long>(r.block_offset) * psz,
+                        static_cast<unsigned long long>(r.block_length) * psz,
                         static_cast<unsigned long long>(cached),
                         static_cast<unsigned long long>(r.block_length),
                         static_cast<unsigned long long>(req_idx));
@@ -216,8 +256,24 @@ public:
         // used because `f` is shared by every client thread: fseek would
         // race with concurrent reads at other offsets, while pread's offset
         // argument makes each read atomic and lock-free.
+        const uint64_t pread_start_ns = steady_ns();
         ssize_t bytes_got = pread(fileno(f), buf, length, static_cast<off_t>(offset));
         if (bytes_got < 0) bytes_got = 0;
+        if (feature_log) {
+            const uint64_t end_ns = steady_ns();
+            std::lock_guard _{mu};
+            const ReqInfo zero{};
+            const ReqInfo& ri = info ? *info : zero;
+            std::fprintf(feature_log, "%llu,%llu,%u,%u,%llu,%llu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%llu,%llu\n",
+                (unsigned long long)req_idx, (unsigned long long)worker_id, ri.type, ri.flags,
+                (unsigned long long)ri.handle, (unsigned long long)offset, length,
+                (unsigned long long)(ri.req_length ? ri.req_length : length),
+                (unsigned long long)(ri.arrive_ns ? ri.arrive_ns : start_ns), (unsigned long long)start_ns,
+                (unsigned long long)end_ns, (unsigned long long)(end_ns - pread_start_ns),
+                (unsigned long long)policy_ns, (unsigned long long)worker_run_ns,
+                ri.inflight, ri.queued_bytes, (unsigned long long)hit_count, (unsigned long long)total_count,
+                (unsigned long long)pf_hits, (unsigned long long)prefetch_req.fetch_count);
+        }
         
         // final metric - tracking
         if (count_stats) {
@@ -286,6 +342,7 @@ public:
 
             for (uint64_t i = 0; i < evictions.n_pages; ++i) {
                 cache.evict(evictions.pages[i]);
+                log_evict(evictions.pages[i]);
                 latency += charge_policy_ns([&]{
                     if (evict_policy) evict_policy->on_evict(worker_id, evictions.pages[i]);
                     if (prefetch_policy) prefetch_policy->on_evict(worker_id, evictions.pages[i]);
@@ -294,6 +351,8 @@ public:
             if (count_stats) stats.evictions += evictions.n_pages;
             auto evict = cache.insert(range.block_offset + block_suboffset);
             if (count_stats && evict.first) stats.evictions++;
+            if (evict.first) log_evict(evict.second);
+            log_admit(range.block_offset + block_suboffset, is_prefetch);
             latency += charge_policy_ns([&]{
                 if (evict.first && evict_policy) evict_policy->on_evict(worker_id, evict.second);
                 if (evict.first && prefetch_policy) prefetch_policy->on_evict(worker_id, evict.second);
@@ -304,6 +363,25 @@ public:
         return latency;
     }
 
+
+    // Cache-residency bookkeeping for cache_log (callers hold mu).
+    void log_admit(uint64_t page, bool is_prefetch) {
+        if (!track_meta()) return;
+        uint64_t now = steady_ns();
+        page_meta[page] = PageMeta{now, cur_req_idx, 0, is_prefetch, false};
+        if (cache_log) std::fprintf(cache_log, "%llu,%llu,admit,%llu,%d,0,0,0\n", (unsigned long long)now,
+            (unsigned long long)cur_req_idx, (unsigned long long)page, (int)is_prefetch);
+    }
+    void log_evict(uint64_t page) {
+        if (!track_meta()) return;
+        auto m = page_meta.find(page);
+        if (m == page_meta.end()) return;
+        uint64_t now = steady_ns();
+        if (cache_log) std::fprintf(cache_log, "%llu,%llu,evict,%llu,%d,%llu,%u,%d\n", (unsigned long long)now,
+            (unsigned long long)cur_req_idx, (unsigned long long)page, (int)m->second.prefetched,
+            (unsigned long long)(now - m->second.admit_ns), m->second.hits, (int)m->second.used);
+        page_meta.erase(m);
+    }
 
     // Times `fn` (a policy hook invocation) and charges its real wall-clock
     // cost as simulated delay, added onto `sink` -- so a computationally

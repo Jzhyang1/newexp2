@@ -29,13 +29,28 @@ struct Stats {
     uint64_t sim_time_elapsed_ns{0};    // virtual clock since the last warmup request finished (includes miss delay)
 };
 
+// Per-request facts only the wire layer knows. Passed to read()/on_command()
+// so the simulator can log them (signals #1-9 in offline/SIGNALS.md).
+struct ReqInfo {
+    uint64_t handle{0};
+    uint16_t type{0};        // NBD command (0=read, 1=write, 3=flush, 4=trim, 6=write-zeroes)
+    uint16_t flags{0};       // NBD command flags (FUA etc.)
+    uint64_t arrive_ns{0};   // steady_ns() right after the request header was read
+    uint32_t inflight{0};    // requests being served by other connections when this one arrived
+    uint32_t queued_bytes{0};// bytes already waiting in this connection's socket (pipelined requests => queue depth)
+    uint64_t req_length{0};  // length of the whole NBD request (read() may be called in chunks)
+};
+
 class BlockReadClass {
 public:
+    // Non-read commands (write/flush/trim/...): log only; data is never persisted.
+    virtual void on_command(uint64_t /*worker_id*/, uint64_t /*offset*/, uint64_t /*length*/,
+                            const ReqInfo& /*info*/) {}
     // returns the amount actually read; length == buf_sz
     // If non-null, *miss_blocks is set to the number of sectors in this read
     // that were not already cached (before this request's own admissions).
     virtual uint32_t read(uint64_t worker_id, uint64_t offset, size_t length, void* buf,
-                          uint64_t* miss_blocks = nullptr) = 0;
+                          uint64_t* miss_blocks = nullptr, const ReqInfo* info = nullptr) = 0;
     // Called once a read's data has been fully handed back to the client
     // (after any physical miss delay and the socket write). Marks the point
     // where the worker's own think time starts, so disk-side time never
