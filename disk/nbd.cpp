@@ -7,7 +7,13 @@
 // BlockReadClass (nbd.hpp/sim.hpp), so an attached VM's disk traffic is
 // charged simulated hit/miss latency and mined for prefetch opportunities
 // under a configured policy (see policies/). Writes/trims/flushes are
-// accepted and discarded; nothing written by a guest is ever persisted.
+// handled as follows: guest writes/write-zeroes go to a copy-on-write overlay
+// (overlay.hpp: a temp file of modified blocks plus a block->slot map) that
+// reads are patched from, so data persists for the life of the server while
+// the backing file is never modified. Trim is a no-op and flush has nothing to
+// sync. Each operation is counted per operation type (count, bytes, errors, FUA, service
+// time) in Stats. Out-of-range requests are answered with EINVAL and unknown
+// commands with ENOTSUP; both are counted as errors.
 //
 // The server listens on one TCP port per entry in `ports:` in its config
 // file. Each port is its own client identity ("worker_id" in
@@ -53,6 +59,7 @@
 #include <thread>
 #include <vector>
 #include "nbd.hpp"
+#include "overlay.hpp"
 #include "sim.hpp"
 #include "../policies/policy_api.h"
 
@@ -84,6 +91,9 @@ constexpr uint16_t kTransReadOnly = 1 << 1;
 constexpr uint16_t kTransSendFlush = 1 << 2;
 constexpr uint16_t kTransSendTrim = 1 << 5;
 constexpr uint16_t kTransSendWriteZeroes = 1 << 6;
+
+constexpr uint32_t kErrInval = 22;   // EINVAL
+constexpr uint32_t kErrNotSup = 95;  // ENOTSUP
 
 constexpr uint16_t kCmdRead = 0;
 constexpr uint16_t kCmdWrite = 1;
@@ -117,18 +127,6 @@ bool WriteFull(int fd, const void *buf, size_t len) {
     }
     p += n;
     len -= static_cast<size_t>(n);
-  }
-  return true;
-}
-
-// Drains and discards exactly `len` bytes from fd (used to consume write
-// payloads we don't actually store).
-bool DiscardFull(int fd, uint64_t len) {
-  static thread_local std::vector<uint8_t> scratch(1 << 16);
-  while (len > 0) {
-    size_t chunk = static_cast<size_t>(std::min<uint64_t>(len, scratch.size()));
-    if (!ReadFull(fd, scratch.data(), chunk)) return false;
-    len -= chunk;
   }
   return true;
 }
@@ -259,7 +257,7 @@ bool SendReply(int fd, uint32_t error, uint64_t handle) {
 // time reflects cache performance. (Flat per request, not per missed sector.)
 static std::atomic<uint32_t> g_inflight{0};
 
-void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
+void ServeTransmission(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker_id,
                        uint64_t physical_miss_ns) {
   static thread_local std::vector<uint8_t> buf(1 << 20, 0);
 
@@ -294,8 +292,24 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
     info.req_length = length;
     struct InflightGuard { ~InflightGuard() { g_inflight.fetch_sub(1); } } inflight_guard;
 
+    // Overflow-safe range check against the exported size.
+    const bool in_range = offset <= size && length <= size - offset;
+    // Completes a request: records it in the stats and sends the reply
+    // (err == 0 on success).
+    auto finish = [&](uint32_t err) {
+      info.error = err;
+      reader->on_command(worker_id, offset, length, info);
+      bool ok = SendReply(fd, err, handle);
+      reader->response_sent(worker_id);
+      return ok;
+    };
+
     switch (type) {
       case kCmdRead: {
+        if (!in_range) {
+          if (!finish(kErrInval)) return;
+          break;
+        }
         if (!SendReply(fd, 0, handle)) return;
         uint64_t remaining = length;
         while (remaining > 0) {
@@ -313,22 +327,41 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t worker_id,
         break;
       }
       case kCmdWrite: {
-        if (!DiscardFull(fd, length)) return;
-        reader->on_command(worker_id, offset, length, info);
-        if (!SendReply(fd, 0, handle)) return;
+        // Stream the payload into the overlay chunk by chunk. The payload must
+        // be consumed even once a write has failed or is out of range, so the
+        // stream stays in sync.
+        uint32_t err = in_range ? 0 : kErrInval;
+        uint64_t remaining = length, pos = offset;
+        while (remaining > 0) {
+          size_t chunk = static_cast<size_t>(std::min<uint64_t>(remaining, buf.size()));
+          if (!ReadFull(fd, buf.data(), chunk)) return;
+          if (!err) err = reader->write(pos, buf.data(), chunk);
+          pos += chunk;
+          remaining -= chunk;
+        }
+        if (!finish(err)) return;
         break;
       }
       case kCmdDisc:
         return;
       case kCmdFlush:
+        // The overlay lives in an unlinked temp file that is never meant to
+        // outlive the server, so there is nothing to make durable.
+        if (!finish(0)) return;
+        break;
       case kCmdTrim:
+        // Trim is advisory: the NBD spec leaves trimmed data undefined, so
+        // keeping it intact is valid.
+        if (!finish(in_range ? 0 : kErrInval)) return;
+        break;
       case kCmdWriteZeroes:
-        reader->on_command(worker_id, offset, length, info);
-        if (!SendReply(fd, 0, handle)) return;
+        if (!finish(in_range ? reader->write_zeroes(offset, length) : kErrInval)) return;
         break;
       default:
-        // Unknown command: report "not supported" (ENOTSUP = 95).
-        if (!SendReply(fd, 95, handle)) return;
+        // Unknown command: report "not supported". A command we don't know
+        // may carry a payload we can't size, so the stream could desync;
+        // nothing sensible to do about that besides replying.
+        if (!finish(kErrNotSup)) return;
         break;
     }
   }
@@ -345,7 +378,7 @@ void HandleClient(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker
   // flush the CSV stats log. Contain it to this one connection instead.
   try {
     if (DoHandshake(fd, size, worker_id)) {
-      ServeTransmission(fd, reader, worker_id, physical_miss_ns);
+      ServeTransmission(fd, reader, size, worker_id, physical_miss_ns);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "nbd: worker %llu connection crashed: %s\n",
@@ -438,6 +471,8 @@ struct Config {
   std::string prefetch_log = "./logs/nbd_prefetch.csv";  // per-prefetched-range (worker_id,offset,length,hits,total,req)
                                  // log, same shape as access_log (for heatmap comparison); "" to disable
   std::string feature_log;       // per-request host-side feature log (see disk/sim.hpp); "" (default) disables
+  std::string overlay_dir = "/tmp";  // directory for the (unlinked) temp file holding guest-modified blocks
+  uint64_t overlay_block_size = 4096; // copy-on-write granularity in bytes (power of two, multiple of 512)
   std::string cache_log;         // per-cache-event log (admit/evict, with prefetch + reuse info); "" disables
 };
 
@@ -499,6 +534,14 @@ Config LoadConfig(const std::string& path) {
       if (cfg.page_size < SECTOR_SIZE || cfg.page_size % SECTOR_SIZE ||
           (cfg.page_size & (cfg.page_size - 1))) {
         throw std::runtime_error("page_size must be a power of two and a multiple of 512");
+      }
+    } else if (key == "overlay_dir") {
+      cfg.overlay_dir = value;
+    } else if (key == "overlay_block_size") {
+      cfg.overlay_block_size = std::stoull(value);
+      if (cfg.overlay_block_size < SECTOR_SIZE || cfg.overlay_block_size % SECTOR_SIZE ||
+          (cfg.overlay_block_size & (cfg.overlay_block_size - 1))) {
+        throw std::runtime_error("overlay_block_size must be a power of two and a multiple of 512");
       }
     } else if (key == "feature_log") {
       cfg.feature_log = value;
@@ -617,14 +660,29 @@ std::string JoinPorts(const std::vector<uint16_t>& ports) {
 
 void PrintStatsLine(const Stats& stats) {
   const uint64_t measured = stats.hits + stats.misses;
-  const double avg_latency_ns = stats.request_count == 0
-      ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(stats.request_count);
+  const uint64_t all_requests = stats.request_count + stats.writes.count + stats.flushes.count +
+                                stats.trims.count + stats.write_zeroes.count + stats.unknown_ops.count;
+  const double avg_latency_ns = all_requests == 0
+      ? 0.0 : static_cast<double>(stats.total_latencies) / static_cast<double>(all_requests);
+  auto op = [](const char* name, const OpStats& s) {
+    std::ostringstream o;
+    o << name << "=" << s.count << ' ' << name << "_bytes=" << s.bytes << ' '
+      << name << "_errors=" << s.errors << ' ' << name << "_fua=" << s.fua << ' '
+      << name << "_avg_service_ns=" << (s.count ? static_cast<double>(s.service_ns) / s.count : 0.0) << ' ';
+    return o.str();
+  };
   std::cout << "STATS "
+            << "reads=" << stats.request_count << ' '
+            << "read_errors=" << stats.read_errors << ' '
+            << op("writes", stats.writes) << op("flushes", stats.flushes)
+            << op("trims", stats.trims) << op("write_zeroes", stats.write_zeroes)
+            << op("unknown_ops", stats.unknown_ops)
             << "hits=" << stats.hits << ' '
             << "misses=" << stats.misses << ' '
             << "evictions=" << stats.evictions << ' '
             << "bytes_read=" << stats.bytes_read << ' '
             << "bytes_written=" << stats.bytes_written << ' '
+            << "overlay_bytes=" << stats.overlay_bytes << ' '
             << "miss_requests=" << stats.miss_requests << ' '
             << "avg_latency_ns=" << avg_latency_ns << ' '
             << "total_latency_ns=" << stats.total_latencies << ' '
@@ -685,7 +743,12 @@ void AppendLog(const Config& cfg, const Stats& stats,
       "timestamp,machine,commit_hash,file,ports,capacity,hit_latency_ns,miss_latency_ns,"
       "warmup,evict_policy,prefetch_policy,latency_mode,workload,"
       "requests,miss_requests,blk_hits,blk_misses,hit_ratio,"
-      "evictions,bytes_read,bytes_written,"
+      "evictions,bytes_read,bytes_written,overlay_bytes,read_errors,"
+      "writes,write_errors,write_fua,write_service_s,"
+      "flushes,flush_errors,flush_service_s,"
+      "trims,trim_bytes,trim_errors,trim_service_s,"
+      "write_zeroes,write_zeroes_bytes,write_zeroes_errors,write_zeroes_service_s,"
+      "unknown_ops,"
       "total_s,worker_s,policy_s,miss_s,physical_s,simulated_s,"
       "experiment_s,workload_s";
 
@@ -748,6 +811,18 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << stats.evictions << ','
       << stats.bytes_read << ','
       << stats.bytes_written << ','
+      << stats.overlay_bytes << ','
+      << stats.read_errors << ','
+      << stats.writes.count << ',' << stats.writes.errors << ',' << stats.writes.fua << ','
+      << static_cast<double>(stats.writes.service_ns) / 1e9 << ','
+      << stats.flushes.count << ',' << stats.flushes.errors << ','
+      << static_cast<double>(stats.flushes.service_ns) / 1e9 << ','
+      << stats.trims.count << ',' << stats.trims.bytes << ',' << stats.trims.errors << ','
+      << static_cast<double>(stats.trims.service_ns) / 1e9 << ','
+      << stats.write_zeroes.count << ',' << stats.write_zeroes.bytes << ','
+      << stats.write_zeroes.errors << ','
+      << static_cast<double>(stats.write_zeroes.service_ns) / 1e9 << ','
+      << stats.unknown_ops.count << ','
       << static_cast<double>(stats.total_latencies) / 1e9 << ','
       << static_cast<double>(stats.worker_latency_ns) / 1e9 << ','
       << static_cast<double>(stats.policy_latency_ns) / 1e9 << ','
@@ -854,9 +929,17 @@ int main(int argc, char **argv) {
   FILE* feature_log = open_log(cfg.feature_log);
   FILE* cache_log = open_log(cfg.cache_log);
 
+  nbd::Overlay* overlay = nullptr;
+  try {
+    overlay = new nbd::Overlay(fileno(f), size, cfg.overlay_block_size, cfg.overlay_dir);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
+  }
+
   nbd::BlockReadClass* reader = new nbd::SimReadClass(
       f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log,
-      feature_log, cache_log);
+      feature_log, cache_log, overlay);
 
   signal(SIGPIPE, SIG_IGN);
 

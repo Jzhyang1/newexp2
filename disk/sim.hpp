@@ -16,6 +16,7 @@
  */
 
 #include "nbd.hpp"
+#include "overlay.hpp"
 #include "../policies/policy_api.h"
 #include <stdio.h>
 #include <atomic>
@@ -57,6 +58,8 @@ class SimReadClass : public BlockReadClass {
     // Optional per-cache-event log (admit/evict with prefetch provenance and
     // how often the page was reused while resident).
     FILE* cache_log;
+    // Modified-block overlay (guest writes); null = writes are discarded.
+    Overlay* overlay;
     // Residency metadata, only maintained when feature_log/cache_log is on.
     struct PageMeta { uint64_t admit_ns; uint64_t admit_req; uint32_t hits; bool prefetched; bool used; };
     std::unordered_map<uint64_t, PageMeta> page_meta;
@@ -83,11 +86,12 @@ public:
             FILE* access_log = nullptr,
             FILE* prefetch_log = nullptr,
             FILE* feature_log = nullptr,
-            FILE* cache_log = nullptr
+            FILE* cache_log = nullptr,
+            Overlay* overlay = nullptr
         ):  f(f), warmup(warmup), cache(cache),
             evict_policy(evict_policy), prefetch_policy(prefetch_policy),
             access_log(access_log), prefetch_log(prefetch_log),
-            feature_log(feature_log), cache_log(cache_log) {
+            feature_log(feature_log), cache_log(cache_log), overlay(overlay) {
                 sim_start = steady_ns();
                 if (feature_log) std::fprintf(feature_log,
                     "req,worker,type,flags,handle,offset,length,req_length,arrive_ns,start_ns,end_ns,"
@@ -97,10 +101,64 @@ public:
 
     bool track_meta() const { return feature_log || cache_log; }
 
+    // Writes only change data, never cache residency: the cache tracks page
+    // presence, not contents, and reads re-patch from the overlay every time.
+    uint32_t write(uint64_t offset, const void* buf, uint64_t length) override {
+        return overlay ? overlay->write(offset, buf, length) : 0;
+    }
+    uint32_t write_zeroes(uint64_t offset, uint64_t length) override {
+        if (!overlay) return 0;
+        static thread_local std::vector<uint8_t> zeros(1 << 20, 0);
+        while (length > 0) {
+            uint64_t n = std::min<uint64_t>(length, zeros.size());
+            if (uint32_t err = overlay->write(offset, zeros.data(), n)) return err;
+            offset += n;
+            length -= n;
+        }
+        return 0;
+    }
+
     void on_command(uint64_t worker_id, uint64_t offset, uint64_t length, const ReqInfo& info) override {
-        if (!feature_log) return;
         std::lock_guard _{mu};
-        uint64_t now = steady_ns();
+        const uint64_t now = steady_ns();
+
+        // Think time since this worker's previous response, charged like
+        // read() does so total_latencies == worker + policy + miss delay holds.
+        uint64_t worker_run_ns = 0;
+        auto ws = worker_real_time_start.find(worker_id);
+        if (ws != worker_real_time_start.end()) {
+            worker_run_ns = now - ws->second;
+            worker_real_time_start.erase(ws);
+        }
+        auto wv = worker_virtual_time.find(worker_id);
+        uint64_t virt_end = (wv != worker_virtual_time.end() ? wv->second : steady_max_virt_ns) + worker_run_ns;
+        if (virt_end > steady_max_virt_ns) steady_max_virt_ns = virt_end;
+        worker_virtual_time[worker_id] = virt_end;
+
+        // Reads gate warmup by request index; other ops count once warmup is over.
+        if (global_idx.load() >= warmup) {
+            const uint64_t service_ns = info.arrive_ns ? now - info.arrive_ns : 0;
+            OpStats* op = nullptr;
+            switch (info.type) {
+                case 0: stats.read_errors += info.error != 0; break;  // rejected read
+                case 1: op = &stats.writes; break;
+                case 3: op = &stats.flushes; break;
+                case 4: op = &stats.trims; break;
+                case 6: op = &stats.write_zeroes; break;
+                default: op = &stats.unknown_ops; break;
+            }
+            if (op) {
+                op->count++;
+                op->service_ns += service_ns;
+                op->fua += (info.flags & 1) != 0;  // NBD_CMD_FLAG_FUA = 1 << 0
+                if (info.error) op->errors++; else op->bytes += length;
+                if (info.type == 1 && !info.error) stats.bytes_written += length;
+            }
+            stats.total_latencies += worker_run_ns;
+            stats.worker_latency_ns += worker_run_ns;
+        }
+
+        if (!feature_log) return;
         std::fprintf(feature_log, "-1,%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,0,0,0,%u,%u,0,0,0,0\n",
             (unsigned long long)worker_id, info.type, info.flags, (unsigned long long)info.handle,
             (unsigned long long)offset, (unsigned long long)length, (unsigned long long)info.req_length,
@@ -259,6 +317,7 @@ public:
         const uint64_t pread_start_ns = steady_ns();
         ssize_t bytes_got = pread(fileno(f), buf, length, static_cast<off_t>(offset));
         if (bytes_got < 0) bytes_got = 0;
+        if (overlay) overlay->patch(offset, buf, length);
         if (feature_log) {
             const uint64_t end_ns = steady_ns();
             std::lock_guard _{mu};
@@ -315,6 +374,7 @@ public:
         stats.real_time_elapsed_ns = steady_ns() - sim_start;
         stats.real_time_measured_ns = steady_ns() - (warmup_end_real_ns ? warmup_end_real_ns : sim_start);
         stats.sim_time_elapsed_ns = steady_max_virt_ns - warmup_end_virt_ns;
+        stats.overlay_bytes = overlay ? overlay->bytes() : 0;
         return stats;
     }
 

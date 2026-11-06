@@ -10,13 +10,25 @@
 
 namespace nbd {
 
+// Per-operation counters for non-read commands (post-warmup only).
+struct OpStats {
+    uint64_t count{0};       // requests of this type (including failed ones)
+    uint64_t bytes{0};       // payload/range bytes covered by successful requests
+    uint64_t errors{0};      // requests answered with a non-zero NBD error
+    uint64_t service_ns{0};  // real time from header arrival to reply (incl. payload drain)
+    uint64_t fua{0};         // requests carrying NBD_CMD_FLAG_FUA
+};
+
 struct Stats {
-    uint64_t request_count{0};
+    uint64_t request_count{0};  // read requests
     uint64_t hits{0};
     uint64_t misses{0};
     uint64_t evictions{0};
     uint64_t bytes_read{0};
-    uint64_t bytes_written{0};
+    uint64_t bytes_written{0};  // payload bytes of accepted writes (same as writes.bytes)
+    uint64_t overlay_bytes{0};  // size of the modified-block overlay right now (not warmup-gated)
+    uint64_t read_errors{0};    // reads rejected (e.g. out of range)
+    OpStats writes, flushes, trims, write_zeroes, unknown_ops;
     uint64_t total_latencies{0};
     uint64_t miss_requests{0};      // requests with >=1 missing sector (each is charged miss_latency_ns once)
     // total_latencies == worker_latency_ns + policy_latency_ns + miss_delay_ns
@@ -39,13 +51,18 @@ struct ReqInfo {
     uint32_t inflight{0};    // requests being served by other connections when this one arrived
     uint32_t queued_bytes{0};// bytes already waiting in this connection's socket (pipelined requests => queue depth)
     uint64_t req_length{0};  // length of the whole NBD request (read() may be called in chunks)
+    uint32_t error{0};       // NBD errno the request is answered with (0 = success); set before on_command()
 };
 
 class BlockReadClass {
 public:
-    // Non-read commands (write/flush/trim/...): log only; data is never persisted.
+    // Non-read commands (write/flush/trim/write-zeroes/unknown, plus rejected
+    // reads): tracked in Stats and logged; data is never persisted.
     virtual void on_command(uint64_t /*worker_id*/, uint64_t /*offset*/, uint64_t /*length*/,
                             const ReqInfo& /*info*/) {}
+    // Persist guest data for the lifetime of the server. Return 0 or an NBD errno.
+    virtual uint32_t write(uint64_t /*offset*/, const void* /*buf*/, uint64_t /*length*/) { return 0; }
+    virtual uint32_t write_zeroes(uint64_t /*offset*/, uint64_t /*length*/) { return 0; }
     // returns the amount actually read; length == buf_sz
     // If non-null, *miss_blocks is set to the number of sectors in this read
     // that were not already cached (before this request's own admissions).

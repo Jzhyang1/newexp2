@@ -74,3 +74,10 @@ vm_log_dir: ./kvm
 # feature_log: ./logs/nbd_features.csv
 # Per-cache-event log: ts_ns,req,admit|evict,page,prefetched,resident_ns,hits,used. Empty/absent disables.
 # cache_log: ./logs/nbd_cache.csv
+
+# Guest writes go to a copy-on-write overlay: an unlinked temp file (created in
+# overlay_dir, gone when the server exits) holding only modified blocks, plus an
+# in-memory block->slot map. The backing file is never modified.
+# overlay_block_size: copy-on-write granularity in bytes (power of two, multiple of 512).
+# overlay_dir: /tmp
+# overlay_block_size: 4096

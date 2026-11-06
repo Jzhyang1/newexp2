@@ -97,11 +97,14 @@ asked to "run the tests," say there aren't any.
   `ports:` only gives each VM a distinct *identity* for cache/timing
   purposes (`worker_id`) — it does not give them distinct disk contents. Run
   separate `nbd_server` processes/configs if VMs need different data.
-- **Writes from guests are silently discarded.** `nbd_server` opens the
-  backing file read-only and never persists guest writes — this is by
-  design (it's a read-cache simulator), but it means a `make guest-image`
-  guest boots with `systemd.volatile=yes` (tmpfs overlay) so it never
-  depends on a write landing on disk.
+- **Guest writes persist only for the life of the server.** `nbd_server`
+  opens the backing file read-only; writes and write-zeroes go to a
+  copy-on-write overlay (`disk/overlay.hpp`): an unlinked temp file in
+  `overlay_dir` holding the modified `overlay_block_size` blocks, plus a
+  block->slot map that reads are patched from. It vanishes on exit and the
+  backing file is never changed. Trim is a no-op and writes don't affect
+  cache residency. All ports share one overlay, so VMs on different ports
+  see each other's writes.
 - **`kvm/launch.py`'s serial console goes to a file, not stdio.**
   `-serial mon:stdio` is incompatible with `-daemonize` (QEMU detaches from
   the terminal); serial output goes to `<log_dir>/<name>.serial.log`
