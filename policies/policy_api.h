@@ -55,6 +55,16 @@ public:
         (void)page;
         (void)is_prefetch;
     };
+    // Called just before on_prefetch_request with the request exactly as the guest issued it: byte offset and
+    // length (the page-granular block_offset/length below lose the guest's window shape, e.g. 120 KiB vs 128 KiB)
+    // and a monotonic arrival time in ns (0 when the caller has none).
+    virtual void on_request(uint64_t context, std::uint64_t byte_offset, std::uint64_t byte_length,
+                            std::uint64_t arrive_ns) {
+        (void)context;
+        (void)byte_offset;
+        (void)byte_length;
+        (void)arrive_ns;
+    }
     virtual void on_prefetch_request(uint64_t context, std::uint64_t block_offset,
                                      std::uint64_t block_length, PrefetchRequest& request) {
         (void)context;
@@ -298,6 +308,120 @@ public:
                             std::uint32_t hot_threshold = 20);
     void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
                              std::uint64_t block_length, PrefetchRequest& request);
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Learned prefetching for VM disk traffic.  The guest's own page cache and readahead already turned the
+// application's accesses into windows (128 KiB read-around, 256 KiB / 1 MiB reads, ...), so what the host sees
+// is a stream of those windows, in two shapes: many short sequential streams that advance a burst at a time
+// (NextRequestPolicy), and windows that land around a point and fill in around it in no fixed order
+// (NeighborhoodPrefetchPolicy).  `learned` (policy_factory.h) runs both.  Both learn online from the stream
+// itself -- nothing is trained offline -- and both are conservative on random traffic (they learn that nothing
+// near a request tends to follow it and stop prefetching).
+// ---------------------------------------------------------------------------------------------------------------
+
+// Learned neighborhood prefetcher (policy_neighborhood.cpp).  For every request it remembers which pages within
+// `dmax` pages of it are requested by one of the next `window` requests, and accumulates that per request context
+// (request length, length of the sequential chain it extends, whether it joins an active neighborhood), per
+// distance bin and per hole class (is the candidate page enclosed by two recent requests -- a gap that a
+// read-around scan will fill?) and, optionally, per what was seen around the same start page last time.  A request
+// then prefetches the pages whose learned probability of being used is >= theta.  No fixed readahead depth or
+// direction: sequential scans, out-of-order windows and isolated random reads each get their own learned shape.
+class NeighborhoodPrefetchPolicy : public CachePolicy {
+public:
+    struct Params {
+        std::size_t window = 32;          // requests an anchor stays open for training
+        std::uint64_t theta_pct = 40;     // prefetch pages with P(used) >= theta
+        std::uint64_t gap = 1;            // pages of slack for "continues the previous request"
+        std::uint64_t prior_trials = 8;   // pseudo-trials behind the cold-start prior
+        std::uint64_t prior_pct = 60;     // cold-start P for the first prior_fwd pages ahead
+        std::uint64_t prior_fwd = 2;
+        std::uint64_t use_hole = 1;       // condition on whether the candidate lies in a gap between two recent requests
+        std::uint64_t hole_small = 4;     // gap (pages) up to which a hole is class 1
+        std::uint64_t hole_max = 16;      // largest gap still treated as a hole (class 2)
+        std::uint64_t use_mem = 1;        // condition on the footprint remembered for this request's start page
+        std::uint64_t mem_entries = 262144;
+        std::uint64_t dmax = 64;          // how far (pages) either side of a request to consider, <= 256
+    };
+    NeighborhoodPrefetchPolicy(Cache& cache, const Params& params);
+    ~NeighborhoodPrefetchPolicy() override;
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Per-stream next-request predictor (policy_nextreq.cpp).  A stream is a run of requests each starting where the
+// previous one ended (or a little after).  Per stream it keeps the last two request lengths (4 KiB resolution, from
+// on_request), learns globally what length tends to follow a (previous, before-previous) pair -- 1 MiB then 256 KiB
+// then 1 MiB ... --, how far past the previous end the next request starts, and how often a stream in a given
+// state is continued at all, and prefetches the pages that the next few predicted requests would touch when that
+// is likely enough.  A read is a full hit only if the *whole* request is cached, so the unit of prediction is the
+// request, not the page.
+class NextRequestPolicy : public CachePolicy {
+public:
+    struct Params {
+        std::size_t streams = 2048;
+        std::uint64_t gap_kb = 128;        // how far before a request's start a stream may end and still be continued by it
+        std::uint64_t overlap_kb = 0;      // ... and how far after (re-reads / overlap)
+        std::uint64_t theta_pct = 10;      // prefetch pages whose probability (P(continued) x P(length)) is >= theta
+        float decay = 0.995f;              // forgetting of the next-length histograms
+        float prior_cont = 0.4f;           // P(continued) prior, one pseudo-trial
+        std::uint64_t max_pages = 64;
+        std::uint32_t look = 3;            // requests ahead to predict
+        std::uint64_t use_consumed = 1;    // P(continued) by bytes consumed so far (file-size prior) instead of request count
+        float min_evidence = 4.f;          // observations needed before a length-distribution level is trusted
+    };
+    NextRequestPolicy(Cache& cache, const Params& params);
+    ~NextRequestPolicy() override;
+    void on_request(std::uint64_t context, std::uint64_t byte_offset, std::uint64_t byte_length, std::uint64_t arrive_ns) override;
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Runs several prefetch policies on the same stream and prefetches the union of what they ask for
+// ("a+b" in a policy spec, see policy_factory.h).
+class ComboPolicy : public CachePolicy {
+public:
+    ComboPolicy(Cache& cache, std::vector<std::unique_ptr<CachePolicy>> parts) : CachePolicy(cache), parts_(std::move(parts)) {}
+    void on_access(std::uint64_t c, std::uint64_t p) override { for (auto& x : parts_) x->on_access(c, p); }
+    void on_admit(std::uint64_t c, std::uint64_t p, bool pf) override { for (auto& x : parts_) x->on_admit(c, p, pf); }
+    void on_evict(std::uint64_t c, std::uint64_t p) override { for (auto& x : parts_) x->on_evict(c, p); }
+    void on_request(std::uint64_t c, std::uint64_t off, std::uint64_t len, std::uint64_t t) override {
+        for (auto& x : parts_) x->on_request(c, off, len, t);
+    }
+    void on_prefetch_request(std::uint64_t c, std::uint64_t b0, std::uint64_t bn, PrefetchRequest& out) override {
+        out.fetch_count = 0;
+        for (auto& x : parts_) {
+            PrefetchRequest r;
+            x->on_prefetch_request(c, b0, bn, r);
+            for (std::uint64_t i = 0; i < r.fetch_count && out.fetch_count < MAX_PREFETCH_PAGES; ++i) out.fetch_ranges[out.fetch_count++] = r.fetch_ranges[i];
+        }
+    }
+private:
+    std::vector<std::unique_ptr<CachePolicy>> parts_;
+};
+
+// LRU with a protected FIFO segment for prefetched-but-unused pages (policy_lru_seg.cpp).  Unused prefetches wait in
+// their own segment and move to the main LRU list when first read; they are evicted first only once the segment holds
+// more than `max_unused_pct` of the cache.  Plain LRU lets a burst of prefetches push out pages that were about to be
+// used, and lets just-consumed pages push out still-unused prefetches.
+class SegmentedLRUPolicy : public CachePolicy {
+public:
+    SegmentedLRUPolicy(Cache& cache, std::uint64_t max_unused_pct = 75);
+    ~SegmentedLRUPolicy() override;
+    void on_access(std::uint64_t context, std::uint64_t page) override;
+    void on_admit(std::uint64_t context, std::uint64_t page, bool is_prefetch) override;
+    void on_evict_request(std::uint64_t context, std::uint64_t page, EvictRequest& request) override;
+    void on_evict(std::uint64_t context, std::uint64_t page) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    std::uint64_t max_unused_pct_;
 };
 
 }  // namespace policy

@@ -612,7 +612,10 @@ uint32_t FwdReadClass::read(uint64_t worker, uint64_t offset, size_t length, voi
         const uint64_t tl0 = nbd::steady_ns();
         std::lock_guard lk(mu_);
         demand_lock_wait_ns_ += nbd::steady_ns() - tl0;
-        if (prefetch_policy_) prefetch_policy_->on_prefetch_request(worker, p0, np, pf);
+        if (prefetch_policy_) {
+            prefetch_policy_->on_request(worker, offset, length, nbd::steady_ns());
+            prefetch_policy_->on_prefetch_request(worker, p0, np, pf);
+        }
         for (uint64_t i = 0; i < np; ++i) {
             const uint64_t page = p0 + i;
             if (cache_.present(page)) {

@@ -66,6 +66,7 @@
 #include "sim.hpp"
 #include "fwd.hpp"
 #include "../policies/policy_api.h"
+#include "../policies/policy_factory.h"
 
 namespace nbd {
 
@@ -695,7 +696,10 @@ Config LoadConfig(const std::string& path) {
   return cfg;
 }
 
-policy::CachePolicy* MakeEvictPolicy(const std::string& name, policy::Cache& cache) {
+policy::CachePolicy* MakeEvictPolicy(const std::string& spec, policy::Cache& cache) {
+  // "name" or "name:key=value,..." (see policies/policy_factory.h)
+  const std::string name = policy::ParseSpec(spec).name;
+  if (name == "lru_seg") return policy::MakeEvictPolicy(spec, cache);
   if (name == "fifo") return new policy::FIFOPolicy(cache);
   if (name == "lifo") return new policy::LIFOPolicy(cache);
   if (name == "lru") return new policy::LRUPolicy(cache);
@@ -706,7 +710,10 @@ policy::CachePolicy* MakeEvictPolicy(const std::string& name, policy::Cache& cac
 }
 
 policy::CachePolicy* MakePrefetchPolicy(const Config& cfg, policy::Cache& cache) {
-  const std::string& name = cfg.prefetch_policy;
+  const std::string name = policy::ParseSpec(cfg.prefetch_policy).name;
+  // new-style specs ("learned", "nextreq:theta=10", "readahead:pages=16", "a+b"): see policies/policy_factory.h
+  if (name == "learned" || name == "nextreq" || name == "neighborhood" || cfg.prefetch_policy.find_first_of(":+") != std::string::npos)
+    return policy::MakePolicy(cfg.prefetch_policy, cache);
   if (name == "readahead") return new policy::ReadaheadPolicy(cache, cfg.readahead_pages);
   if (name == "oracle") return new policy::OraclePolicy(cache, cfg.oracle_file);
   if (name == "model" || name == "model-prefetcher") return new policy::ModelPolicy(
@@ -884,6 +891,9 @@ void AppendLog(const Config& cfg, const Stats& stats,
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
   std::string prefetch_policy = cfg.prefetch_policy == "model-prefetcher" ? cfg.prefetcher_path : cfg.prefetch_policy;
+  for (char& ch : prefetch_policy) if (ch == ',') ch = ';';  // spec params are comma separated; the CSV is too
+  std::string evict_policy_col = cfg.evict_policy;
+  for (char& ch : evict_policy_col) if (ch == ',') ch = ';';
   std::string workload, workload_runtime;
   ReadWorkloadInfo(cfg.vm_log_dir, server_start, &workload, &workload_runtime);
 
@@ -896,7 +906,7 @@ void AppendLog(const Config& cfg, const Stats& stats,
       << cfg.hit_latency_ns << ','
       << cfg.miss_latency_ns << ','
       << cfg.warmup << ','
-      << cfg.evict_policy << ','
+      << evict_policy_col << ','
       << prefetch_policy << ','
       << cfg.latency_mode << ','
       << workload << ','

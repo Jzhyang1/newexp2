@@ -45,10 +45,12 @@ def main():
     ap.add_argument("--data-port", type=int, default=10810)
     ap.add_argument("--mem", default="1G")
     ap.add_argument("--vcpus", type=int, default=2)
-    ap.add_argument("--workload", default="faiss", choices=["faiss", "ycsb"])
+    ap.add_argument("--workload", default="faiss", choices=["faiss", "ycsb", "thesios"])
     ap.add_argument("--ycsb-ops", type=int, default=200000, help="YCSB: operations of the transaction phase (a prefix of the full run)")
     ap.add_argument("--ycsb-workload", default="workloadc")
     ap.add_argument("--ycsb-distribution", default="zipfian")
+    ap.add_argument("--thesios-requests", type=int, default=300000, help="Thesios: trace reads to replay (see tools/capture/build_thesios_disk.py)")
+    ap.add_argument("--thesios-trace", default=os.path.join(ROOT, "disk/data/thesios_trace.csv"))
     ap.add_argument("--n-queries", type=int, default=3000)
     ap.add_argument("--nprobe", type=int, default=8)
     ap.add_argument("--k", type=int, default=10)
@@ -94,6 +96,8 @@ def main():
             shutil.copy(os.path.join(ROOT, "kvm/guest/trace", fn), tools)
     if args.workload == "faiss":
         shutil.copy(args.queries, os.path.join(tools, "queries.npy"))
+    if args.workload == "thesios":
+        shutil.copy(args.thesios_trace, os.path.join(tools, "thesios_trace.csv"))
     meta = json.load(open(args.data_img + ".meta.json"))
     run_cfg = dict(n_queries=args.n_queries, nprobe=args.nprobe, k=args.k, think_us=args.think_us, probe_debug=args.probe_debug, trace=not args.no_trace,
                    sync_tail_offset=meta["tail_offset"], sync_base=0,
@@ -102,6 +106,8 @@ def main():
     if args.workload == "ycsb":
         run_cfg["ycsb"] = dict(workload=args.ycsb_workload, ops=args.ycsb_ops, records=meta["records"], fields=meta["fields"],
                                field_length=meta["field_length"], distribution=args.ycsb_distribution)
+    if args.workload == "thesios":
+        run_cfg["thesios"] = dict(seed=20261007, granule=2 << 20, region_start=1 << 30, requests=args.thesios_requests)
     json.dump(run_cfg, open(os.path.join(tools, "run_config.json"), "w"))
     json.dump(dict(vars(args), meta_file=args.data_img + ".meta.json", mono_start_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC)),
               open(os.path.join(run, "args.json"), "w"), indent=1)

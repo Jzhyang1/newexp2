@@ -16,6 +16,33 @@ that a future reader would otherwise have to reverse-engineer from a diff.
 
 ---
 
+## 2026-11-07 — `learned` prefetcher (nextreq + neighborhood), developed by replaying captured VM streams
+
+**Decision:** added `prefetch_policy: learned[:theta=T]` = `nextreq` (per-stream next-request predictor, byte-exact
+lengths/gaps via the new `CachePolicy::on_request` hook) + `neighborhood` (learned P(page beside a request is requested
+soon), conditioned on request shape, distance, "hole" class and last-seen footprint), plus `lru_seg` eviction. Policy
+values are now specs (`name:k=v`, `a+b`). Evaluation uses `bin/psim` replaying real VM streams (`tools/pf/`).
+**Why:** live VM, 20k FAISS queries / 150k Thesios reads, nbd_server page `hit_ratio` (traffic = pages fetched vs no
+prefetch): FAISS none 30.2%, readahead(512) 69.7% at 53x, quickmine 38.0%, learned+lru_seg 74.3% at 1.7x
+(`theta=30`: 75.6% at 1.8x); Thesios none 8.6%, readahead 70.5% at 24x, quickmine 9.1%, learned+lru_seg 81.1% at 1.8x
+(`theta=30`: 81.4% at 2.0x). Over an emulated 1 ms link the guest's mean query time was 1.77 ms (direct 2.13,
+readahead 1.94) with ~37% less bulk traffic. On random streams (YCSB, GUPS) it adds <=2% traffic (readahead: 16x+).
+Policy cost is ~3-4 us/read on an idle machine (the 100+ us in `policy_s` of the live runs was CPU contention).
+**Alternatives considered (all measured on the stream suite, all dead ends or no better than the above):** fixed
+readahead at any depth (tuned depth is on the frontier for Thesios but floods random traffic and collapses when
+prefetches are late: `--delay 2`); stream tracker with geometric ramp; learned-extent stream tracker (survival curve);
+one big count table; context mixing (7 tables + logistic mixer); burst-aware stream tracker; association mining on top
+(+0.4 pt for +6% traffic); frequency-aware eviction (`lru_freq`, no gain); longer label windows (worse); per-page "seen
+before" memory (no gain). An offline gradient-boosted model with all features gained only 2-3 pts over the online
+tables, so the remaining gap is not modelling: with local information the ceiling is ~80% (FAISS ~85%) because the
+first request of every list visit / new Thesios stream is unpredictable. Belady eviction would add ~11 pts on FAISS but
+reuse distances far exceed the cache. Caveats: nbd_server admits prefetches instantly (real links need `--delay`-style
+lead; learned held up best there); single seed per run.
+**Reference:** `policies/policy_nextreq.cpp`, `policy_neighborhood.cpp`, `policy_lru_seg.cpp`, `policy_factory.h`,
+`tools/pf/`, `logs/pf_live/` (gitignored).
+
+---
+
 ## 2026-08-29 — Delete the synthetic-workload pipeline; NBD/VM path is now the whole project
 
 **Decision:** Removed `app.cpp`, `dat.cpp`, `runner.cpp`, `ldat.cpp`,

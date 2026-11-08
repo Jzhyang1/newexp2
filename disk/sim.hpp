@@ -245,6 +245,7 @@ public:
             cur_req_idx = req_idx;
             if (prefetch_policy) {
                 policy_ns += charge_policy_ns([&]{
+                    prefetch_policy->on_request(worker_id, offset, length, info && info->arrive_ns ? info->arrive_ns : start_ns);
                     prefetch_policy->on_prefetch_request(
                         worker_id, block_offset, block_length, prefetch_req);
                 });

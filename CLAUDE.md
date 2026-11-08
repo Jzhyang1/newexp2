@@ -47,9 +47,11 @@ see the Makefile itself for the full list.
 
 ## Tests, linting, type-checking
 
-**None exist yet.** No test framework, no CI config, no linter config
-anywhere in the repo. Don't invent a test command that isn't there — if
-asked to "run the tests," say there aren't any.
+No test framework, CI config or linter config. The only checks are
+behavioural scripts: `python3 tools/pf/test_policies.py` (synthetic streams
+through the learned prefetch policies, needs `tools/pf/build.sh` first) and
+`python3 disk/test_fwd.py` (see the directory table). Don't invent other test
+commands; if asked to "run the tests," say which of these exist.
 
 ## Directory structure
 
@@ -67,6 +69,10 @@ asked to "run the tests," say there aren't any.
 | `disk/fwd_calibrate.py`, `disk/fwd_report.py` | Emulated-link accuracy check; builds the write-up page from `logs/fwd_dc2`, `logs/fwd_vm` |
 | `policies/policy_api.h`, `policies/cache.cpp` | `Cache` + `CachePolicy` base API |
 | `policies/policy_*.cpp` | Concrete evict/prefetch policies (see glossary for names) |
+| `policies/policy_factory.h` | Spec parser + factory (`name[:k=v,..]`, `a+b` = union) shared by `nbd_server` and `psim`; defines the `learned` preset |
+| `policies/policy_nextreq.cpp`, `policies/policy_neighborhood.cpp` | The learned VM prefetchers (`nextreq`, `neighborhood`; `learned` runs both); `policy_lru_seg.cpp` = `lru_seg` evict |
+| `tools/pf/` | Policy research harness: `psim` (replay a captured VM stream through the real policies in seconds), stream-suite capture, live-VM eval, tests. See `tools/pf/README.md` |
+| `tools/capture/build_thesios_disk.py` | Sparse 8 TiB data disk + condensed trace so `run_capture.py --workload thesios` runs Thesios in a VM without root |
 | `policies/assoc_miner.h` | Shared association-mining engine for cminer/quickmine/mithril |
 | `policies/stream_tracker.h` | Shared stream-detection for the `*_cxt_aware` policy pair |
 | `kvm/launch.py` | Starts/stops/waits-on QEMU VMs from a YAML config |
@@ -123,6 +129,17 @@ asked to "run the tests," say there aren't any.
   `make fwd-experiment` on a quiet machine; the link's RTT/bandwidth are real
   `sleep`s (~60 µs of timer slop each), and `fwd_sim` is a separate binary from
   `nbd_server` (both compile `fwd.cpp`).
+- **Policies see byte-exact requests through `CachePolicy::on_request`**
+  (offset/length in bytes + arrival ns), called just before
+  `on_prefetch_request`, whose arguments are page-granular. `nextreq` needs it
+  (a 120 KiB and a 128 KiB window are the same page count). Callers: `SimReadClass`,
+  `FwdReadClass`, `psim`. New callers of `on_prefetch_request` must call it too.
+- **`bin/psim` and `bin/nbd_server` are built separately** (`tools/pf/build.sh`
+  vs `make nbd`); rebuild both after touching `policies/`. `psim` matched
+  `nbd_server`'s replay of the same stream to 0.01% when last checked.
+- **`prefetch_policy:`/`evict_policy:` accept specs** (`learned:theta=30`,
+  `readahead:pages=16`, `lru_seg:unused=75`); the old `readahead_pages:` key only
+  applies to a bare `readahead`. `,` in a spec is replaced by `;` in the results CSV.
 - The Makefile's `NBD_CONFIG` default (`disk/nbd.yaml`) and `VMS_CONFIG`
   default (`kvm/vms.yaml`) are **regenerated/expected to match each other**
   (same host:port) — if you change one's ports, update the other.

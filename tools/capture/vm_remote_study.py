@@ -33,6 +33,8 @@ MODES = {
     "readahead": ["--fwd-mode", "cache", "--prefetch", "readahead"],
     "stream": ["--fwd-mode", "cache", "--prefetch", "readahead_cxt_aware"],
     "quickmine": ["--fwd-mode", "cache", "--prefetch", "quickmine"],
+    "learned": ["--fwd-mode", "cache", "--prefetch", "learned"],                                   # policies/policy_factory.h
+    "learned_seg": ["--fwd-mode", "cache", "--prefetch", "learned", "--evict", "lru_seg"],
 }
 COLS = ["scenario", "rtt_us", "mode", "rep", "guest_ra_kb", "readahead_pages", "n_queries", "status", "vm_wall_s", "guest_total_s", "query_sum_s",
         "q_mean_ms", "q_p50_ms", "q_p95_ms", "q_p99_ms", "nbd_reads", "remote_demand_reqs", "remote_demand_bytes",

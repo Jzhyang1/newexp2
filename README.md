@@ -140,7 +140,15 @@ file and still copies each fetched page under one lock; that lock is the cost de
 ### policies/
 
 Evict policies (`evict_policy:` in the config): `none`, `fifo`, `lifo`,
-`lru`, `mru`.
+`lru`, `mru`, and `lru_seg[:unused=PCT]` (LRU with a protected FIFO segment for
+prefetched-but-unused pages, so a burst of prefetches doesn't push out pages
+that were about to be read and just-consumed pages don't push out unused
+prefetches; recommended with the learned prefetchers).
+
+Policy values are **specs**: `name`, or `name:key=value,key=value`
+(`readahead:pages=16`, `learned:theta=30`, `lru_seg:unused=75`), and `a+b`
+runs two prefetch policies and prefetches the union. See
+[`policies/policy_factory.h`](policies/policy_factory.h) for every key.
 
 Prefetch policies (`prefetch_policy:`): `none`, `readahead` (fetches the
 next `MAX_PREFETCH_PAGES` pages), and three association-mining policies
@@ -150,6 +158,33 @@ sharing one engine ([`policies/assoc_miner.h`](policies/assoc_miner.h)) —
 each other's associations), and `mithril` (like `cminer`, but skips pages
 that have already gone "hot," reserving mining budget for
 sporadically-recurring pages).
+
+**`learned[:theta=T]`** is the prefetcher tuned for VM workloads (FAISS on-disk
+IVF, the Thesios storage trace). A guest's page cache and readahead have already
+turned the application's accesses into windows (128 KiB mmap read-around, 256 KiB
+/ 1 MiB reads, ...), so the host sees those, in two shapes, and `learned` runs a
+predictor for each, both learning online from the stream itself (no offline
+training, nothing workload-specific):
+
+- `nextreq` ([`policy_nextreq.cpp`](policies/policy_nextreq.cpp)): interleaved
+  sequential streams that advance a burst at a time. Per stream it learns the
+  length of the next request (from byte-exact history: 1 MiB, 256 KiB, 1 MiB, ...),
+  how far past the previous end it starts, and how often a stream in that state is
+  continued at all, and prefetches the pages of the next few predicted requests
+  when that is likely enough. A read only counts as a full hit if the *whole*
+  request is cached, so the unit of prediction is the request, not the page.
+- `neighborhood` ([`policy_neighborhood.cpp`](policies/policy_neighborhood.cpp)):
+  windows that land around a point and fill in around it in no fixed order (mmap
+  read-around). It learns P(page d pages beside a request is requested within the
+  next 32 requests) per request shape, distance and "is this page enclosed by two
+  recent requests", and prefetches the pages above `theta`.
+
+`T` (percent, default 40) is the one knob: lower = more hits and more backend
+traffic. On random traffic (YCSB, GUPS) both learn that nothing near a request
+follows it and stop prefetching (about 1.0x traffic, where `readahead` costs
+16x or more). Design notes, measurements and the dead ends are in
+[`DECISIONS.md`](DECISIONS.md); the replay harness used to develop it is
+[`tools/pf/`](tools/pf/README.md).
 
 `oracle` reads an `nbd_access.csv`-shaped trace from `oracle_file` (default
 `./logs/oracle.csv`) and prefetches the range following the closest request
