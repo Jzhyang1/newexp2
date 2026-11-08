@@ -13,6 +13,7 @@
 // Evict specs: lru, fifo, lifo, mru, lru_cxt_aware, lru_seg[:unused=PCT].
 #include "policy_api.h"
 
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,13 @@ inline CachePolicy* MakeEvictPolicy(const std::string& spec, Cache& cache) {
     if (name == "mru") return new MRUPolicy(cache);
     if (name == "none") return nullptr;
     throw std::runtime_error("unsupported evict policy " + name);
+}
+
+// Hook for analysis-only policies defined outside policies/ (tools/pf/psim.cpp registers `file`, `localoracle`);
+// lets them take part in "a+b" combos. Returns nullptr if it does not know the name.
+inline std::function<CachePolicy*(const std::string&, Cache&)>& ExtraPolicyHook() {
+    static std::function<CachePolicy*(const std::string&, Cache&)> h;
+    return h;
 }
 
 inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std::string& oracle_file = "");
@@ -110,6 +118,7 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
     Spec sp = ParseSpec(spec);
     const std::string& n = sp.name;
     if (n == "none") return nullptr;
+    if (ExtraPolicyHook()) if (CachePolicy* x = ExtraPolicyHook()(spec, cache)) return x;
     if (n == "learned") {
         // one knob: the neighborhood part prefetches pages with P >= theta; the stream part is probability-of-a-
         // whole-request based and runs at a quarter of that (its probabilities are products of several factors)

@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     std::string trace, pol = "none", ev = "lru", label;
     uint64_t page = 65536, cap = 4096, delay = 0, limit = 0, warm = 0, skip = 0, tail_off = 0;
     bool csv = false, header = false;
-    std::string dump_path, dumpreq_path;
+    std::string dump_path, dumpreq_path, clip_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -202,6 +202,7 @@ int main(int argc, char** argv) {
         else if (a == "--header") header = true;
         else if (a == "--dump") dump_path = next();
         else if (a == "--dump-req") dumpreq_path = next();
+        else if (a == "--clip") clip_path = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (header) {
@@ -218,6 +219,14 @@ int main(int argc, char** argv) {
         reqs.swap(f);
     }
 
+    // --clip F: binary {u64 lo_page, u64 hi_page} intervals (sorted, disjoint) = extents of the objects (files) being read.
+    // Analysis of "what if the policy knew where each file ends": prefetches triggered by a request are cut to its extent.
+    std::vector<std::pair<uint64_t, uint64_t>> clip;
+    if (!clip_path.empty()) {
+        FILE* cf = std::fopen(clip_path.c_str(), "rb"); uint64_t v[2];
+        while (cf && std::fread(v, 8, 2, cf) == 2) clip.emplace_back(v[0], v[1]);
+        if (cf) std::fclose(cf);
+    }
     Cache cache(cap, 30000, 300000, page);
     CachePolicy* evict = ev == "belady" ? (CachePolicy*)new BeladyEvict(cache, reqs) : MakeEvictPolicy(ev, cache);
     std::string oracle_file;
@@ -228,10 +237,16 @@ int main(int argc, char** argv) {
         for (auto& r : reqs) std::fprintf(o, "%llu,%llu,%llu,0,0\n", (unsigned long long)r.worker, (unsigned long long)r.off, (unsigned long long)r.len);
         std::fclose(o);
     }
-    CachePolicy* pf;
-    if (pol.rfind("localoracle", 0) == 0) { Spec sp = ParseSpec(pol); pf = new LocalOracle(cache, reqs, sp.get("w", 64), sp.get("d", 256)); }
-    else if (pol.rfind("file", 0) == 0) { Spec sp = ParseSpec(pol); std::string fp; { auto c = pol.find("path="); auto e = pol.find(',', c); fp = pol.substr(c + 5, e == std::string::npos ? e : e - c - 5); } pf = new FilePolicy(cache, fp, sp.get("theta", 40) / 100.f); }
-    else pf = MakePolicy(pol, cache, oracle_file);
+    ExtraPolicyHook() = [&](const std::string& spec, Cache& c) -> CachePolicy* {
+        Spec sp = ParseSpec(spec);
+        if (sp.name == "localoracle") return new LocalOracle(c, reqs, sp.get("w", 64), sp.get("d", 256));
+        if (sp.name == "file") {
+            auto k = spec.find("path="); auto e = spec.find(',', k);
+            return new FilePolicy(c, spec.substr(k + 5, e == std::string::npos ? e : e - k - 5), sp.get("theta", 40) / 100.f);
+        }
+        return nullptr;
+    };
+    CachePolicy* pf = MakePolicy(pol, cache, oracle_file);
 
     // last request index touching each page: lets us split unused prefetches into "never requested again" (futile)
     std::unordered_map<uint64_t, uint64_t> last_use;
@@ -315,6 +330,19 @@ int main(int argc, char** argv) {
             }
             if (evict) evict->on_access(r.worker, pg);
             if (pf) pf->on_access(r.worker, pg);
+        }
+        if (!clip.empty()) {
+            auto it = std::upper_bound(clip.begin(), clip.end(), std::make_pair(b0, UINT64_MAX));
+            uint64_t clo = 0, chi = UINT64_MAX;
+            if (it != clip.begin() && std::prev(it)->second >= b0) { clo = std::prev(it)->first; chi = std::prev(it)->second; }
+            uint64_t kept = 0;
+            for (uint64_t i = 0; i < preq->fetch_count; ++i) {
+                FetchRange fr = preq->fetch_ranges[i];
+                uint64_t lo = std::max(fr.block_offset, clo), hi = std::min(fr.block_offset + fr.block_length - 1, chi);
+                if (hi < lo || hi == UINT64_MAX - 1) continue;
+                preq->fetch_ranges[kept++] = FetchRange{lo, hi - lo + 1};
+            }
+            preq->fetch_count = kept;
         }
         for (uint64_t i = 0; i < preq->fetch_count; ++i) {
             const FetchRange& fr = preq->fetch_ranges[i];
