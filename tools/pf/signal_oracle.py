@@ -171,3 +171,61 @@ def write_hints(name, with_aux):
                 aux = int(round(float(resid_frac[k, l]) * 15)) if with_aux else 255
                 f.write(struct.pack("<QQQII", i, a, b - a + 1, aux, 0))
 write_hints("hints_faiss", True); write_hints("hints_faiss_noaux", False)
+
+# ---------------- no application hint: predict the probe lists from what a guest agent can see without touching the app ----------------
+# Observations: the sequence of lists the application touches (visible to a guest agent from page-fault / mincore tracing, NOT from an
+# app hook), query boundaries (idle gaps) and per-list page-cache residency (mincore, app independent).  Prediction = the lists
+# that co-occurred with the lists seen so far in earlier queries ("topic"), plus the previous queries' lists (session continuity),
+# minus lists the guest already holds.  Delivered when the query starts (m=0) and after its first list (m=1).
+from collections import defaultdict
+co = defaultdict(lambda: defaultdict(float))
+first_i = {}
+for i in range(len(r)):
+    k = qi[i]
+    if k >= 0 and k not in first_i: first_i[k] = i
+def predict(k, seen, K, rf):
+    sc = defaultdict(float)
+    for back, w in ((1, 1.0), (2, .6), (3, .4), (4, .3)):
+        if k - back >= 0:
+            for l in lists_of[k - back]: sc[l] += w * 0.3
+    for a in seen:
+        for b, c in co[a].items(): sc[b] += c
+    for a in seen: sc.pop(a, None)
+    cand = [l for l in sorted(sc, key=sc.get, reverse=True) if rf(k, l)]
+    return cand[:K]
+def build_noapp(name, K, m_stages, rf, decay=1.0):
+    co.clear()
+    with open(out + name + ".bin", "wb") as f:
+        for k in range(len(q)):
+            if k in first_i:
+                i0 = first_i[k]
+                for m in m_stages:
+                    cands = predict(k, list(lists_of[k][:m]), K, rf)
+                    for l in cands:
+                        a, b = pages(l)
+                        f.write(struct.pack("<QQQII", i0, a, b - a + 1, int(round(float(resid_frac[k, l]) * 14)), 0))
+            for a in lists_of[k]:
+                for b in lists_of[k]:
+                    if a != b: co[a][b] += 1.0
+for K in (4, 8, 16):
+    build_noapp(f"noapp_k{K}_m01", K, (0, 1), lambda k, l: resid_frac[k, l] < 0.5)
+build_noapp("noapp_k8_m01_nofilter", 8, (0, 1), lambda k, l: True)
+
+# ceiling of predicting the *host-visible* lists of a query (the ones that actually need a prefetch) from earlier host-visible lists only
+hv = [sorted(need.get(k, ()), key=lambda l: pages(l)[0]) for k in range(len(q))]
+co2 = defaultdict(lambda: defaultdict(float)); rec = {K: [] for K in (4, 8, 16, 32)}; nh = []
+for k in range(len(q)):
+    if k > 2000 and len(hv[k]) >= 2:
+        first = hv[k][0]; rest = set(hv[k][1:])
+        sc = defaultdict(float)
+        for b, c in co2[first].items(): sc[b] += c
+        for back in range(1, 6):
+            for l in hv[k - back]: sc[l] += 0.2 / back
+        sc.pop(first, None)
+        ranked = sorted(sc, key=sc.get, reverse=True)
+        for K in rec: rec[K].append(len(set(ranked[:K]) & rest) / len(rest))
+        nh.append(len(rest))
+    for a in hv[k]:
+        for b in hv[k]:
+            if a != b: co2[a][b] += 1
+print("host-visible lists per query (when >=2): mean remaining", np.mean(nh), " recall of the remaining host-visible lists given the first one, K =", {K: round(float(np.mean(v)), 3) for K, v in rec.items()})
