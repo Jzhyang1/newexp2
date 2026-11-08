@@ -65,6 +65,13 @@ public:
         (void)byte_length;
         (void)arrive_ns;
     }
+    // An application hint: "pages [first_page, first_page + npages) will be read soon" (cache-page units).  `aux` is
+    // an optional guest-side annotation, 255 = none; 0..15 = what fraction of the range (in sixteenths) the guest page
+    // cache already holds (mincore).  Pages the policy appends to `request` are prefetched immediately.
+    virtual void on_hint(uint64_t context, std::uint64_t first_page, std::uint64_t npages, std::uint32_t aux,
+                         PrefetchRequest& request) {
+        (void)context; (void)first_page; (void)npages; (void)aux; (void)request;
+    }
     virtual void on_prefetch_request(uint64_t context, std::uint64_t block_offset,
                                      std::uint64_t block_length, PrefetchRequest& request) {
         (void)context;
@@ -394,6 +401,14 @@ public:
     void on_request(std::uint64_t c, std::uint64_t off, std::uint64_t len, std::uint64_t t) override {
         for (auto& x : parts_) x->on_request(c, off, len, t);
     }
+    void on_hint(std::uint64_t c, std::uint64_t first, std::uint64_t n, std::uint32_t aux, PrefetchRequest& out) override {
+        out.fetch_count = 0;
+        for (auto& x : parts_) {
+            PrefetchRequest r;
+            x->on_hint(c, first, n, aux, r);
+            for (std::uint64_t i = 0; i < r.fetch_count && out.fetch_count < MAX_PREFETCH_PAGES; ++i) out.fetch_ranges[out.fetch_count++] = r.fetch_ranges[i];
+        }
+    }
     void on_prefetch_request(std::uint64_t c, std::uint64_t b0, std::uint64_t bn, PrefetchRequest& out) override {
         out.fetch_count = 0;
         for (auto& x : parts_) {
@@ -422,6 +437,32 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::uint64_t max_unused_pct_;
+};
+
+// Application-hint prefetcher with a learned filter (policy_hint.cpp).  A hint says what will be read; the hard part is
+// that many hinted ranges never reach the host (the guest page cache already holds them), so fetching all of them is
+// mostly wasted traffic.  Each hinted range is proposed only if a count table learned online says ranges *like it* did
+// produce host requests: popularity (how often this range was hinted before), the guest's own residency annotation
+// (`aux`), size, and whether the host saw the range requested recently.  Label = a host request touches the range
+// within `window` requests of the hint.  With `filter=0` everything hinted is fetched (the oracle-recall setting).
+class HintPolicy : public CachePolicy {
+public:
+    struct Params {
+        std::uint64_t theta_pct = 30;     // fetch a hinted range if P(reaches host) >= theta
+        std::uint64_t window = 256;       // host requests a hint stays open for labelling
+        std::uint64_t filter = 1;         // 0 = fetch every hinted range
+        std::uint64_t bucket_pages = 1;   // hinted ranges are identified by first_page / bucket_pages (popularity key)
+        std::uint64_t prior_trials = 4;
+        std::uint64_t prior_pct = 50;
+    };
+    HintPolicy(Cache& cache, const Params& params);
+    ~HintPolicy() override;
+    void on_hint(std::uint64_t context, std::uint64_t first_page, std::uint64_t npages, std::uint32_t aux, PrefetchRequest& request) override;
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace policy

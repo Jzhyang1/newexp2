@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     std::string trace, pol = "none", ev = "lru", label;
     uint64_t page = 65536, cap = 4096, delay = 0, limit = 0, warm = 0, skip = 0, tail_off = 0;
     bool csv = false, header = false;
-    std::string dump_path, dumpreq_path, clip_path;
+    std::string dump_path, dumpreq_path, clip_path, hints_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump_path = next();
         else if (a == "--dump-req") dumpreq_path = next();
         else if (a == "--clip") clip_path = next();
+        else if (a == "--hints") hints_path = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (header) {
@@ -226,6 +227,14 @@ int main(int argc, char** argv) {
         FILE* cf = std::fopen(clip_path.c_str(), "rb"); uint64_t v[2];
         while (cf && std::fread(v, 8, 2, cf) == 2) clip.emplace_back(v[0], v[1]);
         if (cf) std::fclose(cf);
+    }
+    // --hints F: binary records {u64 request idx, u64 first_page, u64 npages, u32 aux, u32 pad}: delivered to on_hint before that request
+    struct Hint { uint64_t i, first, n; uint32_t aux, pad; };
+    std::vector<Hint> hints; size_t hpos = 0;
+    if (!hints_path.empty()) {
+        FILE* hf = std::fopen(hints_path.c_str(), "rb"); Hint h;
+        while (hf && std::fread(&h, sizeof h, 1, hf) == 1) hints.push_back(h);
+        if (hf) std::fclose(hf);
     }
     Cache cache(cap, 30000, 300000, page);
     CachePolicy* evict = ev == "belady" ? (CachePolicy*)new BeladyEvict(cache, reqs) : MakeEvictPolicy(ev, cache);
@@ -299,6 +308,18 @@ int main(int argc, char** argv) {
         uint64_t b0 = r.off / page;
         uint64_t bn = (r.off + r.len - 1) / page - b0 + 1;
         const uint64_t b1x = b0 + bn - 1;
+        // hints addressed to this request: their pages are prefetched before the request is served
+        PrefetchRequest hreq;
+        while (hpos < hints.size() && hints[hpos].i <= idx) {
+            if (pf) {
+                PrefetchRequest hr;
+                pf->on_hint(r.worker, hints[hpos].first, hints[hpos].n, hints[hpos].aux, hr);
+                for (uint64_t k = 0; k < hr.fetch_count; ++k)
+                    for (uint64_t pg = hr.fetch_ranges[k].block_offset; pg < hr.fetch_ranges[k].block_offset + hr.fetch_ranges[k].block_length; ++pg)
+                        if (admit(r.worker, pg, true) && count) ++pf_pages;
+            }
+            ++hpos;
+        }
         PrefetchRequest* preq = new PrefetchRequest();
         if (pf) {
             auto ta = std::chrono::steady_clock::now();

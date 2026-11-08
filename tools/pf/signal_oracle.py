@@ -157,3 +157,17 @@ for M in (3, 6, 12, 24):
             for l in lists_of[k]: cnt[l] = cnt.get(l, 0) + 1
         return out_
     write(f"probe_pop{M}", fnp)
+
+# --- hint files for psim --hints: one hint per probed list at the first host request of its query (the app knows the lists at q_begin)
+def write_hints(name, with_aux):
+    first_i = {}
+    for i in range(len(r)):
+        k = qi[i]
+        if k >= 0 and k not in first_i: first_i[k] = i
+    with open(out + name + ".bin", "wb") as f:
+        for k, i in sorted(first_i.items(), key=lambda x: x[1]):
+            for l in lists_of[k]:
+                a, b = pages(l)
+                aux = int(round(float(resid_frac[k, l]) * 15)) if with_aux else 255
+                f.write(struct.pack("<QQQII", i, a, b - a + 1, aux, 0))
+write_hints("hints_faiss", True); write_hints("hints_faiss_noaux", False)

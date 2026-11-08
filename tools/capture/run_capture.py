@@ -51,6 +51,11 @@ def main():
     ap.add_argument("--ycsb-distribution", default="zipfian")
     ap.add_argument("--thesios-requests", type=int, default=300000, help="Thesios: trace reads to replay (see tools/capture/build_thesios_disk.py)")
     ap.add_argument("--thesios-trace", default=os.path.join(ROOT, "disk/data/thesios_trace.csv"))
+    ap.add_argument("--hints", default="", choices=["", "on", "aux"],
+                    help="application hint channel (3rd NBD disk, vdc): 'on' = the workload tells the host what it will read next "
+                         "(FAISS: the query's probe lists; Thesios: the next --hint-k reads); 'aux' also reports guest page-cache residency (mincore)")
+    ap.add_argument("--hint-k", type=int, default=4, help="Thesios: hint the read this many reads ahead")
+    ap.add_argument("--hint-port", type=int, default=0)
     ap.add_argument("--n-queries", type=int, default=3000)
     ap.add_argument("--nprobe", type=int, default=8)
     ap.add_argument("--k", type=int, default=10)
@@ -96,6 +101,13 @@ def main():
             shutil.copy(os.path.join(ROOT, "kvm/guest/trace", fn), tools)
     if args.workload == "faiss":
         shutil.copy(args.queries, os.path.join(tools, "queries.npy"))
+        if args.hints:   # list -> byte range on the data disk, for the guest's hint shim (what a guest agent gets from FIEMAP)
+            sys.path.insert(0, os.path.join(ROOT, "tools/capture"))
+            import capture_lib
+            _meta = json.load(open(args.data_img + ".meta.json"))
+            _lay = capture_lib.Layout(args.data_img, _meta)
+            json.dump(dict(start=[int(x) for x in _lay.list_disk_start], nbytes=[int(x) for x in _lay.list_bytes],
+                           file_off=[int(x[0]) for x in _meta["list_offset_size_codesize"]]), open(os.path.join(tools, "lists_dev.json"), "w"))
     if args.workload == "thesios":
         shutil.copy(args.thesios_trace, os.path.join(tools, "thesios_trace.csv"))
     meta = json.load(open(args.data_img + ".meta.json"))
@@ -106,6 +118,8 @@ def main():
     if args.workload == "ycsb":
         run_cfg["ycsb"] = dict(workload=args.ycsb_workload, ops=args.ycsb_ops, records=meta["records"], fields=meta["fields"],
                                field_length=meta["field_length"], distribution=args.ycsb_distribution)
+    if args.hints:
+        run_cfg["hints"] = dict(mode=args.hints, k=args.hint_k)
     if args.workload == "thesios":
         run_cfg["thesios"] = dict(seed=20261007, granule=2 << 20, region_start=1 << 30, requests=args.thesios_requests)
     json.dump(run_cfg, open(os.path.join(tools, "run_config.json"), "w"))
@@ -147,6 +161,10 @@ def main():
                   overlay_dir=run, log=os.path.join(run, "results.csv"), access_log=os.path.join(run, "access.csv"),
                   prefetch_log=os.path.join(run, "prefetch.csv"), vm_log_dir=run)
 
+    if args.hints:
+        args.hint_port = args.hint_port or args.data_port + 1000
+        with open(cfg_data, "a") as c:
+            c.write(f"hint_port: {args.hint_port}\n")
     servers = []
     for name, cfg in (("root", cfg_root), ("data", cfg_data)):
         errf = open(os.path.join(run, f"nbd_{name}.log"), "w")
@@ -167,6 +185,7 @@ def main():
             "-device", "virtio-blk-pci,drive=d0,bootindex=1",
             "-drive", f"driver=nbd,host=127.0.0.1,port={args.data_port},if=none,id=d1,cache=none",
             "-device", "virtio-blk-pci,drive=d1",
+            *(["-drive", f"driver=nbd,host=127.0.0.1,port={args.hint_port},if=none,id=d2,cache=none", "-device", "virtio-blk-pci,drive=d2"] if args.hints else []),
             "-nic", "none", "-display", "none", "-no-reboot",
             "-virtfs", f"local,id=tools,path={tools},mount_tag=tools,security_model=none,readonly=on",
             "-virtfs", f"local,id=out,path={out},mount_tag=out,security_model=none",

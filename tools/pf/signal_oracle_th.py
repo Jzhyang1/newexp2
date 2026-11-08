@@ -32,9 +32,8 @@ n_app = len(app); ptr = 0; owner = np.full(len(f), -1)
 for i, o in enumerate(f.offset.values):
     c = idx.get(o // G)
     if not c: continue
-    fwd = [j for j in c if j >= ptr - 20]
-    j = min(fwd) if fwd else max(c)
-    owner[i] = j; ptr = max(ptr, j)
+    j = min(c, key=lambda x: (x < ptr - 5, abs(x - ptr)))      # the candidate read closest to the pointer (forward preferred)
+    owner[i] = j; ptr = j
 print("host requests", len(f), "mapped", np.mean(owner >= 0))
 for K in (1, 4, 16, 64):
     with open(out + f"th_next{K}.bin", "wb") as fo:
@@ -59,3 +58,17 @@ for a, b in iv:   # overlapping files (hash collisions) merge: the extent is the
 with open(out + "th_clip.bin", "wb") as fo:
     for a, b in merged: fo.write(struct.pack("<QQ", max(a, 0), b))
 print("files", len(ext), "extents", len(merged))
+
+# hint files for psim --hints: the app hints read n+K when it issues read n (whether or not read n reaches the host), delivered
+# before the first host request owned by a read >= n
+first_i = np.full(n_app + 1, len(f), dtype=np.int64)
+for i in range(len(f) - 1, -1, -1):
+    if owner[i] >= 0: first_i[owner[i]] = i              # first host request attributed to each app read
+first_i = np.minimum.accumulate(first_i[::-1])[::-1]     # reads that never reach the host inherit the next one's position
+for K in (1, 4, 16):
+    with open(out + f"hints_th{K}.bin", "wb") as fo:
+        for n in range(n_app - K):
+            i = int(first_i[n])
+            if i >= len(f): break
+            a, b = ao[n + K] // PG, (ao[n + K] + al[n + K] - 1) // PG
+            fo.write(struct.pack("<QQQII", i, a, b - a + 1, 255, 0))

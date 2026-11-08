@@ -382,6 +382,20 @@ public:
         return bytes_got;
     }
 
+    // Application hint (see BlockReadClass::hint): the policy proposes pages, which are admitted at once.
+    void hint(uint64_t worker_id, uint64_t first_byte, uint64_t nbytes, uint32_t aux) override {
+        if (!prefetch_policy || nbytes == 0) return;
+        const std::uint64_t psz = cache.page_size;
+        const std::uint64_t first = first_byte / psz, n = (first_byte + nbytes - 1) / psz - first + 1;
+        std::lock_guard _{mu};
+        policy::PrefetchRequest req;
+        prefetch_policy->on_hint(worker_id, first, n, aux, req);
+        for (uint64_t i = 0; i < req.fetch_count; ++i) add_to_cache(worker_id, req.fetch_ranges[i], true, true);
+        ++hints_seen;
+        for (uint64_t i = 0; i < req.fetch_count; ++i) hint_pages += req.fetch_ranges[i].block_length;
+    }
+    uint64_t hints_seen{0}, hint_pages{0};
+
     // Start the worker's think-time clock. Done here (after the physical miss
     // delay and the socket write) rather than at the end of read(), so
     // neither counts as worker time. Runs during warmup too, so the first

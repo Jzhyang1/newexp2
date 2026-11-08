@@ -72,11 +72,27 @@ def main():
     mark(f"APP load_done dt={time.time()-t0:.3f} nlist={index.nlist} ntotal={index.ntotal}")
     snapshot("start")
     nq = len(q)
+    hinter = mincore = lists_dev = None
+    if cfg.get("hints"):
+        sys.path.insert(0, "/tmp/tools")
+        import hints
+        hinter = hints.Hinter()
+        lists_dev = json.load(open("/tmp/tools/lists_dev.json"))
+        if cfg["hints"]["mode"] == "aux":
+            mincore = hints.Mincore("/tmp/data/index.ivfdata")
     lat = []
     digest = hashlib.sha256()   # over every query's returned ids+distances: proves the disk path returned the right bytes
     for i in range(nq):
         qi = q[i:i + 1]
         _, lists = index.quantizer.search(qi, cfg["nprobe"])     # which lists this query will read
+        if hinter:           # the query's probe lists are known before any list is read
+            for l in lists[0]:
+                l = int(l)
+                aux = 15
+                if mincore:
+                    fr = mincore.resident_fraction(lists_dev["file_off"][l], lists_dev["nbytes"][l])
+                    aux = 15 if fr is None else min(14, int(fr * 14 + 0.5))
+                hinter.hint(lists_dev["start"][l], lists_dev["nbytes"][l], aux)
         mark("APP q_begin i=%d lists=%s" % (i, ",".join(str(int(x)) for x in lists[0])))
         t1 = time.perf_counter()
         dist, ids = index.search(qi, cfg["k"])

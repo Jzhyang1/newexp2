@@ -143,3 +143,123 @@ S=logs/pf_signals
 bin/psim --trace $S/trace.csv --policy "learned+file:path=$S/probe_resid80.bin,theta=50" --evict lru_seg
 bin/psim --trace $S/th_trace.csv --policy "learned+file:path=$S/th_next4.bin,theta=50" --evict lru_seg
 ```
+
+---
+
+# Part 2: hints as a real channel, degradation, and a learned traffic filter
+
+Following the plan "hit rate first, traffic is a separate filtering problem", the oracle files of part 1 were replaced by a
+real mechanism: `CachePolicy::on_hint(first_page, npages, aux)`, a hint-consuming policy (`hint`, `policies/policy_hint.cpp`)
+and, for the live runs, an in-band hint channel.
+
+## 6. Hint-consuming policy with a learned filter (offline, `psim --hints`)
+
+`hint` fetches a hinted range only if a count table learned online says ranges *like it* reached the host. Features:
+popularity (times this range was hinted), the guest's own residency annotation `aux` (from `mincore`, quartiles), size,
+and whether the host saw the range requested recently. Label: a host request touches the range within 256 requests.
+No oracle data: hints are one per probed list, delivered at query start, exactly what the guest shim sends.
+
+FAISS (20k-query traced run), always in union with `learned`, `lru_seg`:
+
+| configuration | full hit | traffic (pages) |
+|---|---|---|
+| `learned` alone | 74.2% | 65.8K |
+| hints, **no filter** (fetch every hinted list) | 83.0% | 93.5K |
+| hints + learned filter, no residency annotation, theta 20 / 30 / 40 | 80.7 / 80.2 / 79.7% | 70.8 / 68.5 / 67.6K |
+| **hints + learned filter + `aux` (mincore residency)**, theta 20..50 | **83.1%** | **67.0K** (all thetas) |
+
+* Fetching every hinted list gives +8.8 points but +42% traffic. The filter with only popularity/recency/size features
+  keeps 70% of that gain (+6.5 points) for +4% traffic.
+* With the guest's `mincore` residency annotation the filter is essentially perfect: **the whole +8.9 points at
+  `learned`'s own traffic** (traffic is insensitive to theta because the annotation is nearly deterministic). This is
+  better than the part-1 oracle (80.1%) because hints arrive before the query's first request and cover its first list too.
+
+## 7. Degrading the hints (how fragile is the gain?)
+
+`tools/pf/degrade_hints.py` applies channel latency (delay in host requests), noise (a fraction of hint groups point at the
+right-sized range in the wrong place) and loss (only a fraction of groups exist) to the oracle prediction files of part 1
+(`learned+file:...`; no filter; FAISS = exact-residency probe oracle, Thesios = next 4 reads).
+
+| degradation | FAISS hit / traffic | Thesios hit / traffic |
+|---|---|---|
+| none | 80.1% / 66.4K | 94.8% / 2066K |
+| delay 1 / 3 / 10 requests | 79.0 / 77.4 / 74.8% (same traffic) | 94.4 / 93.0 / 87.8% |
+| 25% wrong-place hints | 79.7% / 86.6K | 92.7% / 2857K |
+| 50% wrong-place hints | 79.0% / 105.7K | 89.5% / 3581K |
+| only 50% of hints delivered | 78.9% / 66.3K | 90.7% / 1939K |
+
+* **Hit rate is robust, traffic is not.** Half the hints wrong costs 1 (FAISS) to 5 (Thesios) points of hit but adds
+  60-70% traffic: wrong hints are pure waste. That is the case for the filter, and the reason traffic was split out.
+* **Latency matters more than noise for hits**: ten requests of delay costs 5-7 points (the hint must beat the first
+  request of its range; FAISS hints come ~1 ms ahead of the first list read).
+
+Caveat: in this part the delay unit is host requests, not time; the live channel below has real latency.
+
+## 8. The in-band hint channel
+
+* **Wire format.** `nbd_server` gets a second NBD port (`hint_port: N` in the config; `run_capture.py --hints on|aux`
+  adds it as a third virtio disk, `/dev/vdc`, size 2^50). A hint is a 512-byte O_DIRECT read at byte offset
+  `512 * payload`, `payload = (page4k << 8) | (lenclass << 4) | aux`; the reply is zeros. `HintReader` (`disk/nbd.cpp`)
+  decodes it and calls `SimReadClass::hint` -> `policy->on_hint`, and the pages the policy proposes are admitted at once.
+  In-band, so no vsock/virtio-serial is needed and hints interleave with data reads in the same order the app issued them.
+* **Guest shim** `kvm/guest/trace/hints.py`: `Hinter` (sends hints) and `Mincore` (fraction of a file range resident in the
+  guest page cache, via `mincore(2)` on a shared mapping of the same file faiss mmaps; no tracing needed).
+  FAISS: after `quantizer.search`, before the query reads anything: one hint per probed list (device byte range
+  precomputed from the extent map; a real agent would get it from `FIEMAP`). Thesios: when read n is issued, hint read n+K.
+* A hint costs the app one extra NBD round trip (~tens of microseconds); the live runs use the simulated-latency mode, so
+  guest timings are not meaningful for that cost (see Caveats).
+
+## 9. Live VM results with the hint channel
+
+Real QEMU guests, the in-band channel of section 8, `lru_seg`, nbd_server's own hit ratio and reads-fully-cached
+(`logs/pf_live/h_*`; `tools/pf/live_hints.sh`, aux runs re-run after fixing a `mincore` zero-length bug). Traffic = pages admitted
+to the cache (`cache.csv`) relative to the no-prefetch run of the same workload (FAISS 34.8K, Thesios 927K); runs have
+19.4-21K / 167K host reads. Result hashes of the FAISS runs match the no-hint run (`RESULT_SHA256`), i.e. the hints did not
+change what the application computed.
+
+FAISS, 20k queries, 1 GiB guest:
+
+| policy | hit ratio | full hit | traffic |
+|---|---|---|---|
+| none | 30.2% | 15.5% | 1.00x |
+| `learned` (no hints) | 74.3% | 72.8% | 1.66x |
+| `learned` + hints, **no filter** | 95.6% | 89.8% | 4.97x |
+| `learned` + hints + learned filter (theta 30), no residency annotation | 89.4% | 84.6% | 1.73x |
+| `learned` + hints + **`mincore` residency annotation, no filter** | 95.5% | 89.3% | 4.97x |
+| **`learned` + hints + `mincore` annotation + learned filter (theta 30)** | **95.5%** | **89.8%** | **1.74x** |
+
+Thesios, 150k reads, 2 GiB guest, hint = the read K ahead:
+
+| policy | hit ratio | full hit | traffic |
+|---|---|---|---|
+| none | 8.6% | 6.1% | 1.00x |
+| `learned` (no hints) | 81.1% | 73.5% | 1.80x |
+| `learned` + hint K=1 | 99.7% | 99.5% | 1.87x |
+| `learned` + hint K=4 | 99.7% | 99.5% | 1.86x |
+| `learned` + hint K=16 | 99.6% | 99.4% | 1.87x |
+| `learned` + hint K=4 + learned filter | 99.7% | 99.4% | 1.86x |
+
+* **FAISS: +21 points of hit ratio (74 -> 95.5%) at essentially `learned`'s traffic**, but only with both halves: the hint says
+  *what* will be read, the `mincore` annotation says *which of it the guest already has*. Without the annotation the filter
+  recovers 15 of the 21 points; without the filter the traffic is 5x.
+* **Thesios: 99.5% of reads fully cached** (was 73.5%) for +4% traffic over `learned` (hint K=1..16 are equivalent; one read of
+  lookahead is enough in this simulation because prefetches are instant). The filter has nothing to remove: every hinted
+  read was needed (the guest rarely holds a Thesios range). The offline oracle (section 2, 95-98%) understated this because
+  of the imperfect host-request-to-application-read alignment.
+* This is the "hit rate with and without oracle information" answer: **without any hint ~74% (FAISS) / 81% (Thesios) hit
+  ratio; with a realistic in-band hint 95.5% / 99.7%.** Everything here is gatherable with an application hook plus a
+  `mincore` call, no kernel tracing.
+
+## 10. Caveats of Part 2
+
+* Prefetches are instant (nbd_server's simulated mode), so lead time is free; the delay study of section 7 shows how
+  hit rate falls when hints are late. Guest timings in these runs are dominated by the hint round trips (FAISS query mean
+  3.2 ms vs 2.2 ms without; 127 s vs 52 s per run) and say nothing about real latency: hints are synchronous O_DIRECT reads
+  from the application's thread. A real shim would batch or send them asynchronously.
+* The hint source is the application's own plan (FAISS's quantizer output, the trace's next reads): an upper-bound-quality
+  hint. A coarser hint (only one list, only some reads) is covered by the degradation study, not re-run live.
+* Single runs; FAISS 20k queries and Thesios 150k reads per cell. The `mincore` annotation changes nothing the
+  application sees but its cost (one syscall per probed list) is not charged here.
+* The learned filter's features were chosen from the part-1 sweep (popularity, residency, recency, size); it was not tuned
+  per workload. Other `SIGNALS.md` rows (cgroup, ioprio, HW counters, guest rq flags) were not collected: the capture shows
+  no signal in the host-visible ones, and the rest need privileges this machine lacks.

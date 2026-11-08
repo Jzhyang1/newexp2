@@ -485,6 +485,33 @@ int Listen(uint16_t port) {
   return listen_fd;
 }
 
+// The hint channel.  A second NBD device (`hint_port`) of 2^50 bytes whose reads are not data but application hints: a
+// 512-byte read at byte offset 512 * payload with payload = (page4k << 8) | (lenclass << 4) | aux, where page4k is the
+// 4 KiB block of the data disk the application is about to read, lenclass indexes kHintLen (4 KiB units) and aux is
+// 0..14 (guest-reported residency) or 15 (none).  The reply is zeros.  In-band, so any guest that can read a block
+// device can send hints, and the hints share the request stream's ordering.
+static const uint32_t kHintLen[16] = {1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384};
+class HintReader : public BlockReadClass {
+ public:
+  HintReader(BlockReadClass* inner, uint64_t worker) : inner_(inner), worker_(worker) {}
+  uint32_t read(uint64_t, uint64_t offset, size_t length, void* buf, uint64_t* miss_blocks = nullptr,
+                const ReqInfo* = nullptr) override {
+    std::memset(buf, 0, length);
+    if (miss_blocks) *miss_blocks = 0;
+    const uint64_t payload = offset / 512;
+    const uint32_t aux = payload & 15, cls = (payload >> 4) & 15;
+    const uint64_t page4k = payload >> 8;
+    inner_->hint(worker_, page4k * 4096, static_cast<uint64_t>(kHintLen[cls]) * 4096, aux == 15 ? 255 : aux);
+    return static_cast<uint32_t>(length);
+  }
+  void drain() override {}
+  const Stats& get_stats() override { return stats_; }
+ private:
+  BlockReadClass* inner_;
+  uint64_t worker_;
+  Stats stats_;
+};
+
 // Accepts connections on `listen_fd` forever; every connection accepted here
 // is tagged with the same `worker_id` (this port's index in the config's
 // `ports:` list), so the simulator can tell clients apart by which port they
@@ -547,6 +574,7 @@ struct Config {
   std::string remote_host = "127.0.0.1";
   uint16_t remote_port = 0;
   std::string fwd_mode = "cache";        // direct (every read crosses the link) | cache (local cache + evict/prefetch policy)
+  uint16_t hint_port = 0;                 // 0 = no hint channel; else an extra NBD port whose reads are application hints (see HintReader)
   uint32_t read_concurrency = 8;         // reads served in parallel per connection, any source (1 = one at a time)
   unsigned fwd_prefetch_threads = 4;     // background fetchers (cache mode)
   uint64_t fwd_local_read_ns = 0;        // modeled local-cache-device latency per request (cache mode)
@@ -616,6 +644,8 @@ Config LoadConfig(const std::string& path) {
       cfg.remote_host = value;
     } else if (key == "remote_port") {
       cfg.remote_port = static_cast<uint16_t>(std::stoul(value));
+    } else if (key == "hint_port") {
+      cfg.hint_port = static_cast<uint16_t>(std::stoul(value));
     } else if (key == "read_concurrency") {
       cfg.read_concurrency = static_cast<uint32_t>(std::max<unsigned long>(1, std::stoul(value)));
     } else if (key == "fwd_mode") {
@@ -1124,6 +1154,14 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < cfg.ports.size(); ++i) {
     std::thread(nbd::AcceptLoop, listen_fds[i], cfg.ports[i], reader, size,
                 static_cast<uint64_t>(i), physical_miss_ns).detach();
+  }
+
+  if (cfg.hint_port) {
+    int hfd = nbd::Listen(cfg.hint_port);
+    if (hfd < 0) return 1;
+    static nbd::HintReader hint_reader(reader, 0);
+    std::thread(nbd::AcceptLoop, hfd, cfg.hint_port, &hint_reader, uint64_t{1} << 50, uint64_t{0}, uint64_t{0}).detach();
+    std::fprintf(stderr, "nbd server: hint channel on port %u\n", cfg.hint_port);
   }
 
   const auto server_start = std::filesystem::file_time_type::clock::now();

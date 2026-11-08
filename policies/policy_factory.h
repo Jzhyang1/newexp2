@@ -128,6 +128,12 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
         parts.emplace_back(new NeighborhoodPrefetchPolicy(cache, NeighborhoodParams(Spec{}, theta)));
         return new ComboPolicy(cache, std::move(parts));
     }
+    if (n == "hint") {
+        HintPolicy::Params q;
+        q.theta_pct = sp.get("theta", q.theta_pct); q.window = sp.get("window", q.window); q.filter = sp.get("filter", q.filter);
+        q.bucket_pages = sp.get("bucket", q.bucket_pages); q.prior_trials = sp.get("k0", q.prior_trials); q.prior_pct = sp.get("prior", q.prior_pct);
+        return new HintPolicy(cache, q);
+    }
     if (n == "nextreq") return new NextRequestPolicy(cache, NextRequestParams(sp, 10));
     if (n == "neighborhood") return new NeighborhoodPrefetchPolicy(cache, NeighborhoodParams(sp, 40));
     if (n == "readahead") return new ReadaheadPolicy(cache, sp.get("pages", MAX_PREFETCH_PAGES));

@@ -74,6 +74,9 @@ public:
     // where the worker's own think time starts, so disk-side time never
     // counts as worker time.
     virtual void response_sent(uint64_t /*worker_id*/) {}
+    // An application hint arrived on the hint port: bytes [first_byte, first_byte + nbytes) of the data disk will be
+    // read soon. `aux`: 0..14 = sixteenths-ish of the range the guest page cache holds (mincore), 255 = not reported.
+    virtual void hint(uint64_t /*worker_id*/, uint64_t /*first_byte*/, uint64_t /*nbytes*/, uint32_t /*aux*/) {}
     // the simulator needs to be drained before we get its stats
     virtual void drain() = 0;
     virtual const Stats& get_stats() = 0;
