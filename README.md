@@ -85,6 +85,58 @@ charges simulated latency accordingly — then serves the actual bytes via
 `pread` on the backing file (thread-safe/offset-explicit, since the backing
 `FILE*` is shared across every client thread).
 
+### disk/fwd.cpp, disk/fwd_sim.cpp (remote disk: direct vs local cache)
+
+A *physically remote* disk, to compare "guest NBD attached straight to the
+remote disk" against "guest NBD attached to a local disk cache that reads
+ahead":
+
+- `RemoteDiskServer` (`bin/fwd_sim serve`) is the far side: a separate process
+  serving a file over TCP. Every request pays the link RTT, the disk's service
+  time, and a share of the link bandwidth, all enforced with real sleeps (no
+  simulated clock). Demand traffic is prioritized over prefetch traffic on the
+  link (`--prio 0` turns that off).
+- `RemoteClient` is the near side's connection pool (separate demand and
+  prefetch pools, so speculation can't starve a blocked guest read).
+- `DirectReadClass` forwards every read. `FwdReadClass` is the local disk
+  cache: pages live in an unlinked local file, `policy::Cache` + the usual
+  evict/prefetch policies decide residency, and prefetches are fetched on
+  background connections *while the guest thinks*. A guest read that needs a
+  page whose prefetch is still queued takes it over rather than waiting.
+- Both are `nbd::BlockReadClass`es, so they plug into `nbd_server` with
+  `source: remote` (see `disk/nbd.example.yaml`) and real VMs can sit behind
+  them. Writes still go to the local copy-on-write overlay; the remote disk is
+  read-only.
+
+`make fwd-experiment` builds `bin/fwd_sim` and runs `disk/fwd_experiment.py`:
+network scenarios (`lan`/`wan`/`far`) x workloads (`seq`, `seqjump`, `stride`,
+`random`, `zipf`, and `trace` = replay of `logs/nbd_access.csv`) x modes
+(`direct`, `cache`, `readahead`, `stream`). The remote disk is a generated
+pattern image, and every byte the guest side reads is verified, so a cache bug
+shows up as a mismatch instead of a flattering latency number. Output:
+`logs/fwd/results.csv` (one row per run) and `logs/fwd/summary.md`. "Total
+latency" is the sum of every read's wait; wall time also includes the guest's
+think time (`--think-us`), which is what lets prefetching overlap the guest.
+Pass options with `FWD_ARGS`, e.g.
+`make fwd-experiment FWD_ARGS="--quick --scenarios wan --think-us 0,200,2000"`.
+`python3 disk/test_fwd.py` is the no-QEMU end-to-end check of `source: remote`
+(including pipelined reads with `read_concurrency`).
+
+**With a VM in the loop.** The replay above issues reads one at a time from a host process, which overstates
+what a cache can add: a real guest has its own page cache and readahead and keeps several reads in flight.
+`tools/capture/vm_remote_study.py` boots a QEMU guest running the real FAISS search over the remote disk
+(`run_capture.py --remote-rtt-us ...`), records the guest's own query latencies, and covers local-disk
+references, a serial-vs-overlapped `nbd_server` comparison, and a guest-readahead ablation
+(`--ablation`, which sets the guest's `read_ahead_kb`). Each run hashes the search results, so the VM path's
+data correctness is checked too. `nbd_server`'s `read_concurrency` (default 8, any source) serves reads in parallel
+per connection; QEMU pipelines requests, and a server that handles one at a time (`read_concurrency: 1`,
+the behaviour before this option existed) penalizes the direct baseline. `disk/fwd_calibrate.py` measures the emulated link against its arithmetic model, and
+`disk/fwd_report.py` rebuilds the write-up page from the CSVs. `vm_remote_study.py --depth-sweep` varies the host's readahead
+depth (`readahead_pages`) and `--diag` re-runs one deep depth with a larger cache, an unlimited link, and lock-contention
+counters (`FwdReadClass` prints `lock_wait_ms`/`bulk_hold_ms` at shutdown). `FwdReadClass` keeps its pages in a memory-mapped
+file and still copies each fetched page under one lock; that lock is the cost deep readahead pays on a fast link. Run `nbd_server` configs with explicit
+`access_log`/`prefetch_log` paths: leaving them unset still truncates `logs/nbd_access.csv`.
+
 ### policies/
 
 Evict policies (`evict_policy:` in the config): `none`, `fifo`, `lifo`,

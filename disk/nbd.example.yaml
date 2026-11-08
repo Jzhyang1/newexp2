@@ -12,8 +12,22 @@
 # This is a deliberately small subset of YAML: flat `key: value` lines,
 # `#` comments, and one inline list (`ports:`). Nesting is not supported.
 
-source: local              # only "local" (a real backing file) is implemented
-file: ./data.bin            # exported device size == this file's size
+source: local              # local (a backing file) | remote (a disk across a link: see the remote_* keys below)
+file: ./data.bin            # exported device size == this file's size (source: local)
+
+# source: remote -- the disk lives in a `bin/fwd_sim serve` process (disk/fwd.cpp), reached over TCP
+# with that server's RTT/bandwidth. Guest writes still go to the local copy-on-write overlay.
+#   remote_host: 127.0.0.1
+#   remote_port: 9000
+#   fwd_mode: cache               # direct = every read crosses the link | cache = local cache + evict/prefetch policy below
+#   fwd_prefetch_threads: 4       # background fetchers for the prefetch policy (cache mode)
+#   fwd_local_read_ns: 50000      # modeled local cache device latency per request (cache mode)
+# In cache mode `capacity`/`page_size`/`evict_policy`/`prefetch_policy`/`prefetch_budget_pages` apply as usual;
+# latency_mode/hit_latency_ns/miss_latency_ns do not (latency is whatever the real link costs).
+# Reads served in parallel on one NBD connection (any source). QEMU pipelines its requests and NBD allows
+# replies out of order, so the default overlaps them. 1 = one request at a time (the old behaviour). With
+# source: local, SimReadClass's per-worker think-time accounting counts the gap once per overlapped group.
+#read_concurrency: 8
 ports: [10809, 10810, 10811]
 
 page_size: 65536            # cache/policy page size in bytes (power of two, >= 512); capacity, prefetch ranges and the

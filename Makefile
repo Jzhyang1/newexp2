@@ -252,8 +252,30 @@ NBD_PORTS_YAML := $(subst $(space),$(comma)$(space),$(strip $(NBD_PORTS)))
 .PHONY: nbd nbd-config nbd-run
 nbd: $(NBD_BIN)
 
-$(NBD_BIN): $(NBD_SRC) disk/nbd.hpp disk/sim.hpp $(POLICY_SRCS) | dirs
-	$(CXX) $(CXXFLAGS) $(NBD_SRC) $(POLICY_SRCS) -o $@ $(LDFLAGS)
+$(NBD_BIN): $(NBD_SRC) disk/fwd.cpp disk/fwd.hpp disk/nbd.hpp disk/sim.hpp disk/overlay.hpp $(POLICY_SRCS) | dirs
+	$(CXX) $(CXXFLAGS) $(NBD_SRC) disk/fwd.cpp $(POLICY_SRCS) -o $@ $(LDFLAGS)
+
+# ---------------------------------------------------------------------------
+# Remote-disk experiment (disk/fwd.cpp, disk/fwd_sim.cpp, disk/fwd_experiment.py):
+# a physically remote disk (separate process, real TCP, RTT/bandwidth enforced
+# with real sleeps) reached either directly or through a local cache with
+# readahead. `make fwd-experiment` runs the whole comparison matrix and writes
+# logs/fwd/results.csv + logs/fwd/summary.md. Pass options through FWD_ARGS:
+#   make fwd-experiment FWD_ARGS="--quick --scenarios wan --workloads seq,trace"
+# To put real VMs behind the same remote disk instead, run
+#   bin/fwd_sim serve --file <img> --port 9000 --rtt-us 2000 --bw-mbps 1000
+# and point nbd_server at it with `source: remote` (disk/nbd.example.yaml).
+FWD_BIN := $(BIN_DIR)/fwd_sim
+FWD_ARGS ?=
+
+.PHONY: fwd-sim fwd-experiment
+fwd-sim: $(FWD_BIN)
+
+$(FWD_BIN): disk/fwd.cpp disk/fwd_sim.cpp disk/fwd.hpp disk/nbd.hpp disk/overlay.hpp $(POLICY_SRCS) | dirs
+	$(CXX) $(CXXFLAGS) disk/fwd.cpp disk/fwd_sim.cpp $(POLICY_SRCS) -o $@ $(LDFLAGS)
+
+fwd-experiment: fwd-sim
+	python3 disk/fwd_experiment.py $(FWD_ARGS)
 
 
 # Build, provision the backing disk, regenerate the config, and run in the

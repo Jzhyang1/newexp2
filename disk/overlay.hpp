@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -40,6 +41,11 @@ public:
         unlink(path.data());
     }
     ~Overlay() { if (fd_ >= 0) close(fd_); }
+
+    // Where partial-block writes read the unmodified block from when it is not
+    // a local file (e.g. a remote disk); returns bytes read or -1. Default: base_fd.
+    using BaseReader = std::function<ssize_t(void* buf, size_t len, uint64_t off)>;
+    void set_base_reader(BaseReader r) { base_reader_ = std::move(r); }
     Overlay(const Overlay&) = delete;
     Overlay& operator=(const Overlay&) = delete;
 
@@ -66,7 +72,9 @@ public:
                     const uint64_t base_off = b * bs_;
                     if (base_off < base_size_) {
                         size_t want = static_cast<size_t>(std::min<uint64_t>(bs_, base_size_ - base_off));
-                        if (PreadFull(base_fd_, blk.data(), want, base_off) < 0) return kEio;
+                        const ssize_t got = base_reader_ ? base_reader_(blk.data(), want, base_off)
+                                                         : PreadFull(base_fd_, blk.data(), want, base_off);
+                        if (got < 0) return kEio;
                     }
                 }
                 std::memcpy(blk.data() + boff, p, n);
@@ -133,6 +141,7 @@ private:
     }
 
     int base_fd_;
+    BaseReader base_reader_;
     uint64_t base_size_;
     uint64_t bs_;
     int fd_{-1};

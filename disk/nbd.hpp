@@ -56,6 +56,7 @@ struct ReqInfo {
 
 class BlockReadClass {
 public:
+    virtual ~BlockReadClass() = default;
     // Non-read commands (write/flush/trim/write-zeroes/unknown, plus rejected
     // reads): tracked in Stats and logged; data is never persisted.
     virtual void on_command(uint64_t /*worker_id*/, uint64_t /*offset*/, uint64_t /*length*/,

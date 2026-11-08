@@ -48,7 +48,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +64,7 @@
 #include "nbd.hpp"
 #include "overlay.hpp"
 #include "sim.hpp"
+#include "fwd.hpp"
 #include "../policies/policy_api.h"
 
 namespace nbd {
@@ -257,11 +261,40 @@ bool SendReply(int fd, uint32_t error, uint64_t handle) {
 // time reflects cache performance. (Flat per request, not per missed sector.)
 static std::atomic<uint32_t> g_inflight{0};
 
+// Reads served concurrently per connection (config `read_concurrency`, default 8).
+// QEMU's NBD client pipelines requests (about half of a FAISS guest's reads arrive with
+// another already queued: ReqInfo::queued_bytes), and NBD allows replies out of order,
+// so the server overlaps them instead of making every queued read wait for the one ahead.
+// 1 = strictly one request at a time, which is what nbd_server did before this option
+// existed; it is kept for comparison (the `direct_c1` / `readahead_c1` runs of the VM study).
+// Anything that is not a read (write, flush, trim, ...) first waits for the in-flight reads.
+static uint32_t g_read_concurrency = 8;
+
+// Per-connection state shared with the detached read workers.
+struct ConnState {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::mutex write_mu;  // replies from different workers must not interleave on the socket
+  uint32_t active = 0;
+  bool failed = false;
+};
+
 void ServeTransmission(int fd, BlockReadClass* reader, uint64_t size, uint64_t worker_id,
                        uint64_t physical_miss_ns) {
   static thread_local std::vector<uint8_t> buf(1 << 20, 0);
+  auto conn = std::make_shared<ConnState>();
+  // Whatever way this function returns, no worker may outlive the connection's use of fd.
+  struct DrainOnExit {
+    ConnState& c;
+    ~DrainOnExit() { std::unique_lock lk(c.mu); c.cv.wait(lk, [&] { return c.active == 0; }); }
+  } drain_on_exit{*conn};
+  auto wait_idle = [&] { std::unique_lock lk(conn->mu); conn->cv.wait(lk, [&] { return conn->active == 0; }); };
 
   for (;;) {
+    if (g_read_concurrency > 1) {
+      std::lock_guard lk(conn->mu);
+      if (conn->failed) return;
+    }
     struct {
       uint32_t magic;
       uint16_t flags;
@@ -299,15 +332,49 @@ void ServeTransmission(int fd, BlockReadClass* reader, uint64_t size, uint64_t w
     auto finish = [&](uint32_t err) {
       info.error = err;
       reader->on_command(worker_id, offset, length, info);
+      std::lock_guard wl(conn->write_mu);
       bool ok = SendReply(fd, err, handle);
       reader->response_sent(worker_id);
       return ok;
     };
 
+    // Everything but a read is a barrier: let in-flight reads finish first.
+    if (type != kCmdRead && g_read_concurrency > 1) wait_idle();
+
     switch (type) {
       case kCmdRead: {
         if (!in_range) {
           if (!finish(kErrInval)) return;
+          break;
+        }
+        if (g_read_concurrency > 1) {
+          {
+            std::unique_lock lk(conn->mu);
+            conn->cv.wait(lk, [&] { return conn->active < g_read_concurrency; });
+            ++conn->active;
+          }
+          std::thread([conn, fd, reader, worker_id, physical_miss_ns, handle, offset, length, info]() mutable {
+            std::vector<uint8_t> data(length);
+            bool ok = true;
+            for (uint64_t done = 0; done < length;) {
+              size_t chunk = static_cast<size_t>(std::min<uint64_t>(length - done, 1 << 20));
+              uint64_t miss_blocks = 0;
+              reader->read(worker_id, offset + done, chunk, data.data() + done, &miss_blocks, &info);
+              if (physical_miss_ns > 0 && miss_blocks > 0) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(physical_miss_ns));
+              }
+              done += chunk;
+            }
+            {
+              std::lock_guard wl(conn->write_mu);
+              ok = SendReply(fd, 0, handle) && WriteFull(fd, data.data(), length);
+            }
+            reader->response_sent(worker_id);
+            std::lock_guard lk(conn->mu);
+            if (!ok) conn->failed = true;
+            --conn->active;
+            conn->cv.notify_all();
+          }).detach();
           break;
         }
         if (!SendReply(fd, 0, handle)) return;
@@ -445,7 +512,7 @@ void AcceptLoop(int listen_fd, uint16_t port, BlockReadClass* reader, uint64_t s
 // YAML library. See nbd.example.yaml for the schema.
 // ---------------------------------------------------------------------------
 struct Config {
-  std::string source = "local";       // only "local" (a real backing file) is supported
+  std::string source = "local";       // "local" (a backing file) | "remote" (a fwd_sim/RemoteDiskServer, see disk/fwd.cpp)
   std::string file;                   // path to the backing file
   std::vector<uint16_t> ports;        // one export/client identity per port
   std::size_t capacity = 4096;        // cache capacity, in pages of `page_size` bytes
@@ -475,6 +542,13 @@ struct Config {
   std::string feature_log;       // per-request host-side feature log (see disk/sim.hpp); "" (default) disables
   std::string overlay_dir = "/tmp";  // directory for the (unlinked) temp file holding guest-modified blocks
   uint64_t overlay_block_size = 4096; // copy-on-write granularity in bytes (power of two, multiple of 512)
+  // source: remote -- the backing disk lives across a (physical) link, see disk/fwd.hpp.
+  std::string remote_host = "127.0.0.1";
+  uint16_t remote_port = 0;
+  std::string fwd_mode = "cache";        // direct (every read crosses the link) | cache (local cache + evict/prefetch policy)
+  uint32_t read_concurrency = 8;         // reads served in parallel per connection, any source (1 = one at a time)
+  unsigned fwd_prefetch_threads = 4;     // background fetchers (cache mode)
+  uint64_t fwd_local_read_ns = 0;        // modeled local-cache-device latency per request (cache mode)
   std::string cache_log;         // per-cache-event log (admit/evict, with prefetch + reuse info); "" disables
 };
 
@@ -537,6 +611,19 @@ Config LoadConfig(const std::string& path) {
           (cfg.page_size & (cfg.page_size - 1))) {
         throw std::runtime_error("page_size must be a power of two and a multiple of 512");
       }
+    } else if (key == "remote_host") {
+      cfg.remote_host = value;
+    } else if (key == "remote_port") {
+      cfg.remote_port = static_cast<uint16_t>(std::stoul(value));
+    } else if (key == "read_concurrency") {
+      cfg.read_concurrency = static_cast<uint32_t>(std::max<unsigned long>(1, std::stoul(value)));
+    } else if (key == "fwd_mode") {
+      if (value != "direct" && value != "cache") throw std::runtime_error("fwd_mode must be 'direct' or 'cache'");
+      cfg.fwd_mode = value;
+    } else if (key == "fwd_prefetch_threads") {
+      cfg.fwd_prefetch_threads = static_cast<unsigned>(std::stoul(value));
+    } else if (key == "fwd_local_read_ns") {
+      cfg.fwd_local_read_ns = std::stoull(value);
     } else if (key == "overlay_dir") {
       cfg.overlay_dir = value;
     } else if (key == "overlay_block_size") {
@@ -591,7 +678,11 @@ Config LoadConfig(const std::string& path) {
     }
   }
 
-  if (cfg.file.empty()) throw std::runtime_error("config is missing required key: file");
+  if (cfg.source == "remote") {
+    if (!cfg.remote_port) throw std::runtime_error("source: remote requires remote_port");
+  } else if (cfg.file.empty()) {
+    throw std::runtime_error("config is missing required key: file");
+  }
   if (cfg.ports.empty()) throw std::runtime_error("config is missing required key: ports");
   if ((cfg.prefetch_policy == "model" || cfg.prefetch_policy == "model-prefetcher") &&
       cfg.prefetcher_path.empty()) {
@@ -624,7 +715,7 @@ policy::CachePolicy* MakePrefetchPolicy(const Config& cfg, policy::Cache& cache)
   if (name == "cminer") return new policy::CMinerPolicy(cache);
   if (name == "quickmine") return new policy::QuickMinePolicy(cache);
   if (name == "mithril") return new policy::MithrilPolicy(cache);
-  if (name == "readahead_cxt_aware") return new policy::ContextAwareReadaheadPolicy(cache);
+  if (name == "readahead_cxt_aware") return new policy::ContextAwareReadaheadPolicy(cache, 8, 8, cfg.readahead_pages);
   if (name == "none") return nullptr;
   throw std::runtime_error("Unsupported prefetch_policy: " + name);
 }
@@ -871,24 +962,41 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (strcasecmp(cfg.source.c_str(), "local") != 0) {
-    std::fprintf(stderr, "unsupported source: %s (only 'local' is implemented)\n",
-                 cfg.source.c_str());
+  const bool remote = strcasecmp(cfg.source.c_str(), "remote") == 0;
+  if (!remote && strcasecmp(cfg.source.c_str(), "local") != 0) {
+    std::fprintf(stderr, "unsupported source: %s (expected 'local' or 'remote')\n", cfg.source.c_str());
     return 1;
   }
 
-  FILE* f = fopen(cfg.file.c_str(), "rb");
-  if (!f) {
-    perror(("failed to open backing file " + cfg.file).c_str());
-    return 1;
+  FILE* f = nullptr;
+  fwd::RemoteClient* remote_client = nullptr;
+  uint64_t size = 0;
+  if (remote) {
+    // One demand connection per exported port (each guest has one request in
+    // flight per connection), plus a separate pool for speculative fetches.
+    remote_client = new fwd::RemoteClient(
+        cfg.remote_host, cfg.remote_port,
+        static_cast<unsigned>(std::max<size_t>(2, cfg.ports.size() * cfg.read_concurrency)),
+        cfg.fwd_mode == "cache" ? std::max(1u, cfg.fwd_prefetch_threads) : 1u);
+    if (!remote_client->connect()) {
+      std::fprintf(stderr, "cannot reach remote disk %s:%u\n", cfg.remote_host.c_str(), cfg.remote_port);
+      return 1;
+    }
+    size = remote_client->size();  // the exported device is exactly the remote disk
+  } else {
+    f = fopen(cfg.file.c_str(), "rb");
+    if (!f) {
+      perror(("failed to open backing file " + cfg.file).c_str());
+      return 1;
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) < 0) {
+      perror("fstat");
+      return 1;
+    }
+    // The exported device size is exactly the backing file's size.
+    size = static_cast<uint64_t>(st.st_size);
   }
-  struct stat st;
-  if (fstat(fileno(f), &st) < 0) {
-    perror("fstat");
-    return 1;
-  }
-  // The exported device size is exactly the backing file's size.
-  uint64_t size = static_cast<uint64_t>(st.st_size);
 
   static policy::Cache cache(cfg.capacity, cfg.hit_latency_ns, cfg.miss_latency_ns, cfg.page_size);
   policy::CachePolicy* evict_policy = nbd::MakeEvictPolicy(cfg.evict_policy, cache);
@@ -937,18 +1045,38 @@ int main(int argc, char **argv) {
 
   nbd::Overlay* overlay = nullptr;
   try {
-    overlay = new nbd::Overlay(fileno(f), size, cfg.overlay_block_size, cfg.overlay_dir);
+    overlay = new nbd::Overlay(f ? fileno(f) : -1, size, cfg.overlay_block_size, cfg.overlay_dir);
+    if (remote_client) {  // partial-block writes read-modify-write against the remote disk
+      overlay->set_base_reader([remote_client](void* buf, size_t len, uint64_t off) -> ssize_t {
+        return remote_client->read(off, buf, len, fwd::kDemand) ? static_cast<ssize_t>(len) : -1;
+      });
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
   }
 
-  auto* sim = new nbd::SimReadClass(
-      f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log,
-      feature_log, cache_log, overlay);
-  sim->prefetch_budget_pages = cfg.prefetch_budget_pages;
-  nbd::BlockReadClass* reader = sim;
+  nbd::BlockReadClass* reader = nullptr;
+  fwd::FwdReadClass* fwd_cache = nullptr;
+  if (remote && cfg.fwd_mode == "direct") {
+    reader = new fwd::DirectReadClass(*remote_client, overlay);
+  } else if (remote) {
+    fwd::FwdConfig fc;
+    fc.prefetch_threads = std::max(1u, cfg.fwd_prefetch_threads);
+    fc.prefetch_budget_pages = cfg.prefetch_budget_pages;
+    fc.local_read_ns = cfg.fwd_local_read_ns;
+    fc.cache_dir = cfg.overlay_dir;
+    fwd_cache = new fwd::FwdReadClass(*remote_client, cache, evict_policy, prefetch_policy, fc, overlay);
+    reader = fwd_cache;
+  } else {
+    auto* sim = new nbd::SimReadClass(
+        f, cfg.ports.size(), cfg.warmup, cache, evict_policy, prefetch_policy, access_log, prefetch_log,
+        feature_log, cache_log, overlay);
+    sim->prefetch_budget_pages = cfg.prefetch_budget_pages;
+    reader = sim;
+  }
 
+  nbd::g_read_concurrency = cfg.read_concurrency;
   signal(SIGPIPE, SIG_IGN);
 
   // Block SIGINT/SIGTERM/SIGUSR1 here, before spawning any threads, so
@@ -972,8 +1100,14 @@ int main(int argc, char **argv) {
     if (listen_fds[i] < 0) return 1;
   }
 
-  std::fprintf(stderr, "nbd server: exporting %llu bytes from %s over %zu port(s)\n",
-               static_cast<unsigned long long>(size), cfg.file.c_str(), cfg.ports.size());
+  if (remote) {
+    std::fprintf(stderr, "nbd server: exporting %llu bytes from remote disk %s:%u (%s) over %zu port(s)\n",
+                 static_cast<unsigned long long>(size), cfg.remote_host.c_str(), cfg.remote_port,
+                 cfg.fwd_mode.c_str(), cfg.ports.size());
+  } else {
+    std::fprintf(stderr, "nbd server: exporting %llu bytes from %s over %zu port(s)\n",
+                 static_cast<unsigned long long>(size), cfg.file.c_str(), cfg.ports.size());
+  }
 
   const uint64_t physical_miss_ns =
       cfg.latency_mode == "physical" ? cfg.miss_latency_ns : 0;
@@ -999,12 +1133,28 @@ int main(int argc, char **argv) {
   const nbd::Stats& stats = reader->get_stats();
   nbd::PrintStatsLine(stats);
   nbd::AppendLog(cfg, stats, server_start);
+  if (remote_client) {
+    std::fprintf(stderr, "FWD mode=%s remote_demand_reqs=%llu remote_demand_bytes=%llu remote_bulk_reqs=%llu remote_bulk_bytes=%llu",
+                 cfg.fwd_mode.c_str(), (unsigned long long)remote_client->requests(fwd::kDemand),
+                 (unsigned long long)remote_client->bytes(fwd::kDemand), (unsigned long long)remote_client->requests(fwd::kBulk),
+                 (unsigned long long)remote_client->bytes(fwd::kBulk));
+    if (fwd_cache) {
+      const fwd::FwdStats fs = fwd_cache->fwd_stats();
+      std::fprintf(stderr, " hit_pages=%llu late_pages=%llu miss_pages=%llu pf_issued=%llu pf_used=%llu pf_wasted=%llu lock_wait_ms=%llu bulk_hold_ms=%llu",
+                   (unsigned long long)fs.hit_pages, (unsigned long long)fs.late_pages, (unsigned long long)fs.miss_pages,
+                   (unsigned long long)fs.pf_issued_pages, (unsigned long long)fs.pf_used_pages,
+                   (unsigned long long)fs.pf_wasted_pages, (unsigned long long)(fs.demand_lock_wait_ns / 1000000),
+                   (unsigned long long)(fs.bulk_hold_ns / 1000000));
+    }
+    std::fprintf(stderr, "\n");
+    delete reader;  // joins the prefetch threads before the policies they call into go away
+  }
   delete prefetch_policy;
   delete evict_policy;
   if (access_log) std::fclose(access_log);
   if (prefetch_log) std::fclose(prefetch_log);
   if (feature_log) std::fclose(feature_log);
   if (cache_log) std::fclose(cache_log);
-  std::fclose(f);
+  if (f) std::fclose(f);
   return 0;
 }

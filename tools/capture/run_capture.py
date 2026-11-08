@@ -68,6 +68,17 @@ def main():
     ap.add_argument("--buffer-kb", type=int, default=2048, help="ftrace ring buffer per cpu per instance (guest RAM it steals!)")
     ap.add_argument("--probe-debug", action="store_true")
     ap.add_argument("--no-trace", action="store_true", help="skip the guest tracer (host-only features)")
+    # Remote data disk: the FAISS data image lives behind an emulated link (bin/fwd_sim serve) and nbd_server
+    # reaches it with `source: remote` -- either directly (--fwd-mode direct) or through a local cache that
+    # reads ahead (--fwd-mode cache, policies as --evict/--prefetch). See disk/fwd.hpp.
+    ap.add_argument("--remote-rtt-us", type=int, default=None, help="enable the remote data disk with this link RTT")
+    ap.add_argument("--remote-bw-mbps", type=float, default=10000)
+    ap.add_argument("--remote-disk-us", type=int, default=100)
+    ap.add_argument("--fwd-mode", default="cache", choices=["direct", "cache"])
+    ap.add_argument("--read-concurrency", type=int, default=8, help="remote mode: reads served in parallel per NBD connection")
+    ap.add_argument("--guest-ra-kb", type=int, default=None, help="set the guest's /sys/block/vdb/queue/read_ahead_kb (default: leave the kernel's 128)")
+    ap.add_argument("--lean-local", action="store_true", help="local (non-remote) data disk: write no per-request logs, so the run is a clean local-disk reference")
+    ap.add_argument("--local-read-us", type=int, default=0, help="remote cache mode: modeled local cache device latency")
     args = ap.parse_args()
 
     if not args.data_img:
@@ -87,7 +98,7 @@ def main():
     run_cfg = dict(n_queries=args.n_queries, nprobe=args.nprobe, k=args.k, think_us=args.think_us, probe_debug=args.probe_debug, trace=not args.no_trace,
                    sync_tail_offset=meta["tail_offset"], sync_base=0,
                    marker_instances=["", "instances/blk/", "instances/app/", "instances/stk/"],
-                   buffer_kb=args.buffer_kb, workload=args.workload)
+                   buffer_kb=args.buffer_kb, workload=args.workload, guest_ra_kb=args.guest_ra_kb)
     if args.workload == "ycsb":
         run_cfg["ycsb"] = dict(workload=args.ycsb_workload, ops=args.ycsb_ops, records=meta["records"], fields=meta["fields"],
                                field_length=meta["field_length"], distribution=args.ycsb_distribution)
@@ -98,17 +109,37 @@ def main():
     nbd = os.path.join(ROOT, "bin/nbd_server")
     cfg_root = os.path.join(run, "nbd_root.yaml")
     cfg_data = os.path.join(run, "nbd_data.yaml")
+    remote_srv = None
+    if args.remote_rtt_us is not None:
+        fwd_bin = os.path.join(ROOT, "bin/fwd_sim")
+        remote_srv = subprocess.Popen([fwd_bin, "serve", "--file", args.data_img, "--port", "0", "--rtt-us", str(args.remote_rtt_us),
+                                       "--bw-mbps", str(args.remote_bw_mbps), "--disk-us", str(args.remote_disk_us)],
+                                      stdout=subprocess.PIPE, stderr=open(os.path.join(run, "remote_disk.log"), "w"), text=True)
+        remote_port = int(remote_srv.stdout.readline().split()[1])
     write_cfg(cfg_root, source="local", file=args.root_img, ports=f"[{args.root_port}]", capacity=4096, page_size=65536,
               evict_policy="lru", prefetch_policy="none", log=os.path.join(run, "root_results.csv"),
               access_log=os.path.join(run, "root_access.csv"), prefetch_log=os.path.join(run, "root_prefetch.csv"),
               vm_log_dir=run)
-    write_cfg(cfg_data, source="local", file=args.data_img, ports=f"[{args.data_port}]", capacity=args.capacity,
-              page_size=args.page_size, hit_latency_ns=args.hit_ns, miss_latency_ns=args.miss_ns, latency_mode=args.latency_mode,
-              readahead_pages=args.readahead_pages, prefetch_budget_pages=args.prefetch_budget_pages,
-              evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=(args.oracle_file or os.path.join(run, "access.csv")), log=os.path.join(run, "results.csv"),
-              access_log=os.path.join(run, "access.csv"), prefetch_log=os.path.join(run, "prefetch.csv"),
-              feature_log=os.path.join(run, "features.csv"), cache_log=os.path.join(run, "cache.csv"),
-              vm_log_dir=run)
+    if remote_srv is None and args.lean_local:
+        # SimReadClass logs every request and cache event under one lock; for a reference run that logging is the dominant cost
+        write_cfg(cfg_data, source="local", file=args.data_img, ports=f"[{args.data_port}]", capacity=args.capacity, page_size=args.page_size,
+                  evict_policy="lru", prefetch_policy="none", log=os.path.join(run, "results.csv"),
+                  access_log="/dev/null", prefetch_log="/dev/null", vm_log_dir=run)
+    elif remote_srv is None:
+        write_cfg(cfg_data, source="local", file=args.data_img, ports=f"[{args.data_port}]", capacity=args.capacity,
+                  page_size=args.page_size, hit_latency_ns=args.hit_ns, miss_latency_ns=args.miss_ns, latency_mode=args.latency_mode,
+                  readahead_pages=args.readahead_pages, prefetch_budget_pages=args.prefetch_budget_pages,
+                  evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=(args.oracle_file or os.path.join(run, "access.csv")), log=os.path.join(run, "results.csv"),
+                  access_log=os.path.join(run, "access.csv"), prefetch_log=os.path.join(run, "prefetch.csv"),
+                  feature_log=os.path.join(run, "features.csv"), cache_log=os.path.join(run, "cache.csv"),
+                  vm_log_dir=run)
+    else:  # access/prefetch logs are SimReadClass-only; set explicit paths so the defaults under ./logs are never truncated
+        write_cfg(cfg_data, source="remote", remote_host="127.0.0.1", remote_port=remote_port, fwd_mode=args.fwd_mode,
+                  read_concurrency=args.read_concurrency, fwd_local_read_ns=args.local_read_us * 1000, ports=f"[{args.data_port}]",
+                  capacity=args.capacity, page_size=args.page_size, readahead_pages=args.readahead_pages,
+                  prefetch_budget_pages=args.prefetch_budget_pages, evict_policy=args.evict, prefetch_policy=args.prefetch,
+                  overlay_dir=run, log=os.path.join(run, "results.csv"), access_log=os.path.join(run, "access.csv"),
+                  prefetch_log=os.path.join(run, "prefetch.csv"), vm_log_dir=run)
 
     servers = []
     for name, cfg in (("root", cfg_root), ("data", cfg_data)):
@@ -148,6 +179,12 @@ def main():
     wall = time.time() - t0
     for s in servers:
         s.send_signal(signal.SIGTERM)
+    if remote_srv:
+        remote_srv.send_signal(signal.SIGTERM)
+        try:
+            remote_srv.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            remote_srv.kill()
     for s in servers:
         try:
             s.wait(timeout=20)

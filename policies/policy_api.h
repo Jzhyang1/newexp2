@@ -211,9 +211,14 @@ public:
 // direction yet to extrapolate from.
 class ContextAwareReadaheadPolicy : public CachePolicy {
     detail::StreamTracker tracker_;
+    std::uint64_t pages_;
 public:
+    // `pages`: how far ahead of a detected stream to prefetch, in cache pages
+    // (<= MAX_PREFETCH_PAGES). It used to be fixed at MAX_PREFETCH_PAGES, which made
+    // this policy 16x+ more aggressive than ReadaheadPolicy at any smaller setting.
     explicit ContextAwareReadaheadPolicy(Cache& cache, std::uint64_t attach_window = 8,
-                                          std::size_t max_streams_per_context = 8);
+                                          std::size_t max_streams_per_context = 8,
+                                          std::uint64_t pages = MAX_PREFETCH_PAGES);
     void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
                              std::uint64_t block_length, PrefetchRequest& request);
 };

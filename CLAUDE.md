@@ -60,7 +60,11 @@ asked to "run the tests," say there aren't any.
 | `disk/nbd.cpp`, `disk/nbd.hpp` | NBD protocol server (`nbd_server`) — reads/writes the wire protocol |
 | `disk/sim.hpp` | `SimReadClass` — drives `policy::Cache` from real NBD reads via `pread` |
 | `disk/nbd.example.yaml`, `disk/nbd.yaml` | `nbd_server` config schema + committed default |
-| `disk/fwd.cpp` | Empty stub — deliberate placeholder, not implemented |
+| `disk/fwd.hpp`, `disk/fwd.cpp` | Remote-disk forwarding: `RemoteDiskServer` (emulated link), `RemoteClient`, `DirectReadClass`, `FwdReadClass` (local cache + readahead); `nbd_server` uses them for `source: remote` |
+| `disk/fwd_sim.cpp`, `disk/fwd_experiment.py` | `bin/fwd_sim serve/mkdisk/bench` and the direct-vs-cache experiment matrix (`make fwd-experiment`) |
+| `disk/test_fwd.py` | End-to-end test of `source: remote` incl. pipelined reads (`make nbd fwd-sim` first) |
+| `tools/capture/vm_remote_study.py` | VM-in-the-loop study: QEMU guest + FAISS over the emulated remote disk (needs `/dev/kvm`, no root); `--ablation` varies guest readahead, `--depth-sweep` the host's readahead depth, `--diag` why deep readahead loses |
+| `disk/fwd_calibrate.py`, `disk/fwd_report.py` | Emulated-link accuracy check; builds the write-up page from `logs/fwd_dc2`, `logs/fwd_vm` |
 | `policies/policy_api.h`, `policies/cache.cpp` | `Cache` + `CachePolicy` base API |
 | `policies/policy_*.cpp` | Concrete evict/prefetch policies (see glossary for names) |
 | `policies/assoc_miner.h` | Shared association-mining engine for cminer/quickmine/mithril |
@@ -114,8 +118,11 @@ asked to "run the tests," say there aren't any.
   a bare extra `pthread` breaks `sigwait` delivery on at least one macOS/
   Darwin libc build (unrelated to this code — a host libc quirk). Don't
   "fix" this pattern based on macOS test behavior.
-- **`disk/fwd.cpp` is an intentional empty stub**, not dead code by
-  accident — don't delete it without confirming with the author first.
+- **`disk/fwd.cpp` is no longer a stub** — it holds the remote-disk forwarding
+  layer (see the directory table). Its latency numbers are wall-clock, so run
+  `make fwd-experiment` on a quiet machine; the link's RTT/bandwidth are real
+  `sleep`s (~60 µs of timer slop each), and `fwd_sim` is a separate binary from
+  `nbd_server` (both compile `fwd.cpp`).
 - The Makefile's `NBD_CONFIG` default (`disk/nbd.yaml`) and `VMS_CONFIG`
   default (`kvm/vms.yaml`) are **regenerated/expected to match each other**
   (same host:port) — if you change one's ports, update the other.

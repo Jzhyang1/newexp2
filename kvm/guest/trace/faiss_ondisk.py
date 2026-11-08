@@ -9,6 +9,7 @@ Application-level ground truth (query id + the inverted lists it is about to
 read, i.e. signal #50, "app phase marker") is written to ftrace's
 trace_marker so it lands on the same clock as the kernel events.
 """
+import hashlib
 import json
 import os
 import sys
@@ -54,6 +55,12 @@ def snapshot(tag):
 
 
 def main():
+    ra = cfg.get("guest_ra_kb")
+    if ra is not None:  # ablation: change the guest kernel's own readahead for the data disk
+        with open("/sys/block/vdb/queue/read_ahead_kb", "w") as f:
+            f.write(str(ra))
+    with open("/sys/block/vdb/queue/read_ahead_kb") as f:
+        print("GUEST_READ_AHEAD_KB", f.read().strip(), flush=True)
     faiss.omp_set_num_threads(1)   # one search thread: reproducible order, one pid for the event filter
     q = np.load("/tmp/tools/queries.npy")[: cfg["n_queries"]]
     # barrier: guest_main adds our pid to the tracing filters, then writes one byte
@@ -66,13 +73,15 @@ def main():
     snapshot("start")
     nq = len(q)
     lat = []
+    digest = hashlib.sha256()   # over every query's returned ids+distances: proves the disk path returned the right bytes
     for i in range(nq):
         qi = q[i:i + 1]
         _, lists = index.quantizer.search(qi, cfg["nprobe"])     # which lists this query will read
         mark("APP q_begin i=%d lists=%s" % (i, ",".join(str(int(x)) for x in lists[0])))
         t1 = time.perf_counter()
-        index.search(qi, cfg["k"])
+        dist, ids = index.search(qi, cfg["k"])
         dt = time.perf_counter() - t1
+        digest.update(ids.tobytes()); digest.update(dist.tobytes())
         lat.append(dt)
         mark("APP q_end i=%d dt_us=%d" % (i, int(dt * 1e6)))
         if i == nq // 2:
@@ -80,6 +89,7 @@ def main():
         if cfg.get("think_us"):
             time.sleep(cfg["think_us"] / 1e6)
     snapshot("end")
+    print("RESULT_SHA256", digest.hexdigest(), flush=True)
     lat = np.array(lat) * 1e3
     print("WORKLOAD_RESULT: PASS nq=%d p50=%.3fms p99=%.3fms mean=%.3fms total=%.1fs" % (
         nq, np.percentile(lat, 50), np.percentile(lat, 99), lat.mean(), time.time() - t0), flush=True)
