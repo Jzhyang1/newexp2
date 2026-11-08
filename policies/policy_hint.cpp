@@ -14,13 +14,15 @@ struct HintPolicy::Impl {
         std::deque<Open> open;                               // hints awaiting their label
         std::unordered_map<std::uint64_t, std::uint32_t> pop;   // hinted-range key -> times hinted
         std::unordered_map<std::uint64_t, std::uint64_t> seen;  // page / 16 -> request counter when the host last requested it
-        std::array<float, 8 * 6 * 6 * 3> hits{}, trials{};
+        std::array<float, 8 * 6 * 6 * 3 * 6> hits{}, trials{};
         std::uint64_t now = 0;
     };
     std::unordered_map<std::uint64_t, Ctx> ctx;
     Params p;
     static int PopB(std::uint32_t c) { return c == 0 ? 0 : c == 1 ? 1 : c == 2 ? 2 : c <= 4 ? 3 : c <= 8 ? 4 : c <= 16 ? 5 : c <= 32 ? 6 : 7; }
-    static int AuxB(std::uint32_t a) { return a == 255 ? 5 : std::min<int>(4, (int)(a / 4)); }          // unknown / quarters resident
+    // aux: bits 0-3 = guest residency 0..14 (15 = not reported), bits 4-7 = the agent's own confidence class 0..14 (15 = none)
+    static int AuxB(std::uint32_t a) { return (a & 15) == 15 ? 5 : std::min<int>(4, (int)((a & 15) / 4)); }   // unknown / quarters resident
+    static int ConfB(std::uint32_t a) { std::uint32_t c = (a >> 4) & 15; return c == 15 ? 5 : std::min<int>(4, (int)(c / 3)); }
     static int SizeB(std::uint64_t n) { return n <= 1 ? 0 : n <= 2 ? 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : 5; }
 };
 
@@ -40,7 +42,7 @@ void HintPolicy::on_hint(std::uint64_t context, std::uint64_t first, std::uint64
         auto it = C.seen.find(q);
         if (it != C.seen.end()) { recent = (C.now - it->second < 2000) ? 2 : 1; if (recent == 2) break; }
     }
-    const std::size_t slot = ((Impl::PopB(pop) * 6 + Impl::AuxB(aux)) * 6 + Impl::SizeB(n)) * 3 + recent;
+    const std::size_t slot = (((Impl::PopB(pop) * 6 + Impl::AuxB(aux)) * 6 + Impl::SizeB(n)) * 3 + recent) * 6 + Impl::ConfB(aux);
     ++pop;
     const double k0 = (double)P.prior_trials;
     const double pr = (C.hits[slot] + k0 * P.prior_pct / 100.0) / (C.trials[slot] + k0);

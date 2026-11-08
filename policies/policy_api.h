@@ -465,4 +465,39 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// IVF-geometry prefetcher (policy_ivfgeo.cpp): prefetching for a disk-resident IVF (FAISS) index with no application hook.
+// Needs side information about the *data*, not the application: the byte extent of every inverted list and the cluster
+// centroids (both are in the index files).  A query probes the lists whose centroids are nearest to its vector, so when a
+// host request touches list `a`, the other lists of that query are, with high probability, among the nearest centroids of
+// `a` -- and the lists that reach the host are rare ones, which cluster together.  Candidates (the `k` nearest lists, whole
+// extents) are filtered by a count table learned online (candidate's rank, how often/recently the host has seen it, size;
+// label = a host request touches it within `window` requests), which is what keeps the traffic down.
+class IvfGeoPolicy : public CachePolicy {
+public:
+    struct Params {
+        std::uint64_t k = 24;             // candidate lists per touched list (nearest centroids)
+        std::uint64_t max_k = 64;
+        std::uint64_t theta_pct = 20;
+        std::uint64_t window = 256;       // requests a proposal stays open for labelling
+        std::uint64_t cooldown = 64;      // do not re-propose a list within this many requests
+        std::uint64_t filter = 1;
+        std::uint64_t prior_trials = 4;
+        std::uint64_t prior_pct = 50;
+        std::uint64_t gap_us = 1000;      // host-stream silence (us) that starts a new query; 0 = every touched list anchors
+        std::uint64_t res_thr_pct = 50;   // skip candidates the guest reports >= this resident (needs residency reports via on_hint)
+    };
+    // geo_file: u32 nlist, u32 d, float centroids[nlist*d], u64 start_byte[nlist], u64 nbytes[nlist]   (tools/pf/geo_export.py)
+    IvfGeoPolicy(Cache& cache, const Params& params, const std::string& geo_file);
+    ~IvfGeoPolicy() override;
+    void on_request(std::uint64_t context, std::uint64_t byte_offset, std::uint64_t byte_length, std::uint64_t arrive_ns) override;
+    void on_hint(std::uint64_t context, std::uint64_t first_page, std::uint64_t npages, std::uint32_t aux, PrefetchRequest& request) override;
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset,
+                             std::uint64_t block_length, PrefetchRequest& request) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    std::uint64_t cur_off_ = 0, cur_len_ = 0;
+    bool have_ = false;
+};
+
 }  // namespace policy

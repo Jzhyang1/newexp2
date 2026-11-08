@@ -486,9 +486,9 @@ int Listen(uint16_t port) {
 }
 
 // The hint channel.  A second NBD device (`hint_port`) of 2^50 bytes whose reads are not data but application hints: a
-// 512-byte read at byte offset 512 * payload with payload = (page4k << 8) | (lenclass << 4) | aux, where page4k is the
+// 512-byte read at byte offset 512 * payload with payload = (page4k << 12) | (lenclass << 8) | aux, where page4k is the
 // 4 KiB block of the data disk the application is about to read, lenclass indexes kHintLen (4 KiB units) and aux is
-// 0..14 (guest-reported residency) or 15 (none).  The reply is zeros.  In-band, so any guest that can read a block
+// 8 bits: low nibble = guest-reported residency 0..14 (15 = none), high nibble = the sender's own confidence class (15 = none).  The reply is zeros.  In-band, so any guest that can read a block
 // device can send hints, and the hints share the request stream's ordering.
 static const uint32_t kHintLen[16] = {1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384};
 class HintReader : public BlockReadClass {
@@ -499,9 +499,9 @@ class HintReader : public BlockReadClass {
     std::memset(buf, 0, length);
     if (miss_blocks) *miss_blocks = 0;
     const uint64_t payload = offset / 512;
-    const uint32_t aux = payload & 15, cls = (payload >> 4) & 15;
-    const uint64_t page4k = payload >> 8;
-    inner_->hint(worker_, page4k * 4096, static_cast<uint64_t>(kHintLen[cls]) * 4096, aux == 15 ? 255 : aux);
+    const uint32_t aux = payload & 255, cls = (payload >> 8) & 15;
+    const uint64_t page4k = payload >> 12;
+    inner_->hint(worker_, page4k * 4096, static_cast<uint64_t>(kHintLen[cls]) * 4096, aux);
     return static_cast<uint32_t>(length);
   }
   void drain() override {}
@@ -1160,7 +1160,7 @@ int main(int argc, char **argv) {
     int hfd = nbd::Listen(cfg.hint_port);
     if (hfd < 0) return 1;
     static nbd::HintReader hint_reader(reader, 0);
-    std::thread(nbd::AcceptLoop, hfd, cfg.hint_port, &hint_reader, uint64_t{1} << 50, uint64_t{0}, uint64_t{0}).detach();
+    std::thread(nbd::AcceptLoop, hfd, cfg.hint_port, &hint_reader, uint64_t{1} << 53, uint64_t{0}, uint64_t{0}).detach();
     std::fprintf(stderr, "nbd server: hint channel on port %u\n", cfg.hint_port);
   }
 

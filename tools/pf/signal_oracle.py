@@ -229,3 +229,37 @@ for k in range(len(q)):
         for b in hv[k]:
             if a != b: co2[a][b] += 1
 print("host-visible lists per query (when >=2): mean remaining", np.mean(nh), " recall of the remaining host-visible lists given the first one, K =", {K: round(float(np.mean(v)), 3) for K, v in rec.items()})
+
+# ---------- no app hook, but domain knowledge: IVF list centroids live in index.faiss (read it from the image) ----------
+# Lists a query probes are the centroids nearest to the query vector, so once the guest agent has seen the FIRST list the query touches
+# (page fault on the mmap'd index: no app hook), the other probed lists are among that centroid's neighbours.  Rank candidates by
+# distance to the mean of the centroids observed so far; drop lists the guest already holds (mincore); deliver as hints.
+SC = "/tmp/claude-1000/-home-jonathan-yang-newexp2/0e888e7a-7f13-410b-94ae-3a8bcb0cf58f/scratchpad/"
+cent = np.load(SC + "cent.npy"); c2 = (cent ** 2).sum(1)
+def geo_rank(obs, K, k, resid_thr):
+    m = cent[obs].mean(0)
+    d = c2 - 2 * cent @ m
+    cand = np.argsort(d)[:K * 6]
+    out_ = [int(l) for l in cand if l not in obs and (resid_thr is None or resid_frac[k, l] < resid_thr)]
+    return out_[:K]
+def build_geo(name, K, m_obs, resid_thr, delay=1):
+    with open(out + name + ".bin", "wb") as f:
+        for k in range(len(q)):
+            if k not in first_i: continue
+            i0 = first_i[k] + delay
+            for l in geo_rank(list(lists_of[k][:m_obs]), K, k, resid_thr):
+                a, b = pages(l)
+                f.write(struct.pack("<QQQII", i0, a, b - a + 1, int(round(float(resid_frac[k, l]) * 14)), 0))
+for K in (8, 16, 24):
+    build_geo(f"geo_k{K}", K, 1, 0.5)
+build_geo("geo_k16_m2", 16, 2, 0.5)
+# recall of what actually needs the host
+tot = hit = 0
+for k in range(len(q)):
+    cands = set(geo_rank(list(lists_of[k][:1]), 16, k, 0.5)); nd = set(need.get(k, ())) - set(lists_of[k][:1])
+    tot += len(nd); hit += len(nd & cands)
+print("geo K=16, m=1, residency-filtered: recall of the host-visible lists beyond the first:", hit / max(1, tot))
+
+import pickle
+pickle.dump(dict(resid_frac=resid_frac, need=need, lists_of=lists_of, first_i=first_i, list_pages=[pages(l) for l in range(len(L))],
+                 qi=qi, ntrace=len(r)), open(out + "cache.pkl", "wb"))

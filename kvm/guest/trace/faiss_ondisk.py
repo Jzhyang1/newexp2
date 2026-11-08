@@ -88,10 +88,10 @@ def main():
         if hinter:           # the query's probe lists are known before any list is read
             for l in lists[0]:
                 l = int(l)
-                aux = 15
+                aux = 255
                 if mincore:
                     fr = mincore.resident_fraction(lists_dev["file_off"][l], lists_dev["nbytes"][l])
-                    aux = 15 if fr is None else min(14, int(fr * 14 + 0.5))
+                    aux = 0xF0 | (15 if fr is None else min(14, int(fr * 14 + 0.5)))
                 hinter.hint(lists_dev["start"][l], lists_dev["nbytes"][l], aux)
         mark("APP q_begin i=%d lists=%s" % (i, ",".join(str(int(x)) for x in lists[0])))
         t1 = time.perf_counter()

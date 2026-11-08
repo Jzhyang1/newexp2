@@ -323,3 +323,79 @@ repeated sequence that a host or guest observer can learn.
 * The practical middle ground is a **workload-aware but app-unmodified agent**: one that reads the same input the application
   will consume (the query file, the trace) and issues the hints itself. It has the oracle's information without a code change
   in the application; part 2 gives its quality, at the price of being workload-specific.
+
+---
+
+# Part 4: being more creative with existing signals (FAISS)
+
+Part 3 concluded that nothing application-independent recovers the hint gain. That was too pessimistic: it only used the access
+*history*. Two things it ignored are in the data, not in the application:
+
+1. **The index itself.** A FAISS IVF query probes the lists whose **centroids are nearest to the query vector**. The centroids
+   are in `index.faiss` (offset 98, float32, `nlist x d`; a guest has `faiss`, the host operator has the file). So the
+   *geometry* of the lists says which lists are probed together, without any history and without knowing the query.
+2. **Guest page-cache residency of every list** (`mincore` over the data file is application independent). It says which of the
+   candidates the guest will never ask the host for.
+
+## 14. Centroid geometry
+
+Probe lists reproduce from `faiss_queries.npy` + centroids to 99.9% (sanity). Recall of a query's *other* 7 probe lists from the
+K nearest centroids of the *first* list: K=4 35%, 8 58%, 16 76%, 32 90%, 64 98%. What matters is the lists that reach the host
+(the rare ones). Recall of those, beyond the anchor list (`tools/pf/geo_exp.py`):
+
+| anchor | residency filter | K=8 | K=16 | K=24 |
+|---|---|---|---|---|
+| first list the app touches | `mincore` (not resident) | 0.44 | 0.57 | 0.63 |
+| **first host-visible list** | `mincore` (not resident) | 0.62 | 0.70 | 0.72 |
+| first host-visible list | none | 0.76 | 0.88 | 0.91 |
+
+* Anchoring on the **first host-visible list** is better than on the first list the app touches: host-visible lists are the
+  rare ones, and rare lists cluster in the same region of the space. It also needs no signal beyond the host's own stream.
+* Not helpful (all tried): blending in the session's centroid mean (hurts: 0.57 -> 0.13..0.46), moving the estimated query
+  position toward the 2nd observed list (0.57 -> 0.55..0.57), adding pair-history to the geometry rank (0.57 -> 0.56).
+  Geometry rank from one anchor is what there is.
+
+## 15. Policy-level, no application hook (`psim`, FAISS traced run, `learned` in union, `lru_seg`)
+
+`geo_hints.py` / `resid_reports.py` build hint files from (a) the true first list of each query as anchor, (b) true per-list
+residency reconstructed from the guest's page-cache events at each query start (`resid_all.npy`, all 4096 lists). The candidate
+carries its centroid rank as a confidence class to the learned filter (`hint:` policy).
+
+| configuration | full hit | page hit | traffic |
+|---|---|---|---|
+| `learned` alone | 74.2% | 75.4% | 65.8K |
+| geometry, anchor = first list the app touches, residency known (K=16, filter theta 20) | **82.1%** | **90.0%** | 94.1K |
+| same, K=24, theta 20 / 30 | 82.3 / 81.5% | 90.1 / 89.1% | 98.7 / 87.2K |
+| same, no filter | 82.4% | 90.3% | 101.9K |
+| *for reference: true app hints + `mincore` (part 2)* | 83.1% | ~95% (live) | 67.0K |
+| `ivfgeo` policy, **host-only**: anchor = first list after a 300 us silence, no agent | 74.9% | 77.1% | 89.3K |
+| `ivfgeo`, host-only + residency reports from a guest agent (mincore scan every query / 5 / 30 queries, reports of changed lists) | 77.2% | 80.5% | 96.5K |
+| same, lower theta (more candidates) | 80.5% | 86.3% | 216K |
+
+* With the query boundary known and residency known, the **no-application-hook geometry predictor reaches 82.1% full hit /
+  90.0% page hit** at 1.43x the traffic of `learned`: within 1 point of the application-hint oracle's full hit and 5 points of its page hit.
+  Without any hook it needs two pieces of side information: the index (centroids + list extents, via `tools/pf/geo_export.py`) and
+  a guest agent that reports residency.
+* The realistic reactive version (`policies/policy_ivfgeo.cpp`: the host detects "a new query" by a silence in the stream) loses most of that:
+  **the anchor is the weak link**, 77.2% vs 82.1%. A cleaner "query starts here" signal (guest scheduler/fault events: the
+  tracer already records them) is the obvious thing to collect next; the host's own inter-arrival gap only separates queries
+  partially (gap 150-3000 us all within 1 point).
+* **Residency reports are cheap and robust to staleness**: reporting every query, every 5 or every 30 queries gives 75.9 / 76.0 / 75.8%
+  with the same proposer (±0.2): the guest cache moves slowly relative to a query.
+
+## 16. Corrections to Part 3
+
+* The part 3 predictors' policy-level table used a residency filter built from `resid_frac`, which only exists for lists the query
+  itself probed (all other candidates read as "not resident"). Recall figures (36%) were computed without residency and stand;
+  the policy-level numbers (75.4-76.3% filtered by the learned hint filter) are for effectively unfiltered candidates. The
+  part 4 numbers use full residency (`resid_all.npy`).
+* "Without any application knowledge ~76-78%" should read: **without application *hooks*, but with the index's own metadata and a residency
+  agent, 80-82% is reachable on FAISS in simulation; without the agent ~75-77%.**
+
+## 17. Thesios: ideas considered
+
+Nothing equivalent was found. The trace is a replay of reads in time order; the first request of a stream carries no information
+about where the next stream starts (0% successor prediction, section 12), and the replay has no metadata (open/footer reads,
+writes, job identity). In a real storage VM the candidates would be: reads of a file's metadata/footer immediately before its data,
+**write-then-read locality** (a freshly written file is read soon after; nbd_server sees every write and currently discards them),
+and file-open events from the guest. None of these exist in this workload, so they cannot be measured here.

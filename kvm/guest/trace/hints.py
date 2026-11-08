@@ -1,8 +1,8 @@
 """Guest-side hint shim: tell the host what this workload is about to read, in-band, over a spare block device.
 
 The host exposes a second NBD disk (/dev/vdc, `hint_port` in nbd.yaml).  A hint is a 512-byte O_DIRECT read at byte
-offset 512 * payload, payload = (page4k << 8) | (lenclass << 4) | aux  (see HintReader in disk/nbd.cpp): page4k = the 4 KiB
-block of the data disk, lenclass indexes LEN (4 KiB units), aux = 0..14 residency or 15 = unknown.  Reads return zeros.
+offset 512 * payload, payload = (page4k << 12) | (lenclass << 8) | aux  (see HintReader in disk/nbd.cpp): page4k = the 4 KiB
+block of the data disk, lenclass indexes LEN (4 KiB units), aux = 8 bits (low nibble residency 0..14 / 15 unknown, high nibble the sender's confidence class / 15 none).  Reads return zeros.
 """
 import ctypes
 import mmap
@@ -17,7 +17,7 @@ class Hinter:
         self.buf = mmap.mmap(-1, 4096)
         self.sent = 0
 
-    def hint(self, byte_off, nbytes, aux=15):
+    def hint(self, byte_off, nbytes, aux=255):
         """Hint [byte_off, byte_off + nbytes) of the data disk (as several hints when it is longer than 1.5 MiB)."""
         first = byte_off // 4096
         units = (byte_off + nbytes + 4095) // 4096 - first
@@ -25,7 +25,7 @@ class Hinter:
             cls = max((i for i, u in enumerate(LEN) if u <= units), default=0)
             if LEN[cls] < units and units < LEN[-1] and cls + 1 < len(LEN) and units - LEN[cls] < LEN[cls] // 2 + 1 and LEN[cls + 1] >= units:
                 cls += 1                                  # a slightly larger class covers the tail in one hint
-            payload = (first << 8) | (cls << 4) | aux
+            payload = (first << 12) | (cls << 8) | aux
             os.preadv(self.fd, [memoryview(self.buf)[:512]], payload * 512)
             self.sent += 1
             first += LEN[cls]

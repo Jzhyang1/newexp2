@@ -6,6 +6,7 @@
 //   learned[:theta=T]   nextreq + neighborhood, one knob.  T (percent, default 40) is the minimum probability a
 //                       page must have to be prefetched: lower = more hits and more traffic.  This is the policy
 //                       tuned for VM workloads (FAISS on-disk IVF, Thesios storage trace); see DECISIONS.md.
+//   ivfgeo:path=F       FAISS-IVF only: neighbours (by centroid distance) of the lists the host sees; F from tools/pf/geo_export.py
 //   nextreq             per-stream next-request predictor (policy_nextreq.cpp)
 //   neighborhood        learned neighborhood prefetcher (policy_neighborhood.cpp)
 //   readahead[:pages=N], cminer, quickmine, mithril, readahead_cxt_aware, oracle   (the older policies)
@@ -133,6 +134,15 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
         q.theta_pct = sp.get("theta", q.theta_pct); q.window = sp.get("window", q.window); q.filter = sp.get("filter", q.filter);
         q.bucket_pages = sp.get("bucket", q.bucket_pages); q.prior_trials = sp.get("k0", q.prior_trials); q.prior_pct = sp.get("prior", q.prior_pct);
         return new HintPolicy(cache, q);
+    }
+    if (n == "ivfgeo") {
+        IvfGeoPolicy::Params q;
+        q.k = sp.get("k", q.k); q.theta_pct = sp.get("theta", q.theta_pct); q.window = sp.get("window", q.window);
+        q.cooldown = sp.get("cooldown", q.cooldown); q.filter = sp.get("filter", q.filter); q.res_thr_pct = sp.get("res", q.res_thr_pct); q.gap_us = sp.get("gap", q.gap_us);
+        auto at = spec.find("path=");
+        if (at == std::string::npos) throw std::runtime_error("ivfgeo needs path=<geo file> (tools/pf/geo_export.py)");
+        auto end = spec.find(',', at);
+        return new IvfGeoPolicy(cache, q, spec.substr(at + 5, end == std::string::npos ? end : end - at - 5));
     }
     if (n == "nextreq") return new NextRequestPolicy(cache, NextRequestParams(sp, 10));
     if (n == "neighborhood") return new NeighborhoodPrefetchPolicy(cache, NeighborhoodParams(sp, 40));
