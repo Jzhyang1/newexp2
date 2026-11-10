@@ -173,6 +173,14 @@ def launch_workload(env=None):
         # `read` blocks until the barrier byte; exec keeps the pid
         return subprocess.Popen(["/bin/sh", "-c", 'read x; cd /opt/ycsb; exec "$@"', "sh"] + cmd,
                                 stdin=subprocess.PIPE, env=env, stdout=open(f"{OUT}/workload.out", "w"), stderr=subprocess.STDOUT)
+    if cfg.get("workload", "faiss") == "cmd":
+        # generic workload: /tmp/tools/workload.sh (copied in by run_capture --cmd-file) against the data disk at
+        # /tmp/data.  With cmd.rw the data disk is remounted read-write first; writes land in nbd_server's
+        # throwaway overlay, never in the image.
+        if cfg["cmd"].get("rw"):
+            subprocess.run(["mount", "-o", "remount,rw", "/tmp/data"], stdout=open(f"{OUT}/remount.log", "w"), stderr=subprocess.STDOUT)
+        return subprocess.Popen(["/bin/sh", "-c", "read x; cd /tmp/data; exec /bin/sh /tmp/tools/workload.sh"], stdin=subprocess.PIPE,
+                                env=env, stdout=open(f"{OUT}/workload.out", "w"), stderr=subprocess.STDOUT)
     if cfg.get("workload", "faiss") == "thesios":
         return subprocess.Popen(["python3", "/tmp/tools/thesios_ondisk.py"], stdin=subprocess.PIPE, env=env,
                                 stdout=open(f"{OUT}/workload.out", "w"), stderr=subprocess.STDOUT)

@@ -9,10 +9,12 @@
 //   ivfgeo:path=F       FAISS-IVF only: neighbours (by centroid distance) of the lists the host sees; F from tools/pf/geo_export.py
 //   nextreq             per-stream next-request predictor (policy_nextreq.cpp)
 //   neighborhood        learned neighborhood prefetcher (policy_neighborhood.cpp)
+//   bop, spp, ppf, bingo, pythia, leap   block-level ports of published prefetchers (policy_lit.h)
 //   readahead[:pages=N], cminer, quickmine, mithril, readahead_cxt_aware, oracle   (the older policies)
 //
 // Evict specs: lru, fifo, lifo, mru, lru_cxt_aware, lru_seg[:unused=PCT].
 #include "policy_api.h"
+#include "policy_lit.h"
 
 #include <functional>
 #include <map>
@@ -153,6 +155,7 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
     if (n == "quickmine") return new QuickMinePolicy(cache);
     if (n == "mithril") return new MithrilPolicy(cache);
     if (n == "oracle") return new OraclePolicy(cache, oracle_file);
+    if (CachePolicy* x = MakeLitPolicy(n, sp.kv, cache)) return x;   // published prefetchers (policy_lit.cpp)
     throw std::runtime_error("unsupported prefetch policy " + n);
 }
 

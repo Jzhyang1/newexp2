@@ -45,7 +45,9 @@ def main():
     ap.add_argument("--data-port", type=int, default=10810)
     ap.add_argument("--mem", default="1G")
     ap.add_argument("--vcpus", type=int, default=2)
-    ap.add_argument("--workload", default="faiss", choices=["faiss", "ycsb", "thesios"])
+    ap.add_argument("--workload", default="faiss", choices=["faiss", "ycsb", "thesios", "cmd"])
+    ap.add_argument("--cmd-file", default="", help="cmd workload: shell script run in the guest (cwd = data disk at /tmp/data)")
+    ap.add_argument("--rw", action="store_true", help="cmd workload: remount the data disk read-write (writes go to the overlay)")
     ap.add_argument("--ycsb-ops", type=int, default=200000, help="YCSB: operations of the transaction phase (a prefix of the full run)")
     ap.add_argument("--ycsb-workload", default="workloadc")
     ap.add_argument("--ycsb-distribution", default="zipfian")
@@ -110,6 +112,8 @@ def main():
                            file_off=[int(x[0]) for x in _meta["list_offset_size_codesize"]]), open(os.path.join(tools, "lists_dev.json"), "w"))
     if args.workload == "thesios":
         shutil.copy(args.thesios_trace, os.path.join(tools, "thesios_trace.csv"))
+    if args.workload == "cmd":
+        shutil.copy(args.cmd_file, os.path.join(tools, "workload.sh"))
     meta = json.load(open(args.data_img + ".meta.json"))
     run_cfg = dict(n_queries=args.n_queries, nprobe=args.nprobe, k=args.k, think_us=args.think_us, probe_debug=args.probe_debug, trace=not args.no_trace,
                    sync_tail_offset=meta["tail_offset"], sync_base=0,
@@ -118,6 +122,8 @@ def main():
     if args.workload == "ycsb":
         run_cfg["ycsb"] = dict(workload=args.ycsb_workload, ops=args.ycsb_ops, records=meta["records"], fields=meta["fields"],
                                field_length=meta["field_length"], distribution=args.ycsb_distribution)
+    if args.workload == "cmd":
+        run_cfg["cmd"] = dict(rw=args.rw)
     if args.hints:
         run_cfg["hints"] = dict(mode=args.hints, k=args.hint_k)
     if args.workload == "thesios":
@@ -152,7 +158,7 @@ def main():
                   evict_policy=args.evict, prefetch_policy=args.prefetch, oracle_file=(args.oracle_file or os.path.join(run, "access.csv")), log=os.path.join(run, "results.csv"),
                   access_log=os.path.join(run, "access.csv"), prefetch_log=os.path.join(run, "prefetch.csv"),
                   feature_log=os.path.join(run, "features.csv"), cache_log=os.path.join(run, "cache.csv"),
-                  vm_log_dir=run)
+                  overlay_dir=run, vm_log_dir=run)   # guest writes (e.g. a RocksDB load) can exceed the /tmp tmpfs
     else:  # access/prefetch logs are SimReadClass-only; set explicit paths so the defaults under ./logs are never truncated
         write_cfg(cfg_data, source="remote", remote_host="127.0.0.1", remote_port=remote_port, fwd_mode=args.fwd_mode,
                   read_concurrency=args.read_concurrency, fwd_local_read_ns=args.local_read_us * 1000, ports=f"[{args.data_port}]",

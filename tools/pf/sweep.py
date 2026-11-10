@@ -20,10 +20,20 @@ TRACES = {
     "thesios_late": ["--trace", f"{ROOT}/logs/oracle_thesios.csv", "--skip", "4000000", "--limit", "1000000"],
 }
 import glob
+def _limit(run_dir, name):
+    """end of the data disk's file system (drops the clock-sync / marker reads in the raw tail)"""
+    try:
+        import json
+        meta = json.load(open(json.load(open(os.path.join(run_dir, "args.json")))["meta_file"]))
+        return str(meta["tail_offset"])
+    except (OSError, KeyError, ValueError):
+        return {"f": "1700790272", "t": str((8 << 40) - (16 << 20)), "y": "14537457664"}[name[0]]
 for _d in sorted(glob.glob(f"{ROOT}/logs/pf_streams/*/features.csv")):
     _n = os.path.basename(os.path.dirname(_d))
-    _lim = {"f": "1700790272", "t": str((8 << 40) - (16 << 20)), "y": "14537457664"}[_n[0]]
-    TRACES["s_" + _n] = ["--trace", _d, "--max-offset", _lim]
+    TRACES["s_" + _n] = ["--trace", _d, "--max-offset", _limit(os.path.dirname(_d), _n)]
+# root-disk streams of the app-launch captures (tools/capture/workloads/app_launch.sh): the guest's own system disk
+for _d in sorted(glob.glob(f"{ROOT}/logs/pf_streams/al_*/root_access.csv")):
+    TRACES["s_" + os.path.basename(os.path.dirname(_d)) + "_root"] = ["--trace", _d]
 HDR = "label,policy,evict,page,cap_pages,delay,reqs,full_hit_pct,page_hit_pct,pf_pages,pf_used,pf_useful_pct,traffic_ratio,demand_miss_pages,late_pages,wall_s,futile_pages".split(",")
 
 

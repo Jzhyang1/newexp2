@@ -16,6 +16,49 @@ that a future reader would otherwise have to reverse-engineer from a diff.
 
 ---
 
+## 2026-11-09 — Adversarial guest workloads: learned loses to block-correlation mining on repeated cold app launches
+
+**Decision:** keep `learned` as the default. Record repeated cold application launches as its one clean loss, and
+`learned+cminer` as the direction to pursue for that case (not yet a default). New guest workloads go through
+`run_capture.py --workload cmd` (generic shell workload, optional read-write data disk) and are always captured from a
+real guest, never replayed directly from an application trace.
+**Why:** 11 new guest workloads were tested at matched traffic against every published port and the older storage
+prefetchers: the Linux 6.6 tree with grep/tar/parallel md5sum/mixed, YCSB on RocksDB (load/C/E, 2 GiB and 1.5 GiB
+guests), YCSB A/B on SQLite, and 20 rounds of cold launches from the guest's Debian root disk.
+On the app-launch root-disk stream, with a per-VM host cache (16–128 MiB) smaller than the 156 MiB launch working
+set, the repo's simplified C-Miner-style miner gets 87.7% full hit at 1.02× traffic against `learned`'s 84.2% at
+1.98× (32 MiB cache, delay 0). 9% of requests jump more than 16 MiB, beyond `learned`'s reach, and 94% of those
+jumps recur. The union gets 92–97% at 2×. At delay 2 the miner only wins below about 1.5×.
+RocksDB YCSB-C depends on the metric: the miner leads on full hit, `learned` on page hit, and the union leads on both
+by 6–14 points.
+Everything else was a tie, a `learned` win, or the known traffic floor. The Linux-tree "losses" were an artifact of
+the theta range: sweep `learned` down to theta=1.
+**Alternative(s) considered:** making `learned+cminer` the default. It costs 0.1–1.2 points at 2× and 5–14 points at
+≤1.5× on FAISS/Thesios, so it needs the miner restricted to long jumps or a shared traffic budget first. TPC-H on
+SQLite was not run: building `dbgen` from source was blocked by the session's permission rules.
+**Reference:** `capture_results/ADVERSARIAL_WORKLOADS.md`, `tools/capture/{build_dir_disk.py,new_streams.sh,split_phases.py,workloads/}`,
+`tools/pf/adv_report.py`; `run_capture.py` now puts the NBD write overlay in the run directory, because a RocksDB
+load filled the `/tmp` tmpfs.
+
+## 2026-11-09 — Published prefetchers ported to the disk setting: none beats `learned` above ~1.5× traffic
+
+**Decision:** added block-level ports of BOP, SPP, SPP+PPF, Bingo, Pythia and Leap (`policies/policy_lit.cpp`) plus
+a PPF-style filter hybrid (`learnedppf`), and keep `learned` unchanged.
+**Why:** at 2× traffic (mean of 11 FAISS + Thesios streams) `learned` scores 77.6 at delay 0 and 73.4 at delay 2,
+against readahead 74.6 / 69.1, BOP 73.9 / 65.3, Bingo 67.3 / 61.4, SPP and PPF 60.4 / 51.5, Leap 59.8 / 53.6 and
+Pythia 36.3 / 33.8. The ranking holds with a 64 MiB cache.
+The hardware designs are accurate but don't reach far enough ahead: one line at a time, region-bounded, no PC. BOP
+converges to offset 1, which is readahead.
+Unions and filters added nothing beyond noise: the best is `learned+bingo` at +0.5, and the PPF-style filter costs
+3–4 points.
+Below about 1.5× traffic, readahead of 2–4 pages wins, because `learned` can't go below about 1.4× even at theta=99
+(nextreq runs at theta/4).
+**Alternative(s) considered:** degree>1 BOP (an extension, not the published design); SPP without region crossing;
+Pythia with 10× α and high-bandwidth rewards; address-free PPF features. All are reported in the write-up.
+**Reference:** `capture_results/PUBLISHED_PREFETCHERS.md`, `tools/pf/lit_eval.py`, `tools/pf/lit_report.py`.
+
+---
+
 ## 2026-11-07 — `learned` prefetcher (nextreq + neighborhood), developed by replaying captured VM streams
 
 **Decision:** added `prefetch_policy: learned[:theta=T]` = `nextreq` (per-stream next-request predictor, byte-exact

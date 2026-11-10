@@ -13,6 +13,8 @@ tools/pf/live_eval.sh        the same workload live in a VM under each policy   
 tools/pf/live_report.py      table of the live runs (nbd_server's own hit_ratio)
 tools/pf/test_policies.py    behavioural checks on synthetic streams (sequential, random, out-of-order, 2 workers)
 tools/pf/ml_probe*.py        offline feature-headroom probes (gradient boosting vs the online tables) used to design the policies
+tools/pf/lit_eval.py         published prefetchers (BOP/SPP/PPF/Bingo/Pythia/Leap, policies/policy_lit.cpp) vs learned -> logs/pf_lit/
+tools/pf/lit_report.py       figures + tables for capture_results/PUBLISHED_PREFETCHERS.md
 ```
 
 ## `psim`
@@ -47,6 +49,10 @@ Real VM streams with policy `none`, captured by `gen_streams.sh`:
 | `f_np16` | nprobe 16 | |
 | `th_m1g` `th_m4g` `th_ra32` `th_ra512` | Thesios, 150k reads | 1 GiB / 4 GiB RAM, readahead 32 / 512 KiB |
 | `y_nt` | YCSB (SQLite point reads) | a random-access control |
+| `lx_*` | `grep -r` / `tar` / `xargs -P8 md5sum` / mixed over the Linux 6.6 tree | 512 MiB (`tools/capture/new_streams.sh`) |
+| `rk_m2g_*`, `rk_m1g5_*` | YCSB on RocksDB, split into `load` / `c` / `e` phases | 2 GiB / 1.5 GiB |
+| `y_a`, `y_b` | YCSB A / B on SQLite | 1 GiB |
+| `al_fixed`, `al_shuf` (`root_access.csv`, trace key `s_al_*_root`) | 20 rounds of cold app launches from the root disk | 1 GiB; evaluate with `--cap` 256-2048 |
 
 Thesios in a VM without root: `tools/capture/build_thesios_disk.py` builds a sparse 8 TiB data disk plus the condensed
 trace from `disk/data/thesios_cache`; `tools/capture/run_capture.py --workload thesios` replays it as buffered reads

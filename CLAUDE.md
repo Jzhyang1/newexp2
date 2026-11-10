@@ -70,8 +70,10 @@ commands; if asked to "run the tests," say which of these exist.
 | `policies/policy_api.h`, `policies/cache.cpp` | `Cache` + `CachePolicy` base API |
 | `policies/policy_*.cpp` | Concrete evict/prefetch policies (see glossary for names) |
 | `policies/policy_factory.h` | Spec parser + factory (`name[:k=v,..]`, `a+b` = union) shared by `nbd_server` and `psim`; defines the `learned` preset |
+| `policies/policy_lit.h`, `policies/policy_lit.cpp` | Block-level ports of published prefetchers (`bop`, `spp`, `ppf`, `bingo`, `pythia`, `leap`) + `learnedppf` hybrid; results in `capture_results/PUBLISHED_PREFETCHERS.md` |
 | `policies/policy_nextreq.cpp`, `policies/policy_neighborhood.cpp` | The learned VM prefetchers (`nextreq`, `neighborhood`; `learned` runs both); `policy_lru_seg.cpp` = `lru_seg` evict |
 | `tools/pf/` | Policy research harness: `psim` (replay a captured VM stream through the real policies in seconds), stream-suite capture, live-VM eval, tests. See `tools/pf/README.md` |
+| `tools/capture/build_dir_disk.py`, `tools/capture/workloads/*.sh`, `tools/capture/new_streams.sh`, `tools/capture/split_phases.py` | Generic guest workloads (`run_capture.py --workload cmd --cmd-file X [--rw]`): Linux-tree tools, YCSB on RocksDB/SQLite, cold app launches (root-disk stream); results in `capture_results/ADVERSARIAL_WORKLOADS.md` |
 | `tools/capture/build_thesios_disk.py` | Sparse 8 TiB data disk + condensed trace so `run_capture.py --workload thesios` runs Thesios in a VM without root |
 | `policies/assoc_miner.h` | Shared association-mining engine for cminer/quickmine/mithril |
 | `policies/stream_tracker.h` | Shared stream-detection for the `*_cxt_aware` policy pair |
