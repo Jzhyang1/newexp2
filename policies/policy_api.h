@@ -334,6 +334,43 @@ public:
 // read-around scan will fill?) and, optionally, per what was seen around the same start page last time.  A request
 // then prefetches the pages whose learned probability of being used is >= theta.  No fixed readahead depth or
 // direction: sequential scans, out-of-order windows and isolated random reads each get their own learned shape.
+// Optional view of the guest's page cache from the hypervisor (tools/capture/hv_sampler.py; set by psim --guest).
+// Returns a class for a cache page: 0 guest holds none of it, 1 part of it, 2 all of it, 3 guest dropped it recently.
+// Unset (the default, e.g. in nbd_server) = no guest information.
+inline std::function<int(std::uint64_t page)>& GuestStateHook() {
+    static std::function<int(std::uint64_t)> h;
+    return h;
+}
+
+// Temporal-streaming prefetcher (policy_tstream.cpp), the storage analogue of temporal memory streaming (STMS, Domino):
+// keeps the ordered log of demand pages; when a request's page occurred before, a "follower" is started at that earlier
+// position and, as later requests keep matching the next few log entries, prefetches ever further ahead along the log
+// (depth d0 << confidence, capped at dmax entries).  Handles long jumps that repeat (cold application launches) and
+// prefetches them early enough to be on time.  Optional event hints (on_hint with npages = 0, aux = 1 << 16 | id):
+// "occurrence of event `id` starts now" (e.g. a launch of app `id`, from a VM-side signal) start a follower at the
+// beginning of that event's previous occurrence before any of its requests arrive.
+class TemporalStreamPolicy : public CachePolicy {
+public:
+    struct Params {
+        std::size_t followers = 8;
+        std::uint64_t win = 64;           // log entries after a follower's position that a request may match
+        std::uint64_t d0 = 4;             // prefetch depth (log entries) of a new follower; doubles per confirmed match
+        std::uint64_t dmax = 32;
+        std::uint64_t idle = 256;         // requests without a match before a follower is dropped
+        std::uint64_t hint_conf = 3;      // confidence of a follower started by an event hint
+        std::uint64_t log_max = 1u << 24;
+        std::uint64_t confirm = 1;        // matches a follower needs before it prefetches anything (0 = at once: more traffic on random streams)
+        std::uint64_t on_miss = 0;        // 1 = start followers only for requests whose first page is not cached (worse on app launch)
+    };
+    TemporalStreamPolicy(Cache& cache, const Params& params);
+    ~TemporalStreamPolicy() override;
+    void on_hint(std::uint64_t context, std::uint64_t first_page, std::uint64_t npages, std::uint32_t aux, PrefetchRequest& request) override;
+    void on_prefetch_request(std::uint64_t context, std::uint64_t block_offset, std::uint64_t block_length, PrefetchRequest& request) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class NeighborhoodPrefetchPolicy : public CachePolicy {
 public:
     struct Params {
@@ -349,6 +386,7 @@ public:
         std::uint64_t use_mem = 1;        // condition on the footprint remembered for this request's start page
         std::uint64_t mem_entries = 262144;
         std::uint64_t dmax = 64;          // how far (pages) either side of a request to consider, <= 256
+        std::uint64_t use_guest = 0;      // also condition on the candidate's guest-residency class (GuestStateHook; off if unset)
     };
     NeighborhoodPrefetchPolicy(Cache& cache, const Params& params);
     ~NeighborhoodPrefetchPolicy() override;

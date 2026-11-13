@@ -87,6 +87,15 @@ def main():
     ap.add_argument("--read-concurrency", type=int, default=8, help="remote mode: reads served in parallel per NBD connection")
     ap.add_argument("--guest-ra-kb", type=int, default=None, help="set the guest's /sys/block/vdb/queue/read_ahead_kb (default: leave the kernel's 128)")
     ap.add_argument("--lean-local", action="store_true", help="local (non-remote) data disk: write no per-request logs, so the run is a clean local-disk reference")
+    ap.add_argument("--hv", action="store_true", help="hypervisor-side sampling (tools/capture/hv_sampler.py): QMP vCPU/KVM state + guest-RAM scans")
+    ap.add_argument("--guest-cmdline", default="", help="extra guest kernel arguments (e.g. init_on_free=1)")
+    ap.add_argument("--hv-idle", default="", help="--hv: path of the root-owned hv_idle helper (tools/capture/hv_idle.py), run via sudo -n; "
+                    "records which guest frames the guest touched (accessed bits) -> hv_access.bin")
+    ap.add_argument("--hv-idle-hz", type=float, default=10)
+    ap.add_argument("--qemu-trace", default="", help="comma-separated QEMU trace events (log backend) -> qemu_trace.log, e.g. "
+                    "virtio_queue_notify,virtio_blk_handle_read,nbd_send_request")
+    ap.add_argument("--hv-hz", type=float, default=100, help="--hv: QMP sample rate")
+    ap.add_argument("--hv-scan-hz", type=float, default=1, help="--hv: guest-RAM content scan rate")
     ap.add_argument("--local-read-us", type=int, default=0, help="remote cache mode: modeled local cache device latency")
     args = ap.parse_args()
 
@@ -145,7 +154,7 @@ def main():
     write_cfg(cfg_root, source="local", file=args.root_img, ports=f"[{args.root_port}]", capacity=4096, page_size=65536,
               evict_policy="lru", prefetch_policy="none", log=os.path.join(run, "root_results.csv"),
               access_log=os.path.join(run, "root_access.csv"), prefetch_log=os.path.join(run, "root_prefetch.csv"),
-              vm_log_dir=run)
+              feature_log=os.path.join(run, "root_features.csv"), vm_log_dir=run)
     if remote_srv is None and args.lean_local:
         # SimReadClass logs every request and cache event under one lock; for a reference run that logging is the dominant cost
         write_cfg(cfg_data, source="local", file=args.data_img, ports=f"[{args.data_port}]", capacity=args.capacity, page_size=args.page_size,
@@ -184,7 +193,7 @@ def main():
             "modprobe 9pnet_virtio; modprobe 9p; mkdir -p /tmp/tools /tmp/out /tmp/data; "
             "mount -t 9p -o trans=virtio,version=9p2000.L,ro tools /tmp/tools; "
             "mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 out /tmp/out; exec /bin/sh /tmp/tools/bootstrap.sh")
-    append = f'console=ttyS0 root=/dev/vda ro panic=1 loglevel=4 init=/bin/sh -- -c "{boot}"'
+    append = f'console=ttyS0 root=/dev/vda ro panic=1 loglevel=4 {args.guest_cmdline} init=/bin/sh -- -c "{boot}"'
     qemu = ["qemu-system-x86_64", "-name", f"{args.name},process=cap-{args.name}", "-enable-kvm", "-cpu", "host",
             "-m", args.mem, "-smp", str(args.vcpus),
             "-drive", f"driver=nbd,host=127.0.0.1,port={args.root_port},if=none,id=d0,cache=none",
@@ -197,9 +206,27 @@ def main():
             "-virtfs", f"local,id=out,path={out},mount_tag=out,security_model=none",
             "-kernel", args.kernel, "-initrd", args.initrd, "-append", append,
             "-serial", f"file:{os.path.join(run, 'serial.log')}", "-monitor", "none"]
+    for ev in filter(None, args.qemu_trace.split(",")):
+        qemu += ["-trace", f"enable={ev}"]
+    if args.qemu_trace:
+        qemu += ["-D", os.path.join(run, "qemu_trace.log")]
+    hv_ram = f"/dev/shm/hv-{os.getpid()}-{args.name}.ram"
+    if args.hv:   # guest RAM in a file the sampler can read; QMP socket for vCPU / KVM state
+        qemu += ["-object", f"memory-backend-file,id=ram0,size={args.mem},mem-path={hv_ram},share=on", "-machine", "memory-backend=ram0",
+                 "-qmp", f"unix:{os.path.join(run, 'qmp.sock')},server=on,wait=off"]
     t0 = time.time()
     print("launching:", args.name, flush=True)
     q = subprocess.Popen(qemu)
+    samplers = []
+    if args.hv:
+        smp = [sys.executable, os.path.join(ROOT, "tools/capture/hv_sampler.py")]
+        samplers.append(subprocess.Popen(smp + ["qmp", "--out", run, "--pid", str(q.pid), "--qmp", os.path.join(run, "qmp.sock"), "--hz", str(args.hv_hz)],
+                                         stderr=open(os.path.join(run, "hv_qmp.log"), "w")))
+        samplers.append(subprocess.Popen(smp + ["scan", "--out", run, "--pid", str(q.pid), "--ram", hv_ram, "--disk", args.data_img, "--disk", args.root_img,
+                                                "--scan-hz", str(args.hv_scan_hz)], stderr=open(os.path.join(run, "hv_scan.log"), "w")))
+        if args.hv_idle:
+            samplers.append(subprocess.Popen(["sudo", "-n", args.hv_idle, "--pid", str(q.pid), "--ram", hv_ram, "--out", os.path.join(run, "hv_access.bin"),
+                                              "--hz", str(args.hv_idle_hz)], stderr=open(os.path.join(run, "hv_idle.log"), "w")))
     status = "ok"
     try:
         q.wait(timeout=args.timeout)
@@ -208,6 +235,13 @@ def main():
         q.kill()
         q.wait()
     wall = time.time() - t0
+    for p in samplers:
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    if os.path.exists(hv_ram):
+        os.unlink(hv_ram)
     for s in servers:
         s.send_signal(signal.SIGTERM)
     if remote_srv:

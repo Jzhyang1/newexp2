@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <set>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -179,11 +180,173 @@ public:
     }
 };
 
+
+// Analysis-only oracle evictions sharing one code path (so they are directly comparable):
+//   min      Belady: evict the resident page whose next demand use is furthest (dead pages first)
+//   dmin     Demand-MIN (Jain & Lin, ISCA 2018): first evict pages the prefetcher will bring back in time before
+//            their next demand use (the one re-prefetched furthest in the future first), else fall back to MIN
+//   dmin_nh  dmin + Cao et al.'s "do no harm": a prefetch is not admitted if it would itself be the next victim
+// Needs the prefetcher's future requests: `learned` and its parts never read cache state, so a pre-pass of the same
+// policy on the request stream alone yields every (request idx, page) it will ask for.
+class OracleEvict : public CachePolicy {
+    std::unordered_map<uint64_t, std::vector<uint32_t>> uses_, pfs_;   // page -> demand / prefetch request indices
+    std::unordered_map<uint64_t, size_t> up_, pp_;
+    std::unordered_map<uint64_t, uint64_t> key_, acc_;                 // resident page -> eviction key; last access idx+1
+    std::set<std::pair<uint64_t, uint64_t>> by_key_;
+    uint64_t cur_ = 0, lag_;
+    bool demand_aware_;
+    static uint64_t First(std::unordered_map<uint64_t, std::vector<uint32_t>>& m, std::unordered_map<uint64_t, size_t>& ptrs, uint64_t pg, uint64_t from) {
+        auto it = m.find(pg);
+        if (it == m.end()) return UINT64_MAX;
+        size_t& p = ptrs[pg];
+        while (p < it->second.size() && it->second[p] < from) ++p;
+        return p < it->second.size() ? it->second[p] : UINT64_MAX;
+    }
+public:
+    bool bypass = false;
+    uint64_t n_bypass = 0;
+    OracleEvict(Cache& c, const std::vector<Req>& reqs, const std::string& pol, bool demand_aware, uint64_t delay)
+        : CachePolicy(c), lag_(std::max<uint64_t>(1, delay)), demand_aware_(demand_aware) {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            uint64_t a = reqs[i].off / c.page_size, b = (reqs[i].off + reqs[i].len - 1) / c.page_size;
+            for (uint64_t q = a; q <= b; ++q) uses_[q].push_back((uint32_t)i);
+        }
+        if (!demand_aware) return;
+        Cache dummy(c.capacity, 0, 0, c.page_size);
+        std::unique_ptr<CachePolicy> shadow(MakePolicy(pol, dummy, ""));
+        if (!shadow) return;
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            const Req& r = reqs[i];
+            uint64_t b0 = r.off / c.page_size, bn = (r.off + r.len - 1) / c.page_size - b0 + 1;
+            PrefetchRequest pr;
+            shadow->on_request(r.worker, r.off, r.len, r.t);
+            shadow->on_prefetch_request(r.worker, b0, bn, pr);
+            for (uint64_t k = 0; k < pr.fetch_count; ++k)
+                for (uint64_t q = pr.fetch_ranges[k].block_offset; q < pr.fetch_ranges[k].block_offset + pr.fetch_ranges[k].block_length; ++q) {
+                    auto& v = pfs_[q];
+                    if (v.empty() || v.back() != i) v.push_back((uint32_t)i);
+                }
+        }
+    }
+    void set_now(uint64_t i) { cur_ = i; }
+    uint64_t Key(uint64_t pg) {             // larger = evict first
+        auto ai = acc_.find(pg);
+        const uint64_t from = (ai != acc_.end() && ai->second == cur_ + 1) ? cur_ + 1 : cur_;
+        const uint64_t d = First(uses_, up_, pg, from);
+        if (d == UINT64_MAX) return UINT64_MAX;
+        if (demand_aware_) {
+            const uint64_t f = First(pfs_, pp_, pg, cur_ + 1);
+            if (f != UINT64_MAX && f + lag_ <= d) return (1ull << 62) + f;     // comes back by prefetch in time: free
+        }
+        return d;
+    }
+    void refresh(uint64_t pg) {
+        auto it = key_.find(pg);
+        if (it == key_.end()) return;
+        by_key_.erase({it->second, pg});
+        it->second = Key(pg);
+        by_key_.insert({it->second, pg});
+    }
+    bool would_bypass(uint64_t pg) {         // incoming prefetch would be the victim itself
+        if (!bypass || cache.size() < cache.capacity || by_key_.empty()) return false;
+        if (Key(pg) >= by_key_.rbegin()->first) { ++n_bypass; return true; }
+        return false;
+    }
+    void on_access(uint64_t, uint64_t page) override { acc_[page] = cur_ + 1; refresh(page); }
+    void on_admit(uint64_t, uint64_t page, bool) override { uint64_t k = Key(page); key_[page] = k; by_key_.insert({k, page}); }
+    void on_evict(uint64_t, uint64_t page) override {
+        auto it = key_.find(page);
+        if (it == key_.end()) return;
+        by_key_.erase({it->second, page});
+        key_.erase(it);
+    }
+    void on_evict_request(uint64_t, uint64_t page, EvictRequest& r) override {
+        if (cache.present(page) || cache.size() < cache.capacity || by_key_.empty()) return;
+        r.pages[r.n_pages++] = by_key_.rbegin()->second;
+    }
+};
+
+// Analysis-only learned eviction (LRB-style, but an online count table instead of a GBM).  At each eviction it samples
+// K cached pages, scores each by the learned P(demand-accessed within the next H requests | features) and evicts the
+// lowest.  Every sampled candidate is also a training example, labelled H requests later from the (exogenous) request
+// stream.  H tracks the cache's turnover time (capacity / pages admitted per request).
+// Features: age since last touch (log2), accesses since admission (0..3), prefetched-and-unused, and with `guest` the
+// GuestStateHook class (guest holds none / part / all of the page, or dropped it recently).
+class LearnedEvict : public CachePolicy {
+    struct Info { uint64_t last, nacc; bool pf; };
+    std::vector<uint64_t> pages_; std::unordered_map<uint64_t, size_t> pos_;
+    std::unordered_map<uint64_t, Info> info_;
+    std::unordered_map<uint64_t, uint64_t> last_demand_;
+    struct Trial { uint64_t idx, page; int cell; };
+    std::deque<Trial> pend_;
+    std::vector<double> hit_, tri_;
+    uint64_t cur_ = 0, rng_ = 0x9e3779b97f4a7c15ull, K_;
+    double admits_ = 0, H_ = 1024;
+    bool guest_;
+    uint64_t Rand() { rng_ ^= rng_ << 13; rng_ ^= rng_ >> 7; rng_ ^= rng_ << 17; return rng_; }
+    int Cell(uint64_t pg) {
+        const Info& f = info_[pg];
+        int age = 0; for (uint64_t a = cur_ - f.last + 1; a > 1 && age < 15; a >>= 1) ++age;
+        int g = guest_ && GuestStateHook() ? GuestStateHook()(pg) : 0;
+        return ((age * 4 + (int)std::min<uint64_t>(f.nacc, 3)) * 2 + (f.pf ? 1 : 0)) * 4 + g;
+    }
+public:
+    LearnedEvict(Cache& c, bool guest, uint64_t K) : CachePolicy(c), hit_(16 * 4 * 2 * 4, 0), tri_(16 * 4 * 2 * 4, 0), K_(K), guest_(guest) {}
+    void set_now(uint64_t i) {
+        if (i != cur_) {                                      // per request: update turnover horizon, resolve labels
+            H_ = std::clamp(cache.capacity / std::max(0.05, admits_), 64.0, 65536.0);
+            admits_ *= 0.999;
+        }
+        cur_ = i;
+        while (!pend_.empty() && (double)pend_.front().idx + H_ < (double)cur_) {
+            const Trial& t = pend_.front();
+            auto it = last_demand_.find(t.page);
+            tri_[t.cell] += 1;
+            if (it != last_demand_.end() && it->second > t.idx) hit_[t.cell] += 1;
+            pend_.pop_front();
+        }
+    }
+    void on_access(uint64_t, uint64_t pg) override {
+        last_demand_[pg] = cur_;
+        auto it = info_.find(pg);
+        if (it != info_.end()) { it->second.last = cur_; ++it->second.nacc; it->second.pf = false; }
+    }
+    void on_admit(uint64_t, uint64_t pg, bool is_pf) override {
+        admits_ += 0.001;
+        pos_[pg] = pages_.size(); pages_.push_back(pg);
+        info_[pg] = Info{cur_, 0, is_pf};
+    }
+    void on_evict(uint64_t, uint64_t pg) override {
+        auto it = pos_.find(pg);
+        if (it == pos_.end()) return;
+        size_t i = it->second; pos_.erase(it);
+        if (i + 1 != pages_.size()) { pages_[i] = pages_.back(); pos_[pages_[i]] = i; }
+        pages_.pop_back();
+        info_.erase(pg);
+    }
+    void on_evict_request(uint64_t, uint64_t page, EvictRequest& r) override {
+        if (cache.present(page) || cache.size() < cache.capacity || pages_.empty()) return;
+        uint64_t best = 0; double bs = 2; uint64_t blast = UINT64_MAX;
+        for (uint64_t k = 0; k < K_; ++k) {
+            uint64_t pg = pages_[Rand() % pages_.size()];
+            int c = Cell(pg);
+            pend_.push_back({cur_, pg, c});
+            double s = (hit_[c] + 0.5) / (tri_[c] + 1.0);
+            uint64_t l = info_[pg].last;
+            if (s < bs || (s == bs && l < blast)) { bs = s; best = pg; blast = l; }
+        }
+        r.pages[r.n_pages++] = best;
+    }
+};
+
 int main(int argc, char** argv) {
     std::string trace, pol = "none", ev = "lru", label;
     uint64_t page = 65536, cap = 4096, delay = 0, limit = 0, warm = 0, skip = 0, tail_off = 0;
     bool csv = false, header = false;
-    std::string dump_path, dumpreq_path, clip_path, hints_path;
+    std::string dump_path, dumpreq_path, clip_path, hints_path, guest_path;
+    uint64_t g_evict = 0, g_filter = 0;   // --guest-evict / --guest-filter thresholds (resident 4 KiB blocks per page; 0 = off)
+    bool g_refault = false;
+    uint64_t g_recent = 2048;             // requests after a guest drop during which the page counts as "recently dropped"
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -204,6 +367,11 @@ int main(int argc, char** argv) {
         else if (a == "--dump-req") dumpreq_path = next();
         else if (a == "--clip") clip_path = next();
         else if (a == "--hints") hints_path = next();
+        else if (a == "--guest") guest_path = next();
+        else if (a == "--guest-evict") g_evict = std::stoull(next());
+        else if (a == "--guest-filter") g_filter = std::stoull(next());
+        else if (a == "--guest-refault") g_refault = true;
+        else if (a == "--guest-recent") g_recent = std::stoull(next());
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (header) {
@@ -237,7 +405,13 @@ int main(int argc, char** argv) {
         if (hf) std::fclose(hf);
     }
     Cache cache(cap, 30000, 300000, page);
-    CachePolicy* evict = ev == "belady" ? (CachePolicy*)new BeladyEvict(cache, reqs) : MakeEvictPolicy(ev, cache);
+    OracleEvict* oev = nullptr;
+    if (ev == "min" || ev == "dmin" || ev == "dmin_nh") {
+        oev = new OracleEvict(cache, reqs, pol, ev != "min", delay);
+        oev->bypass = ev == "dmin_nh";
+    }
+    LearnedEvict* lev = (ev == "lev" || ev == "lev_g") ? new LearnedEvict(cache, ev == "lev_g", 64) : nullptr;
+    CachePolicy* evict = lev ? (CachePolicy*)lev : oev ? (CachePolicy*)oev : ev == "belady" ? (CachePolicy*)new BeladyEvict(cache, reqs) : MakeEvictPolicy(ev, cache);
     std::string oracle_file;
     if (pol.rfind("oracle", 0) == 0) {
         oracle_file = "/tmp/claude-1000/-home-jonathan-yang-newexp2/0e888e7a-7f13-410b-94ae-3a8bcb0cf58f/scratchpad/oracle_" + std::to_string(getpid()) + ".csv";
@@ -273,13 +447,62 @@ int main(int argc, char** argv) {
     uint64_t idx = 0, pol_ns = 0;
     int64_t cur_dist = 0; bool cur_futile = false;
     FILE* dreq = dumpreq_path.empty() ? nullptr : std::fopen(dumpreq_path.c_str(), "w");
-    if (dreq) std::fputs("idx,off,len,hits,pages\n", dreq);
+    if (dreq) std::fputs("idx,off,len,hits,pages,pf,dm\n", dreq);
     FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "w");
     if (dump) std::fputs("born,page,dist,used,futile\n", dump);
     auto emit_dump = [&](uint64_t pg, const Meta& m) { if (dump && m.prefetched) std::fprintf(dump, "%llu,%llu,%lld,%d,%d\n", (unsigned long long)m.born, (unsigned long long)pg, (long long)m.dist, (int)m.used, (int)m.futile); };
 
+    // --guest F: host-side reconstruction of the guest page cache (tools/capture/hv_residency.py: t_ns,page,delta =
+    // change in the number of the page's 4 KiB blocks held in guest RAM).  Used by
+    //   --guest-evict T   evict cached pages the guest holds >= T blocks of first (oldest touch first): exclusive caching
+    //   --guest-filter T  do not prefetch pages the guest holds >= T blocks of
+    //   --guest-refault   prefetch a page as soon as the guest drops its last block of it
+    struct GEv { uint64_t t, page; int d; };
+    std::vector<GEv> gev; size_t gpos = 0;
+    if (!guest_path.empty()) {
+        std::ifstream gi(guest_path); std::string ln; std::getline(gi, ln);
+        while (std::getline(gi, ln)) {
+            unsigned long long t, pg; int d;
+            if (std::sscanf(ln.c_str(), "%llu,%llu,%d", &t, &pg, &d) == 3) gev.push_back({t, pg, d});
+        }
+        std::stable_sort(gev.begin(), gev.end(), [](const GEv& x, const GEv& y) { return x.t < y.t; });
+    }
+    std::unordered_map<uint64_t, int> gcnt;
+    std::unordered_map<uint64_t, uint64_t> touch, gx_key;     // cached page -> last touch idx; page -> its key in gxset
+    std::set<std::pair<uint64_t, uint64_t>> gxset;            // (last touch, page) of cached pages the guest holds
+    auto gx_update = [&](uint64_t pg) {
+        if (!g_evict) return;
+        auto k = gx_key.find(pg);
+        if (k != gx_key.end()) { gxset.erase({k->second, pg}); gx_key.erase(k); }
+        if (cache.present(pg)) {
+            auto c = gcnt.find(pg);
+            if (c != gcnt.end() && c->second >= (int)g_evict) { uint64_t t = touch[pg]; gxset.insert({t, pg}); gx_key[pg] = t; }
+        } else touch.erase(pg);
+    };
+    uint64_t gx_evictions = 0, g_filtered = 0, g_refaults = 0;
+    std::unordered_map<uint64_t, uint64_t> gdrop;             // page -> request idx at which the guest dropped its last block
+    const uint64_t per_page = page / 4096;
+    if (!guest_path.empty())
+        GuestStateHook() = [&](uint64_t pg) -> int {
+            auto c = gcnt.find(pg);
+            if (c != gcnt.end() && c->second > 0) return c->second >= (int)per_page ? 2 : 1;
+            auto d = gdrop.find(pg);
+            return d != gdrop.end() && idx - d->second <= g_recent ? 3 : 0;
+        };
+
     auto admit = [&](uint64_t ctx, uint64_t pg, bool is_pf) {
-        if (cache.present(pg)) return false;
+        if (cache.present(pg)) { if (oev && is_pf) oev->refresh(pg); return false; }
+        if (oev && is_pf && oev->would_bypass(pg)) return false;
+        if (g_evict && cache.size() >= cache.capacity && !gxset.empty()) {   // exclusive caching: drop what the guest holds
+            const uint64_t v = gxset.begin()->second;
+            cache.evict(v);
+            { auto mi = meta.find(v); if (mi != meta.end()) emit_dump(v, mi->second); }
+            meta.erase(v);
+            if (evict) evict->on_evict(ctx, v);
+            if (pf) pf->on_evict(ctx, v);
+            gx_update(v);
+            ++gx_evictions;
+        }
         EvictRequest er;
         if (evict) evict->on_evict_request(ctx, pg, er);
         for (uint64_t i = 0; i < er.n_pages; ++i) {
@@ -288,6 +511,7 @@ int main(int argc, char** argv) {
             meta.erase(er.pages[i]);
             if (evict) evict->on_evict(ctx, er.pages[i]);
             if (pf) pf->on_evict(ctx, er.pages[i]);
+            gx_update(er.pages[i]);
         }
         auto e = cache.insert(pg);
         if (e.first) {  // capacity eviction (random victim) if policy didn't make room
@@ -295,15 +519,30 @@ int main(int argc, char** argv) {
             meta.erase(e.second);
             if (evict) evict->on_evict(ctx, e.second);
             if (pf) pf->on_evict(ctx, e.second);
+            gx_update(e.second);
         }
         meta[pg] = Meta{is_pf, false, idx + delay, idx, cur_dist, cur_futile};
         if (evict) evict->on_admit(ctx, pg, is_pf);
         if (pf) pf->on_admit(ctx, pg, is_pf);
+        if (g_evict) { touch[pg] = idx; gx_update(pg); }
         return true;
     };
 
+    uint64_t pf_req = 0, dm_req = 0;   // per-request admissions, for --dump-req
     for (const Req& r : reqs) {
+        pf_req = dm_req = 0;
         if (ev == "belady") static_cast<BeladyEvict*>(evict)->set_now(idx);
+        if (oev) oev->set_now(idx);
+        if (lev) lev->set_now(idx);
+        while (gpos < gev.size() && gev[gpos].t <= r.t) {
+            const GEv& g = gev[gpos++];
+            int& c = gcnt[g.page];
+            const int before = c;
+            c += g.d;
+            if (before > 0 && c == 0) gdrop[g.page] = idx;
+            gx_update(g.page);
+            if (g_refault && before > 0 && c == 0 && admit(r.worker, g.page, true)) { ++g_refaults; if (idx >= warm) ++pf_pages; }
+        }
         const bool count = idx >= warm;
         uint64_t b0 = r.off / page;
         uint64_t bn = (r.off + r.len - 1) / page - b0 + 1;
@@ -316,7 +555,7 @@ int main(int argc, char** argv) {
                 pf->on_hint(r.worker, hints[hpos].first, hints[hpos].n, hints[hpos].aux, hr);
                 for (uint64_t k = 0; k < hr.fetch_count; ++k)
                     for (uint64_t pg = hr.fetch_ranges[k].block_offset; pg < hr.fetch_ranges[k].block_offset + hr.fetch_ranges[k].block_length; ++pg)
-                        if (admit(r.worker, pg, true) && count) ++pf_pages;
+                        if (admit(r.worker, pg, true)) { ++pf_req; if (count) ++pf_pages; }
             }
             ++hpos;
         }
@@ -347,10 +586,11 @@ int main(int argc, char** argv) {
             hits += hit;
             if (!cache.present(pg)) {
                 if (count) ++dm_pages;
-                admit(r.worker, pg, false);
+                if (admit(r.worker, pg, false)) ++dm_req;
             }
             if (evict) evict->on_access(r.worker, pg);
             if (pf) pf->on_access(r.worker, pg);
+            if (g_evict && cache.present(pg)) { touch[pg] = idx; gx_update(pg); }
         }
         if (!clip.empty()) {
             auto it = std::upper_bound(clip.begin(), clip.end(), std::make_pair(b0, UINT64_MAX));
@@ -369,9 +609,12 @@ int main(int argc, char** argv) {
             const FetchRange& fr = preq->fetch_ranges[i];
             for (uint64_t k = 0; k < fr.block_length; ++k) {
                 uint64_t pgx = fr.block_offset + k;
+                if (g_filter) { auto c = gcnt.find(pgx); if (c != gcnt.end() && c->second >= (int)g_filter) { ++g_filtered; continue; } }
                 cur_dist = pgx > b1x ? (int64_t)(pgx - b1x) : -(int64_t)(b0 - pgx);
                 { auto lu0 = last_use.find(pgx); cur_futile = (lu0 == last_use.end() || lu0->second <= idx); }
-                if (admit(r.worker, pgx, true) && count) {
+                const bool adm = admit(r.worker, pgx, true);
+                if (adm) ++pf_req;
+                if (adm && count) {
                     ++pf_pages;
                     auto lu = last_use.find(fr.block_offset + k);
                     if (lu == last_use.end() || lu->second <= idx) ++futile;
@@ -379,7 +622,7 @@ int main(int argc, char** argv) {
             }
         }
         delete preq;
-        if (dreq) std::fprintf(dreq, "%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)idx, (unsigned long long)r.off, (unsigned long long)r.len, (unsigned long long)hits, (unsigned long long)bn);
+        if (dreq) std::fprintf(dreq, "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)idx, (unsigned long long)r.off, (unsigned long long)r.len, (unsigned long long)hits, (unsigned long long)bn, (unsigned long long)pf_req, (unsigned long long)dm_req);
         if (count) {
             ++n_req;
             pg_hit += hits;
@@ -409,6 +652,7 @@ int main(int argc, char** argv) {
     for (auto& kv : meta) emit_dump(kv.first, kv.second);
     if (dump) std::fclose(dump);
     if (dreq) std::fclose(dreq);
+    if (!guest_path.empty()) std::fprintf(stderr, "guest: %zu events, gx_evictions %llu, filtered %llu, refault_prefetches %llu\n", gev.size(), (unsigned long long)gx_evictions, (unsigned long long)g_filtered, (unsigned long long)g_refaults);
     delete pf;
     delete evict;
     if (!oracle_file.empty()) std::remove(oracle_file.c_str());

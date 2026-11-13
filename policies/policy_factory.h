@@ -98,6 +98,7 @@ inline NeighborhoodPrefetchPolicy::Params NeighborhoodParams(const Spec& sp, std
     q.use_mem = sp.get("mem", q.use_mem);
     q.mem_entries = sp.get("mementries", q.mem_entries);
     q.dmax = std::min<std::uint64_t>(256, sp.get("dmax", q.dmax));
+    q.use_guest = sp.get("guest", q.use_guest);
     return q;
 }
 
@@ -128,7 +129,9 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
         const std::uint64_t theta = sp.get("theta", 40);
         std::vector<std::unique_ptr<CachePolicy>> parts;
         parts.emplace_back(new NextRequestPolicy(cache, NextRequestParams(Spec{}, std::max<std::uint64_t>(1, theta / 4))));
-        parts.emplace_back(new NeighborhoodPrefetchPolicy(cache, NeighborhoodParams(Spec{}, theta)));
+        auto nq = NeighborhoodParams(Spec{}, theta);
+        nq.use_guest = sp.get("guest", 0);        // learned:guest=1 = neighborhood also conditions on GuestStateHook
+        parts.emplace_back(new NeighborhoodPrefetchPolicy(cache, nq));
         return new ComboPolicy(cache, std::move(parts));
     }
     if (n == "hint") {
@@ -145,6 +148,13 @@ inline CachePolicy* MakePolicy(const std::string& spec, Cache& cache, const std:
         if (at == std::string::npos) throw std::runtime_error("ivfgeo needs path=<geo file> (tools/pf/geo_export.py)");
         auto end = spec.find(',', at);
         return new IvfGeoPolicy(cache, q, spec.substr(at + 5, end == std::string::npos ? end : end - at - 5));
+    }
+    if (n == "tstream") {
+        TemporalStreamPolicy::Params q;
+        q.followers = sp.get("f", q.followers); q.win = sp.get("win", q.win); q.d0 = sp.get("d0", q.d0);
+        q.dmax = sp.get("dmax", q.dmax); q.idle = sp.get("idle", q.idle); q.hint_conf = sp.get("hconf", q.hint_conf);
+        q.on_miss = sp.get("miss", q.on_miss); q.confirm = sp.get("confirm", q.confirm);
+        return new TemporalStreamPolicy(cache, q);
     }
     if (n == "nextreq") return new NextRequestPolicy(cache, NextRequestParams(sp, 10));
     if (n == "neighborhood") return new NeighborhoodPrefetchPolicy(cache, NeighborhoodParams(sp, 40));

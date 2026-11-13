@@ -33,7 +33,7 @@ struct NeighborhoodPrefetchPolicy::Impl {
     static constexpr int kBins = 20;
     static constexpr int kLenB = 6, kChainB = 6, kNear = 2;
     static constexpr int kCtx = kLenB * kChainB * kNear;
-    static constexpr int kState = 9;               // hole class (3) x footprint class (3)
+    static constexpr int kState = 36;              // hole class (3) x footprint class (3) x guest class (4, 0 unless use_guest)
 
     struct BinDef { int lo, hi; };                 // distances [lo, hi] (pages from the request edge)
     std::array<BinDef, kBins> bins;
@@ -177,6 +177,14 @@ void NeighborhoodPrefetchPolicy::on_prefetch_request(std::uint64_t context, std:
                 a.state[d - 1] += 3 * (inside(b1 + d) ? 1 : 2);
                 if (b0 >= (std::uint64_t)d) a.state[I::kD + d - 1] += 3 * (inside(b0 - d) ? 1 : 2);
             }
+        }
+    }
+
+    if (P.use_guest && GuestStateHook()) {         // guest class: what the guest's own cache holds of the candidate
+        auto& G = GuestStateHook();
+        for (int d = 1; d <= DM; ++d) {
+            a.state[d - 1] += 9 * G(b1 + d);
+            if (b0 >= (std::uint64_t)d) a.state[I::kD + d - 1] += 9 * G(b0 - d);
         }
     }
 
